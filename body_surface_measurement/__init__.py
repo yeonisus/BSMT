@@ -11,7 +11,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 11, 0),
+    "version": (0, 12, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (
@@ -21,7 +21,8 @@ bl_info = {
         "Milestone 3.0: named research landmark manager. "
         "Milestone 3.1: user-defined measurement manager. "
         "Milestone 3.2: measurement visualization and surface paths. "
-        "Milestone 3.3: scan preprocessing and solver safety gate"
+        "Milestone 3.3: scan preprocessing and solver safety gate. "
+        "Milestone 3.4: controlled mesh repair"
     ),
     "category": "3D View",
 }
@@ -31,9 +32,9 @@ if "bpy" in locals():
     import importlib
 
     from . import (
-        attach, geodesic, landmarks, measurement, measurements, panels,
-        picking, preprocess, protocol, scancopy, state, visualization, viz,
-        operators,
+        attach, geodesic, landmarks, measurement, measurements, meshrepair,
+        panels, picking, preprocess, protocol, repair, scancopy, state,
+        visualization, viz, operators,
     )
 
     importlib.reload(geodesic)
@@ -41,11 +42,13 @@ if "bpy" in locals():
     importlib.reload(landmarks)
     importlib.reload(measurements)
     importlib.reload(preprocess)
+    importlib.reload(repair)
     importlib.reload(protocol)
     importlib.reload(measurement)
     importlib.reload(visualization)
     importlib.reload(state)
     importlib.reload(scancopy)
+    importlib.reload(meshrepair)
     importlib.reload(viz)
     importlib.reload(picking)
     importlib.reload(operators)
@@ -53,9 +56,9 @@ if "bpy" in locals():
     importlib.reload(attach)
 else:
     from . import (
-        attach, geodesic, landmarks, measurement, measurements, operators,
-        panels, picking, preprocess, protocol, scancopy, state, visualization,
-        viz,
+        attach, geodesic, landmarks, measurement, measurements, meshrepair,
+        operators, panels, picking, preprocess, protocol, repair, scancopy,
+        state, visualization, viz,
     )
 
 import bpy  # noqa: E402  (kept after the reload guard on purpose)

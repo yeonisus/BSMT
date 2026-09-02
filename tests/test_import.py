@@ -286,6 +286,8 @@ def test_fresh_import():
     check("fresh: viz module loaded", hasattr(bsmt, "viz"))
     check("fresh: preprocess module loaded", hasattr(bsmt, "preprocess"))
     check("fresh: scancopy module loaded", hasattr(bsmt, "scancopy"))
+    check("fresh: repair module loaded", hasattr(bsmt, "repair"))
+    check("fresh: meshrepair module loaded", hasattr(bsmt, "meshrepair"))
     check("fresh: protocol module loaded", hasattr(bsmt, "protocol"))
     check("fresh: register/unregister present",
           callable(bsmt.register) and callable(bsmt.unregister))
@@ -818,7 +820,8 @@ def test_landmark_modules_are_pure(bsmt):
     print("\nMilestone 3.0 modules are importable without Blender")
     import ast as _ast
     import os as _os
-    for name in ("landmarks", "protocol", "measurements", "preprocess"):
+    for name in ("landmarks", "protocol", "measurements", "preprocess",
+                 "repair"):
         path = _os.path.join(ROOT, "body_surface_measurement", name + ".py")
         tree = _ast.parse(open(path).read())
         imported = set()

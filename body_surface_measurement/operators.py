@@ -9,8 +9,8 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 
 from . import (attach, geodesic, landmarks, measurement, measurements,
-               picking, preprocess, protocol, scancopy, state,
-               visualization, viz)
+               meshrepair, picking, preprocess, protocol, repair,
+               scancopy, state, visualization, viz)
 
 def _addon_version():
     from . import bl_info
@@ -3180,6 +3180,563 @@ class BSMT_OT_clear_preprocess_report(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Controlled mesh repair (Milestone 3.4)
+# ---------------------------------------------------------------------------
+#
+# Every repair is an explicit action on a region the researcher selected.
+# There is no "make it manifold" button and no global cleanup: on a human scan
+# a global weld or a fill-everything pass fuses anatomically distinct surfaces
+# that happen to touch, and the resulting geodesic is confidently wrong and
+# systematically short.
+
+
+def _repair_target(context):
+    """The object repairs may run on, or (None, reason).
+
+    Only a generated measurement copy qualifies. Refusing the original is the
+    whole safety story of this milestone: the source scan is never modified.
+    """
+    obj = context.active_object
+    if obj is None or obj.type != 'MESH':
+        return None, "select a mesh object"
+    if visualization.is_helper(obj):
+        return None, "'%s' is a BSMT helper, not a scan" % obj.name
+    provenance = getattr(obj, "bsmt_scan", None)
+    if provenance is None or not provenance.is_measurement_copy:
+        return None, ("'%s' is not a measurement copy. Repairs run only on a "
+                      "copy created by Scan Preprocessing, so the source scan "
+                      "is never modified." % obj.name)
+    return obj, ""
+
+
+def _canonical_arrays(context, props, obj, rebuild=True):
+    canonical = geodesic.meshcache.get(context, obj, props.unit,
+                                       rebuild=rebuild)
+    return canonical
+
+
+def _analyse_repair(context, props, obj):
+    """Rebuild the diagnostics and refill the repair lists. Returns lines."""
+    canonical = _canonical_arrays(context, props, obj)
+    report = dict(canonical.topology or {})
+
+    loops = repair.boundary_loops(canonical.vertices_solver,
+                                  canonical.triangles)
+    rows = repair.component_rows(canonical.component_triangle_counts,
+                                 canonical.component_vertex_counts)
+
+    state.clear_repair_lists(props)
+    for loop in loops:
+        entry = props.boundary_loops.add()
+        entry.loop_id = loop["loop_id"]
+        entry.edge_count = loop["edge_count"]
+        entry.vertex_count = loop["vertex_count"]
+        entry.perimeter_mm = loop["perimeter_mm"]
+        entry.bbox_x, entry.bbox_y, entry.bbox_z = loop["bbox_mm"]
+        entry.closed = loop["closed"]
+        entry.label = repair.describe_loop(loop)
+    for row in rows:
+        entry = props.repair_components.add()
+        entry.index = row["index"]
+        entry.triangle_count = row["triangle_count"]
+        entry.vertex_count = row["vertex_count"]
+        entry.percent = row["percent"]
+        entry.is_small = row["is_small"]
+        entry.is_largest = row["is_largest"]
+        entry.label = repair.describe_component(row)
+
+    verdict = repair.readiness(report)
+    props.repair_readiness = "\n".join(repair.readiness_lines(verdict))
+    props.repair_object = obj.name
+    props.repair_valid = True
+
+    lines = [
+        "Diagnostics for '%s'" % obj.name,
+        "  Vertices             %s" % "{:,}".format(report.get("vertex_count", 0)),
+        "  Triangles            %s" % "{:,}".format(report.get("triangle_count", 0)),
+        "  Connected components %d" % report.get("component_count", 0),
+        "  Boundary edges       %d" % report.get("boundary_edge_count", 0),
+        "  Non-manifold edges   %d" % report.get("nonmanifold_edge_count", 0),
+        "  Degenerate triangles %d" % report.get("degenerate_triangle_count", 0),
+        "  Coincident vertices  %d" % report.get("duplicate_vertex_count", 0),
+        "",
+    ]
+    lines.extend(repair.readiness_lines(verdict))
+    props.repair_report = "\n".join(lines)
+    return canonical, report, verdict
+
+
+def _after_repair(self, context, props, obj, action, before_report,
+                  before_texture, detail=""):
+    """Re-diagnose, verify texture, mark points stale, log. Returns (ok, msg)."""
+    texture_ok, problems, _after_facts = meshrepair.verify_texture(
+        obj, before_texture
+    )
+    canonical, after_report, verdict = _analyse_repair(context, props, obj)
+    record = repair.repair_record(action, before_report, after_report, detail)
+
+    lines = repair.repair_lines(record)
+    if texture_ok:
+        lines.append("  texture         preserved")
+    else:
+        lines.append("  TEXTURE LOST    %s" % "; ".join(problems))
+    props.repair_log = ((props.repair_log + "\n" if props.repair_log else "")
+                        + "\n".join(lines))
+    print("[BSMT] repair: " + " | ".join(lines))
+
+    # The mesh changed, so its geometry hash changed. Every SurfacePoint that
+    # referred to the old surface is now STALE and is never re-projected.
+    stale = _mark_points_stale(context, props, obj, canonical)
+    if stale:
+        print("[BSMT] repair invalidated %d landmark(s)/point(s) as STALE"
+              % stale)
+
+    if not texture_ok:
+        return False, ("repair completed but the texture was lost: %s"
+                       % "; ".join(problems))
+    return True, "%s | %s" % (record["action"], verdict["headline"])
+
+
+def _mark_points_stale(context, props, obj, canonical):
+    """Mark every stored point on this object stale after a geometry change."""
+    affected = 0
+    for slot in ('A', 'B'):
+        point = state.surface_point(props, slot)
+        if point.valid and point.source_object == obj.name:
+            reason = landmarks.stale_reason(
+                point.geometry_hash, point.triangle_index,
+                canonical.geometry_hash, canonical.triangle_count,
+            )
+            if reason:
+                point.status = "STALE: " + reason
+                affected += 1
+
+    collection = state.get_landmarks(context)
+    for item in collection or ():
+        point = item.surface_point
+        if point.valid and point.source_object == obj.name:
+            state.refresh_landmark_status(item, canonical)
+            if item.status != landmarks.STATUS_VALID:
+                affected += 1
+                state.invalidate_measurements_for_landmark(
+                    context, item.stable_id,
+                    "the mesh was repaired since this landmark was picked",
+                )
+    return affected
+
+
+class BSMT_OT_analyse_repair(bpy.types.Operator):
+    """Diagnose the selected measurement copy for repair.
+
+    Read-only: nothing is modified
+    """
+
+    bl_idname = "bsmt.analyse_repair"
+    bl_label = "Analyse Mesh"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        if geodesic.ensure_loaded():
+            self.report({'ERROR'}, "BSMT: " + geodesic.ensure_loaded())
+            return {'CANCELLED'}
+        try:
+            _canonical, report, verdict = _analyse_repair(context, props, obj)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: analysis failed (%s)" % exc)
+            return {'CANCELLED'}
+        print("\n[BSMT] " + props.repair_report + "\n")
+        self.report({'WARNING'} if not verdict["ready"] else {'INFO'},
+                    "BSMT: %s - %d non-manifold, %d boundary, %d component(s)"
+                    % (verdict["headline"],
+                       report.get("nonmanifold_edge_count", 0),
+                       report.get("boundary_edge_count", 0),
+                       report.get("component_count", 0)))
+        return {'FINISHED'}
+
+
+class BSMT_OT_show_non_manifold(bpy.types.Operator):
+    """Highlight the non-manifold edges in the viewport.
+
+    Overlay only: the mesh is not modified
+    """
+
+    bl_idname = "bsmt.show_non_manifold"
+    bl_label = "Show Non-Manifold"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        geodesic.ensure_loaded()
+        canonical = _canonical_arrays(context, props, obj, rebuild=False)
+        edges = repair.classify_edges(canonical.triangles,
+                                      canonical.vertex_count)["non_manifold"]
+        if edges.shape[0] == 0:
+            visualization.show_repair_edges(
+                context, props, visualization.REPAIR_NON_MANIFOLD,
+                [], [], obj.matrix_world,
+                visualization.REPAIR_NON_MANIFOLD_COLOR)
+            self.report({'INFO'}, "BSMT: no non-manifold edges to show")
+            return {'FINISHED'}
+
+        used = np.unique(edges)
+        remap = {int(v): i for i, v in enumerate(used)}
+        points = canonical.vertices_local[used]
+        local_edges = [(remap[int(a)], remap[int(b)]) for a, b in edges]
+        visualization.show_repair_edges(
+            context, props, visualization.REPAIR_NON_MANIFOLD,
+            points, local_edges, obj.matrix_world,
+            visualization.REPAIR_NON_MANIFOLD_COLOR)
+        self.report({'INFO'},
+                    "BSMT: highlighted %d non-manifold edge(s)"
+                    % edges.shape[0])
+        return {'FINISHED'}
+
+
+class BSMT_OT_show_boundary_loop(bpy.types.Operator):
+    """Highlight the selected boundary loop. Overlay only"""
+
+    bl_idname = "bsmt.show_boundary_loop"
+    bl_label = "Show Selected Boundary"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return (props is not None and len(props.boundary_loops) > 0
+                and _repair_target(context)[0] is not None)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        entry = state.active_boundary_loop(props)
+        if entry is None:
+            self.report({'WARNING'}, "BSMT: select a boundary loop first")
+            return {'CANCELLED'}
+
+        canonical = _canonical_arrays(context, props, obj, rebuild=False)
+        loops = repair.boundary_loops(canonical.vertices_solver,
+                                      canonical.triangles)
+        loop = next((entry_loop for entry_loop in loops
+                     if entry_loop["loop_id"] == entry.loop_id), None)
+        if loop is None:
+            self.report({'ERROR'},
+                        "BSMT: that loop no longer exists - re-analyse")
+            return {'CANCELLED'}
+
+        edges = loop["edges"]
+        used = np.unique(edges)
+        remap = {int(v): i for i, v in enumerate(used)}
+        visualization.show_repair_edges(
+            context, props, visualization.REPAIR_BOUNDARY,
+            canonical.vertices_local[used],
+            [(remap[int(a)], remap[int(b)]) for a, b in edges],
+            obj.matrix_world, visualization.REPAIR_BOUNDARY_COLOR)
+        self.report({'INFO'}, "BSMT: highlighted loop %d (%d edges, %.1f mm)"
+                    % (loop["loop_id"], loop["edge_count"],
+                       loop["perimeter_mm"]))
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_repair_highlight(bpy.types.Operator):
+    """Remove the repair highlights. Nothing else is affected"""
+
+    bl_idname = "bsmt.clear_repair_highlight"
+    bl_label = "Clear Highlight"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        removed = visualization.clear_repair_highlights()
+        self.report({'INFO'}, "BSMT: removed %d highlight(s)" % removed)
+        return {'FINISHED'}
+
+
+class _RepairBase(bpy.types.Operator):
+    """Shared safety wrapper: back up, edit, re-diagnose, verify texture."""
+
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def _guarded(self, context, action, work, detail=""):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        if props.repair_running:
+            self.report({'WARNING'}, "BSMT: a repair is already running")
+            return {'CANCELLED'}
+        if geodesic.ensure_loaded():
+            self.report({'ERROR'}, "BSMT: " + geodesic.ensure_loaded())
+            return {'CANCELLED'}
+
+        source = scancopy.resolve_source(obj)
+        source_triangles = (scancopy.triangle_count(source.data)
+                            if source is not None else None)
+
+        canonical = _canonical_arrays(context, props, obj)
+        before_report = dict(canonical.topology or {})
+        before_texture = scancopy.audit_object(obj)
+
+        # Backed up before anything is touched, so a repair can be undone even
+        # if the undo stack has been disturbed.
+        backup = meshrepair.make_backup(obj)
+        props.repair_backup_mesh = backup
+        props.repair_running = True
+        try:
+            outcome = work(obj, canonical, before_report)
+        except meshrepair.RepairAborted as exc:
+            meshrepair.restore_backup(obj, backup)
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            meshrepair.restore_backup(obj, backup)
+            self.report({'ERROR'},
+                        "BSMT: repair failed and was rolled back (%s: %s)"
+                        % (type(exc).__name__, exc))
+            return {'CANCELLED'}
+        finally:
+            props.repair_running = False
+
+        ok, message = _after_repair(self, context, props, obj, action,
+                                    before_report, before_texture,
+                                    detail or str(outcome))
+        if not ok:
+            meshrepair.restore_backup(obj, backup)
+            _analyse_repair(context, props, obj)
+            self.report({'ERROR'}, "BSMT: %s - rolled back" % message)
+            return {'CANCELLED'}
+
+        if source is not None and source_triangles is not None:
+            if scancopy.triangle_count(source.data) != source_triangles:
+                self.report({'ERROR'},
+                            "BSMT: the SOURCE scan changed during a repair. "
+                            "This is a bug; do not trust the copy.")
+                return {'CANCELLED'}
+
+        self.report({'INFO'}, "BSMT: " + message)
+        return {'FINISHED'}
+
+
+class BSMT_OT_fill_boundary_loop(_RepairBase):
+    """Fill the selected boundary loop and triangulate the new faces.
+
+    Only the selected loop. No other boundary in the mesh is touched
+    """
+
+    bl_idname = "bsmt.fill_boundary_loop"
+    bl_label = "Fill Selected Boundary"
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return (props is not None and len(props.boundary_loops) > 0
+                and _repair_target(context)[0] is not None)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        entry = state.active_boundary_loop(props)
+        if entry is None:
+            self.report({'WARNING'}, "BSMT: select a boundary loop first")
+            return {'CANCELLED'}
+        loop_id = entry.loop_id
+
+        def work(obj, canonical, _before):
+            loops = repair.boundary_loops(canonical.vertices_solver,
+                                          canonical.triangles)
+            loop = next((entry_loop for entry_loop in loops
+                         if entry_loop["loop_id"] == loop_id), None)
+            if loop is None:
+                raise meshrepair.RepairAborted(
+                    "boundary loop %d no longer exists - re-analyse" % loop_id
+                )
+            filled = meshrepair.fill_boundary_loop(obj, loop["edges"])
+            return "loop %d, %d face(s) created" % (loop_id, filled)
+
+        return self._guarded(context, "Fill boundary loop", work)
+
+
+class BSMT_OT_remove_small_component(_RepairBase):
+    """Delete the selected connected component.
+
+    Explicit and per-component. A component is never removed automatically,
+    and never merely because it is smaller than another
+    """
+
+    bl_idname = "bsmt.remove_small_component"
+    bl_label = "Remove Selected Component"
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or len(props.repair_components) < 2:
+            return False
+        return _repair_target(context)[0] is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        entry = state.active_repair_component(props)
+        if entry is None:
+            self.report({'WARNING'}, "BSMT: select a component first")
+            return {'CANCELLED'}
+        if entry.is_largest:
+            self.report({'ERROR'},
+                        "BSMT: refusing to remove the largest component - "
+                        "that is the body")
+            return {'CANCELLED'}
+        component_index = entry.index
+
+        def work(obj, canonical, _before):
+            labels = np.asarray(canonical.vertex_components)
+            wanted = np.where(labels == (component_index - 1))[0]
+            if wanted.size == 0:
+                raise meshrepair.RepairAborted(
+                    "component %d no longer exists - re-analyse"
+                    % component_index
+                )
+            removed = meshrepair.remove_component(obj, wanted)
+            return "component %d, %d vertices removed" % (component_index,
+                                                          removed)
+
+        return self._guarded(context, "Remove component", work)
+
+
+class BSMT_OT_remove_duplicate_faces(_RepairBase):
+    """Delete faces that exactly repeat another face.
+
+    The safest non-manifold repair: a duplicated face adds no surface, so
+    removing it cannot move any anatomy
+    """
+
+    bl_idname = "bsmt.remove_duplicate_faces"
+    bl_label = "Remove Duplicate Faces"
+
+    @classmethod
+    def poll(cls, context):
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        def work(obj, canonical, _before):
+            duplicates = repair.duplicate_faces(canonical.triangles)
+            if duplicates.size == 0:
+                raise meshrepair.RepairAborted(
+                    "this mesh has no duplicate faces"
+                )
+            removed = meshrepair.remove_duplicate_faces(obj, duplicates)
+            return "%d duplicate face(s) removed" % removed
+
+        return self._guarded(context, "Remove duplicate faces", work)
+
+
+class BSMT_OT_weld_non_manifold(_RepairBase):
+    """Merge coincident vertices AT THE NON-MANIFOLD EDGES ONLY.
+
+    Not a global merge-by-distance: the vertex set is the endpoints of the
+    reported non-manifold edges and nothing else, so it cannot weld an arm to
+    a torso elsewhere in the scan
+    """
+
+    bl_idname = "bsmt.weld_non_manifold"
+    bl_label = "Weld Non-Manifold Region"
+
+    @classmethod
+    def poll(cls, context):
+        return _repair_target(context)[0] is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        distance_mm = props.repair_weld_distance_mm
+
+        def work(obj, canonical, _before):
+            edges = repair.classify_edges(
+                canonical.triangles, canonical.vertex_count)["non_manifold"]
+            if edges.shape[0] == 0:
+                raise meshrepair.RepairAborted(
+                    "this mesh has no non-manifold edges"
+                )
+            # The weld runs on the object's own mesh, whose units are
+            # coordinate units, so the physical millimetre setting is
+            # converted rather than passed through raw.
+            local = measurement.mm_to_units(distance_mm, props.unit)
+            merged = meshrepair.weld_non_manifold_region(obj, edges, local)
+            return ("%d vertex/vertices merged at %d non-manifold edge(s), "
+                    "tolerance %.4f mm" % (merged, edges.shape[0], distance_mm))
+
+        return self._guarded(context, "Weld non-manifold region", work)
+
+
+class BSMT_OT_restore_repair_backup(bpy.types.Operator):
+    """Restore the mesh as it was before the last repair"""
+
+    bl_idname = "bsmt.restore_repair_backup"
+    bl_label = "Restore Backup"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or not props.repair_backup_mesh:
+            return False
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        if not meshrepair.restore_backup(obj, props.repair_backup_mesh):
+            self.report({'ERROR'}, "BSMT: the backup mesh is gone")
+            return {'CANCELLED'}
+        _analyse_repair(context, props, obj)
+        props.repair_log = ((props.repair_log + "\n" if props.repair_log else "")
+                            + "Restored the pre-repair backup")
+        self.report({'INFO'}, "BSMT: restored '%s' from backup" % obj.name)
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_repair_report(bpy.types.Operator):
+    """Clear the repair analysis and log. No mesh is touched"""
+
+    bl_idname = "bsmt.clear_repair_report"
+    bl_label = "Clear Repair Report"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is not None:
+            state.clear_repair_state(props)
+            props.repair_log = ""
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_topology(bpy.types.Operator):
     """Clear the topology diagnostics report"""
 
@@ -3238,6 +3795,16 @@ classes = (
     BSMT_OT_create_measurement_copy,
     BSMT_OT_toggle_measurement_copy,
     BSMT_OT_clear_preprocess_report,
+    BSMT_OT_analyse_repair,
+    BSMT_OT_show_non_manifold,
+    BSMT_OT_show_boundary_loop,
+    BSMT_OT_clear_repair_highlight,
+    BSMT_OT_fill_boundary_loop,
+    BSMT_OT_remove_small_component,
+    BSMT_OT_remove_duplicate_faces,
+    BSMT_OT_weld_non_manifold,
+    BSMT_OT_restore_repair_backup,
+    BSMT_OT_clear_repair_report,
 )
 
 

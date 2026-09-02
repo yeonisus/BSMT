@@ -495,6 +495,32 @@ class BSMT_ScanProvenance(bpy.types.PropertyGroup):
     )
 
 
+class BSMT_BoundaryLoop(bpy.types.PropertyGroup):
+    """One detected boundary loop, for the repair list. Display only."""
+
+    loop_id: IntProperty(default=0)
+    edge_count: IntProperty(default=0)
+    vertex_count: IntProperty(default=0)
+    perimeter_mm: FloatProperty(default=0.0)
+    bbox_x: FloatProperty(default=0.0)
+    bbox_y: FloatProperty(default=0.0)
+    bbox_z: FloatProperty(default=0.0)
+    closed: BoolProperty(default=False)
+    label: StringProperty(default="")
+
+
+class BSMT_RepairComponent(bpy.types.PropertyGroup):
+    """One connected component, for the repair list. Display only."""
+
+    index: IntProperty(default=0)
+    triangle_count: IntProperty(default=0)
+    vertex_count: IntProperty(default=0)
+    percent: FloatProperty(default=0.0)
+    is_small: BoolProperty(default=False)
+    is_largest: BoolProperty(default=False)
+    label: StringProperty(default="")
+
+
 class BSMT_ComponentInfo(bpy.types.PropertyGroup):
     """One connected component in the diagnostics preview (display only)."""
 
@@ -806,6 +832,31 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         name="Details", description="Show the selected measurement's detail",
         default=True,
     )
+    # ------------------------------------------------------------------
+    # Milestone 3.4 - controlled mesh repair.
+    # ------------------------------------------------------------------
+    repair_object: StringProperty(name="Repair Target", default="")
+    repair_report: StringProperty(name="Repair Report", default="")
+    repair_valid: BoolProperty(default=False)
+    repair_log: StringProperty(name="Repair Log", default="")
+    repair_backup_mesh: StringProperty(default="")
+    repair_running: BoolProperty(default=False, options={'SKIP_SAVE'})
+    show_repair: BoolProperty(name="Mesh Repair", default=False)
+
+    boundary_loops: CollectionProperty(type=BSMT_BoundaryLoop)
+    boundary_loop_index: IntProperty(default=0, min=0)
+    repair_components: CollectionProperty(type=BSMT_RepairComponent)
+    repair_component_index: IntProperty(default=0, min=0)
+
+    repair_weld_distance_mm: FloatProperty(
+        name="Local Weld Distance (mm)",
+        description="Merge distance used ONLY at the reported non-manifold "
+                    "edges. This is never a global merge-by-distance: the "
+                    "vertex set is those edges' endpoints and nothing else",
+        default=0.01, min=0.0001, max=5.0, precision=4,
+    )
+    repair_readiness: StringProperty(name="Readiness", default="")
+
     # ------------------------------------------------------------------
     # Milestone 3.3 - scan preprocessing and the solver safety gate.
     # ------------------------------------------------------------------
@@ -1588,6 +1639,36 @@ def invalidate_all_measurement_results(context, reason):
     return count
 
 
+def clear_repair_lists(props):
+    props.boundary_loops.clear()
+    props.repair_components.clear()
+    props.boundary_loop_index = 0
+    props.repair_component_index = 0
+
+
+def clear_repair_state(props):
+    """Forget the repair analysis. No object or mesh is touched."""
+    clear_repair_lists(props)
+    props.repair_report = ""
+    props.repair_readiness = ""
+    props.repair_valid = False
+    props.repair_object = ""
+
+
+def active_boundary_loop(props):
+    index = props.boundary_loop_index
+    if 0 <= index < len(props.boundary_loops):
+        return props.boundary_loops[index]
+    return None
+
+
+def active_repair_component(props):
+    index = props.repair_component_index
+    if 0 <= index < len(props.repair_components):
+        return props.repair_components[index]
+    return None
+
+
 def metric_tensor(matrix_world, multiplier):
     """(L^T L) * multiplier^2 as 9 floats, row major.
 
@@ -1781,6 +1862,8 @@ classes = (
     BSMT_Landmark,
     BSMT_Measurement,
     BSMT_ScanProvenance,
+    BSMT_BoundaryLoop,
+    BSMT_RepairComponent,
     BSMT_ComponentInfo,
     BSMT_Properties,
 )

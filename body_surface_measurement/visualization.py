@@ -20,6 +20,9 @@ LINE_NAME = "BSMT_Straight_Line"
 COMPONENT_PREFIX = "BSMT_Component_"
 LANDMARK_PREFIX = "BSMT_Landmark_"
 MEASUREMENT_PREFIX = "BSMT_Measurement_"
+REPAIR_PREFIX = "BSMT_Repair_"
+REPAIR_NON_MANIFOLD = REPAIR_PREFIX + "NonManifold"
+REPAIR_BOUNDARY = REPAIR_PREFIX + "Boundary"
 STRAIGHT_SUFFIX = "_Straight"
 PATH_SUFFIX = "_Path"
 
@@ -36,6 +39,12 @@ LINE_COLOR = (1.0, 0.85, 0.1, 1.0)  # yellow
 LANDMARK_COLOR = (0.15, 0.9, 0.35, 1.0)         # green
 LANDMARK_STALE_COLOR = (1.0, 0.45, 0.0, 1.0)    # orange
 LANDMARK_UNVERIFIED_COLOR = (0.75, 0.75, 0.2, 1.0)  # dull yellow
+
+# Repair highlights. Deliberately alarming colours: they mark the places the
+# exact solver is not safe on, and they are overlays only - no mesh is edited
+# to draw them.
+REPAIR_NON_MANIFOLD_COLOR = (1.0, 0.05, 0.35, 1.0)   # magenta-red
+REPAIR_BOUNDARY_COLOR = (0.15, 0.6, 1.0, 1.0)        # blue
 
 # Marker spheres are built once at radius 1.0 and resized with object scale, so
 # changing "Marker Size" never rebuilds geometry.
@@ -293,6 +302,9 @@ def clear_all(context):
         if obj.name.startswith(MEASUREMENT_PREFIX):
             # Measurement visualisation likewise has its own lifetime and its
             # own Clear buttons (sect. 14).
+            continue
+        if obj.name.startswith(REPAIR_PREFIX):
+            # Repair highlights have their own Clear button too.
             continue
         if remove_object(obj):
             removed += 1
@@ -573,3 +585,51 @@ def apply_measurement_display(context, props):
             if obj.data.materials:
                 obj.data.materials[0].diffuse_color = color
         obj.color = color
+
+
+# ---------------------------------------------------------------------------
+# repair highlights (Milestone 3.4)
+# ---------------------------------------------------------------------------
+#
+# Edge-only helper meshes drawn over the scan. They carry no faces, are never
+# selectable, and never touch the mesh they describe - highlighting a defect
+# must not be able to change it.
+
+
+def _edge_mesh(name, points_local, edges):
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata([tuple(float(v) for v in point) for point in points_local],
+                     [(int(a), int(b)) for a, b in edges], [])
+    mesh.update()
+    mesh[HELPER_FLAG] = True
+    return mesh
+
+
+def show_repair_edges(context, props, name, points_local, edges, matrix_world,
+                      color):
+    """Draw a set of edges over a scan. Returns the helper object, or None."""
+    existing = _existing_helper(name)
+    if existing is not None:
+        remove_object(existing)
+    if len(edges) == 0:
+        return None
+    mesh = _edge_mesh(name + "_Mesh", points_local, edges)
+    obj = new_helper_object(context, name, mesh, color)
+    obj.show_in_front = True          # a defect hidden inside the scan is
+    obj.display_type = 'WIRE'         # exactly the one you need to see
+    obj.matrix_world = matrix_world
+    return obj
+
+
+def clear_repair_highlights():
+    """Remove every repair highlight. Nothing else is affected."""
+    removed = 0
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith(REPAIR_PREFIX) and is_helper(obj):
+            if remove_object(obj):
+                removed += 1
+    return removed
+
+
+def repair_highlight_exists(name):
+    return _existing_helper(name) is not None

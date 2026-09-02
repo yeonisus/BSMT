@@ -7,8 +7,8 @@
 bundled Python 3.11.15, numpy 1.26.4 — **all detected at runtime, 2026-09-02** (§5.1a)
 **Status:** Phase 1 complete and validated on a real human-body scan. Milestones 2.0, 2.0a,
 2.1, 2.2, 2.3, 3.0 (Landmark Manager), 3.1 (Measurement Manager) and
-3.2 (Measurement Visualisation) and **3.3 (Scan Preprocessing)** implemented and validated in
-Blender. Real-scan acceptance testing of 2.3, 3.0, 3.1, 3.2 and 3.3 is outstanding.
+3.2 (Measurement Visualisation), 3.3 (Scan Preprocessing) and **3.4 (Mesh Repair)** implemented
+and validated in Blender. Real-scan acceptance testing of 2.3 and 3.0–3.4 is outstanding.
 
 > Note on this document's history: no `PROJECT_SPEC.md` existed in the project before this
 > revision. Phase 1 was specified conversationally and implemented from that specification.
@@ -29,7 +29,8 @@ on textured OBJ human-body scans.
 | 3.1 | User-defined measurement manager: definitions, batch calculation, templates | **Done** (v0.9.0) |
 | 3.2 | Measurement visualisation: straight chords and exact geodesic paths | **Done** (v0.10.0) |
 | 3.3 | Scan preprocessing: textured measurement copy + solver safety gate | **Done** (v0.11.0) |
-| 3.4+ | CSV/XLSX export, alignment, automatic landmark detection | Not designed |
+| 3.4 | Controlled mesh repair and measurement readiness | **Done** (v0.12.0) |
+| 3.5+ | CSV/XLSX export, alignment, automatic landmark detection | Not designed |
 | Future | Anatomical scan alignment (§13) | Requirement recorded, not designed |
 
 Non-goals for Phase 2, explicitly: automatic landmark detection, mesh repair as a measurement
@@ -1917,6 +1918,100 @@ Toggle showed one object at a time without deleting either.
 **Outstanding: real-scan acceptance on the 2.78M-triangle textured OBJ** (§15 of the brief) — in
 particular the decimation time at that scale and whether the post-check still reports non-manifold
 edges, in which case exact geodesic must not be run.
+
+---
+
+## 11f. Milestone 3.4 — Controlled mesh repair (v0.12.0, 2026-09-02)
+
+Repairs the topology defects that block exact geodesic measurement, one explicitly chosen region
+at a time.
+
+### 11f.1 Two absolute constraints
+
+**Repairs run only on a generated measurement copy.** Every repair operator resolves
+`Object.bsmt_scan.is_measurement_copy` first and refuses anything else by name, so the source scan
+cannot be reached. Each repair additionally re-checks the source's triangle count afterwards and
+reports a bug if it moved.
+
+**There is no global cleanup path.** No merge-by-distance over the whole mesh, no fill-every-hole,
+no "make it manifold" button — asserted by a test that greps `meshrepair.py` for
+`remove_doubles(bm, verts=bm.verts` and `holes_fill(bm, edges=bm.edges`. On a human scan those
+fuse anatomically distinct surfaces that happen to touch and produce a confidently wrong,
+**systematically short** geodesic.
+
+### 11f.2 What is offered
+
+| Action | Scope |
+|---|---|
+| **Show Non-Manifold** / **Show Selected Boundary** | Edge-only helper overlays, no faces, never selectable. The mesh is not touched to draw them. |
+| **Remove Duplicate Faces** | Faces repeating another's vertex set (winding-insensitive). The safest repair: a duplicated face adds no surface, so removing it cannot move anatomy. |
+| **Weld Non-Manifold Region** | `remove_doubles` on **the reported non-manifold edges' own endpoints and nothing else**. It cannot reach across a gap between an arm and a torso elsewhere in the scan. Tolerance is the researcher's, in mm, and the merged count is reported. |
+| **Fill Selected Boundary** | One loop, chosen from the list. `holes_fill`, falling back to `triangle_fill`, then triangulated. |
+| **Remove Selected Component** | One component, confirmed. The largest is refused outright — that is the body. |
+| **Restore Backup** | The mesh datablock is copied before every destructive edit, independent of Blender's undo stack. |
+
+Boundary loops are listed with edge count, perimeter in mm and bounding-box size, largest
+perimeter first, and open chains are distinguished from closed cycles — a cropped scan's open
+bottom is normal and must be left alone.
+
+### 11f.3 Readiness rule (§7)
+
+**Only non-manifold topology blocks**, because only that has been shown to break the solver.
+Multiple components and open boundaries are stated *preferences*: a landmark pair on one good
+component is perfectly measurable, and a landmark pair spanning two components is already refused
+individually (§7.4). Degenerate triangles and coincident vertices are **warnings only** — refusing
+a whole scan over a handful of them would block real work for no demonstrated reason.
+
+When neither automatic repair clears the non-manifold edges, the blocker text says so and asks for
+manual cleanup rather than attempting something more aggressive.
+
+### 11f.4 After every repair
+
+Diagnostics are rebuilt, the texture is re-audited against the pre-repair record (a loss rolls the
+repair back), the readiness verdict is recomputed, and — because the geometry hash has changed —
+every SurfacePoint on that object is marked **STALE** and the measurements depending on it are
+invalidated. Nothing is ever re-projected onto repaired geometry.
+
+### 11f.5 A defect found while building this
+
+**The hole fill left ngons behind.** `bmesh.ops.holes_fill` returns face references, and the code
+triangulated only the faces not present in a `set(bm.faces)` snapshot taken *before* the op. A
+BMFace reference taken before a topology-changing operation is not reliable afterwards, so the
+membership test silently missed faces: the mesh came back with 2,212 polygons but 2,218 triangles.
+Triangulation is now driven by a **property** — every face with more than three verts — and the
+result is verified before commit. A measurement copy is already all triangles, so that set is
+exactly the faces the fill created.
+
+Also noted: `bmesh` refuses to create a literally duplicated face, so the duplicate-face defect
+had to be built through `from_pydata`, which does allow it. A "fin" (a third face on an interior
+edge) is the more realistic scanner artefact and is *not* auto-repairable — which is the case
+§6 requires to report that manual cleanup is needed.
+
+### 11f.6 Verified in Blender 4.5.13
+
+Textured defect scan (1,116 verts / 2,218 tris, `UVMap` + `SkinMat` + `skin.jpg`) carrying 2
+non-manifold edges, 16 boundary edges and 2 components:
+
+- repairs **refused** on the original, allowed on the copy
+- non-manifold highlight created as an edge-only helper (2 edges, 0 faces); the mesh was unchanged
+- 4 boundary loops listed with perimeters and bounding boxes, open chains distinguished
+- duplicate-face removal correctly **aborted** ("no duplicate faces") and left the mesh untouched;
+  the local weld merged nothing on a fin; readiness stayed NOT READY and said manual cleanup may
+  be required
+- hole fill: boundary 12 → 6, mesh still **all triangles** (2,218 polys / 2,218 tris), texture kept
+- component list showed `Component 1: 2,206 (99.46%) [largest]` and `Component 2: 12 (0.54%)
+  [small]`; removing the largest was refused; removing the small one gave 1 component
+- readiness then `READY — Measurement ready, with caveats` (6 boundary edges remaining)
+- Restore Backup returned the mesh (2,206 → 2,218 triangles) with the texture intact
+- the source scan's triangles, vertices, UVs and materials were unchanged throughout
+
+**Clean-mesh regression:** a defect-free copy reported 0/0/1, `READY` and *ideal*, listed no
+boundary loops and one component, and exact surface distance (130.2824 mm) plus the surface path
+(36 points, agreeing with the distance) both still worked.
+
+**Outstanding: real-scan acceptance on the Design X measurement copy and the full-body PLY** — in
+particular whether decimation leaves the 7 non-manifold edges, and whether they are duplicate
+faces (auto-repairable) or fins (manual).
 
 ---
 
