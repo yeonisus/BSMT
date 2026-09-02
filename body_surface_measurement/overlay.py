@@ -39,7 +39,7 @@ import math
 
 import bpy
 
-from . import landmarks, visualization
+from . import geodesic, landmarks, visualization
 
 #: The draw handler lives in the driver namespace rather than a module global
 #: so it survives Blender's "Reload Scripts", which re-imports this module and
@@ -69,6 +69,20 @@ DISC_SEGMENTS = 16
 #: A cap so a pathological scene cannot make the viewport unusable. A protocol
 #: of 100 landmarks draws in full.
 MAX_LANDMARKS = 512
+
+#: How much nearer than the landmark something has to be before it counts as
+#: hiding it (Milestone 3.10). A FRACTION of the distance from the viewer, so
+#: it means the same thing at any zoom and in any unit: at a 2 m view distance
+#: 1e-3 is 2 mm.
+#:
+#: A tolerance is unavoidable. The landmark sits exactly ON the surface, so the
+#: ray that looks for an occluder hits that same surface at the landmark's own
+#: position; without a margin every landmark would hide itself. Near a
+#: silhouette the ray grazes the body and hits a neighbouring triangle a
+#: fraction in front, which is why the margin is millimetres rather than
+#: microns - and still nowhere near the ~200 mm of body thickness that hides a
+#: landmark on the far side.
+OCCLUSION_TOLERANCE = 1e-3
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +150,7 @@ def entries(props, collection, active_index=-1):
         selected = index == int(active_index)
         entry = {
             "stable_id": int(item.stable_id),
+            "source_object": str(point.source_object),
             "world": (float(point.world_xyz[0]), float(point.world_xyz[1]),
                       float(point.world_xyz[2])),
             "selected": selected,
@@ -202,6 +217,25 @@ def ring_lines(center, radius, segments=DISC_SEGMENTS):
     return vertices
 
 
+def is_occluded(hit_distance, landmark_distance,
+                tolerance=OCCLUSION_TOLERANCE):
+    """Is something hiding a landmark at `landmark_distance` from the viewer?
+
+    Pure, so the rule can be tested without a viewport. `hit_distance` is where
+    the view ray first meets the mesh, or None when it misses entirely.
+
+    A miss means nothing is in the way. A hit at (or behind) the landmark is
+    the landmark's own surface, which does not hide it. Only a hit clearly in
+    FRONT of it does.
+    """
+    if hit_distance is None:
+        return False
+    if landmark_distance <= 0.0:
+        return False
+    margin = float(landmark_distance) * float(tolerance)
+    return float(hit_distance) < float(landmark_distance) - margin
+
+
 def selected_ring_radius(radius):
     """Where the selection ring sits: outside the core, never replacing it."""
     return float(radius) + SELECTED_RING_GAP
@@ -242,6 +276,70 @@ def marker_batches(drawn):
                           ring_lines(entry["screen"],
                                      selected_ring_radius(entry["radius"]))))
     return group_by_color(discs), group_by_color(rings)
+
+
+# ---------------------------------------------------------------------------
+# visibility against the mesh (Milestone 3.10)
+# ---------------------------------------------------------------------------
+
+def hide_occluded(drawn, region, rv3d):
+    """Drop the landmarks the mesh is standing in front of.
+
+    `drawn` are entries that already carry their `screen` position, so the
+    view ray is built from that projection - the same one the marker is drawn
+    at - rather than from a second, possibly disagreeing, camera model. That
+    also makes this correct in an orthographic view, where there is no single
+    eye point and `region_2d_to_origin_3d` returns a per-pixel origin.
+
+    The canonical mesh is read with `peek()`, which never builds one. A draw
+    callback must not be able to start a rebuild, and a mesh that has not been
+    analysed yet simply occludes nothing.
+    """
+    from bpy_extras.view3d_utils import (region_2d_to_origin_3d,
+                                         region_2d_to_vector_3d)
+
+    meshcache = (geodesic.meshcache
+                 if geodesic.MESHCACHE_AVAILABLE else None)
+    if meshcache is None:
+        return drawn
+
+    # One canonical lookup, one matrix and ONE matrix inverse per object -
+    # not per landmark. Built fresh every frame on purpose: nothing here is
+    # remembered between redraws, so a moved object or a re-analysed mesh is
+    # picked up at once.
+    per_object = {}
+    visible = []
+    for entry in drawn:
+        name = entry.get("source_object") or ""
+        if name not in per_object:
+            canonical = meshcache.peek(name) if name else None
+            obj = bpy.data.objects.get(name) if name else None
+            per_object[name] = (
+                meshcache.hit_distance_caster(canonical, obj.matrix_world)
+                if canonical is not None and obj is not None else None
+            )
+        cast = per_object[name]
+        if cast is None:
+            # Nothing to test against. Showing the landmark is the honest
+            # failure direction: hiding one because the mesh is not cached
+            # would look like the landmark had been lost.
+            visible.append(entry)
+            continue
+
+        origin = region_2d_to_origin_3d(region, rv3d, entry["screen"])
+        direction = region_2d_to_vector_3d(region, rv3d, entry["screen"])
+        if origin is None or direction is None:
+            visible.append(entry)
+            continue
+
+        world = entry["world"]
+        landmark_distance = math.sqrt(
+            (world[0] - origin[0]) ** 2 + (world[1] - origin[1]) ** 2
+            + (world[2] - origin[2]) ** 2)
+        hit = cast(origin, direction)
+        if not is_occluded(hit, landmark_distance):
+            visible.append(entry)
+    return visible
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +423,18 @@ def _draw():
         entry = dict(entry)
         entry["screen"] = (float(position[0]), float(position[1]))
         drawn.append(entry)
+
+    # Sect. 1: hide what the body is standing in front of. Both the marker and
+    # its label go, together - a name floating where its marker is not would
+    # be worse than either.
+    if props.landmark_visibility == 'OCCLUDED':
+        try:
+            drawn = hide_occluded(drawn, region, rv3d)
+        except Exception:                            # pragma: no cover
+            # A visibility failure must never blank the overlay. Showing
+            # everything is the behaviour of the other mode, not a broken one.
+            import traceback
+            traceback.print_exc()
     if not drawn:
         return
 

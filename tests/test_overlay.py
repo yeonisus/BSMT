@@ -66,6 +66,12 @@ def load(name):
     return module
 
 
+geodesic_stub = types.ModuleType("bsmt_pkg.geodesic")
+geodesic_stub.MESHCACHE_AVAILABLE = False
+geodesic_stub.meshcache = None
+sys.modules["bsmt_pkg.geodesic"] = geodesic_stub
+package.geodesic = geodesic_stub
+
 landmarks = load("landmarks")
 measurement = load("measurement")
 visualization = load("visualization")
@@ -77,9 +83,10 @@ overlay = load("overlay")
 # ---------------------------------------------------------------------------
 
 class FakePoint(object):
-    def __init__(self, valid=True, world=(0.0, 0.0, 0.0)):
+    def __init__(self, valid=True, world=(0.0, 0.0, 0.0), source="A_BSMT"):
         self.valid = valid
         self.world_xyz = world
+        self.source_object = source
 
 
 class FakeLandmark(object):
@@ -98,6 +105,7 @@ class FakeLandmark(object):
 
 class FakeProps(object):
     def __init__(self, **overrides):
+        self.landmark_visibility = 'ALWAYS'
         self.show_landmarks = True
         self.show_landmark_labels = True
         self.landmark_marker_color = (0.15, 0.9, 0.35, 1.0)
@@ -312,8 +320,11 @@ def test_anchoring():
     source = open(os.path.join(PACKAGE, "overlay.py")).read()
     check("and one projection, so they cannot separate",
           source.count("location_3d_to_region_2d(region, rv3d") == 1)
+    entries_source = source.split("def entries(")[1].split("\ndef ")[0]
     check("no helper object is consulted for the position",
-          "bpy.data.objects" not in source)
+          "bpy.data.objects" not in entries_source)
+    check("the position is the stored surface position",
+          "point.world_xyz" in entries_source)
 
 
 def test_visibility():
@@ -420,27 +431,101 @@ def test_text_is_never_cached():
     check("after renaming, the very next read shows the new name",
           overlay.entries(props, items, 0)[2]["text"] == "Acromion_L")
 
+    # The point of the guard is that no LABEL TEXT is remembered between
+    # redraws, so the check is against caching machinery, not the word.
     source = open(os.path.join(PACKAGE, "overlay.py")).read()
-    for forbidden in ("_CACHE", "lru_cache", "cached"):
+    for forbidden in ("_CACHE", "lru_cache", "functools.cache", "@cache"):
         check("overlay.py holds no %s" % forbidden, forbidden not in source)
+    check("and the text is read from the landmark each time",
+          "item.label" in source.split("def entries(")[1].split("\ndef ")[0])
 
 
 # ---------------------------------------------------------------------------
 # the overlay never writes to the scene
 # ---------------------------------------------------------------------------
 
+def test_occlusion_rule():
+    print("\n[visibility] what counts as being hidden by the mesh")
+    # The ray misses the body entirely: nothing is in the way.
+    check("a ray that misses hides nothing",
+          not overlay.is_occluded(None, 2.0))
+
+    # The ray hits the landmark's own surface. This is the case that makes a
+    # tolerance necessary: without one, every landmark would hide itself.
+    check("a hit exactly at the landmark does not hide it",
+          not overlay.is_occluded(2.0, 2.0))
+    check("nor does floating-point noise around it",
+          not overlay.is_occluded(2.0 - 1e-9, 2.0))
+    check("nor a hit just behind it", not overlay.is_occluded(2.1, 2.0))
+
+    # The far side of a body: the near surface is ~200 mm in front.
+    check("the near surface hides a far-side landmark",
+          overlay.is_occluded(1.8, 2.0))
+    check("and so does anything clearly in front",
+          overlay.is_occluded(0.1, 2.0))
+
+    # The tolerance is a FRACTION of the view distance, so it means the same
+    # thing at any zoom and in any unit.
+    for distance in (0.02, 2.0, 2000.0):
+        margin = distance * overlay.OCCLUSION_TOLERANCE
+        check("at distance %g, %g in front is still visible"
+              % (distance, margin * 0.5),
+              not overlay.is_occluded(distance - margin * 0.5, distance))
+        check("  but %g in front is hidden" % (margin * 2.0),
+              overlay.is_occluded(distance - margin * 2.0, distance))
+    check("the tolerance is millimetres at a metre, not microns",
+          0.0005 <= overlay.OCCLUSION_TOLERANCE <= 0.005,
+          overlay.OCCLUSION_TOLERANCE)
+
+    check("a degenerate distance hides nothing",
+          not overlay.is_occluded(0.5, 0.0) and not overlay.is_occluded(0.5, -1.0))
+    check("the tolerance can be overridden for a caller that needs to",
+          overlay.is_occluded(1.999, 2.0, tolerance=1e-6))
+
+
+def test_occlusion_needs_the_owning_mesh():
+    print("\n[visibility] each landmark is tested against its own mesh")
+    props = FakeProps()
+    items = three_landmarks()
+    items[0].surface_point.source_object = "A_BSMT"
+    items[1].surface_point.source_object = "A_BSMT"
+    items[2].surface_point.source_object = "Other"
+    entries = overlay.entries(props, items, 0)
+    check("every entry names the mesh it was picked on",
+          [e["source_object"] for e in entries] == ["A_BSMT", "A_BSMT", "Other"])
+
+    source = open(os.path.join(PACKAGE, "overlay.py")).read()
+    check("the mesh is read with peek(), which never builds one",
+          "meshcache.peek(" in source)
+    check("and never with get(), which would rebuild inside a draw call",
+          "meshcache.get(" not in source)
+    check("the view ray comes from the same projection the marker uses",
+          'entry["screen"]' in source.split("def hide_occluded")[1]
+          .split("def _set_font_size")[0])
+    check("which is what makes it correct in an orthographic view",
+          "region_2d_to_origin_3d" in source)
+    check("a visibility failure cannot blank the overlay",
+          "traceback.print_exc()" in
+          source.split("landmark_visibility == 'OCCLUDED'")[1][:400])
+    check("Always on Top does no ray casting at all",
+          "landmark_visibility == 'OCCLUDED'" in source)
+
+
 def test_the_overlay_is_read_only():
     print("\n[safety] drawing cannot change anything")
     source = open(os.path.join(PACKAGE, "overlay.py")).read()
     for forbidden in ("bpy.data.objects.new", "bpy.data.texts",
                       "bpy.data.curves", "bpy.data.meshes", "bpy.ops",
-                      "meshcache", "bmesh"):
+                      "bmesh"):
         check("overlay.py never uses %s" % forbidden, forbidden not in source)
     check("no object of any kind is created",
           "objects.new" not in source and "font_add" not in source
           and "type='FONT'" not in source)
-    check("it does not import the solver",
-          "geodesic" not in source and "registry" not in source)
+    # The overlay may read the canonical mesh - occlusion needs geometry - but
+    # it must never reach the solver, and never build a mesh from a draw call.
+    for forbidden in ("registry.", "bounded_distance", "surface_path",
+                      "solve.", "meshcache.get("):
+        check("overlay.py never uses %s" % forbidden, forbidden not in source)
     check("the draw callback is POST_PIXEL", "'POST_PIXEL'" in source)
     check("the handle survives Reload Scripts",
           "driver_namespace" in source)
@@ -463,6 +548,8 @@ def main():
         test_visibility,
         test_text_and_status,
         test_text_is_never_cached,
+        test_occlusion_rule,
+        test_occlusion_needs_the_owning_mesh,
         test_the_overlay_is_read_only,
     ):
         test()

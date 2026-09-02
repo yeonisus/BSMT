@@ -715,6 +715,8 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         row.prop(props, "show_landmarks", toggle=False)
         row.prop(props, "show_landmark_labels", toggle=False)
 
+        box.prop(props, "landmark_visibility", text="Visibility")
+
         marker = box.column(align=True)
         marker.enabled = bool(props.show_landmarks)
         marker.prop(props, "landmark_marker_color")
@@ -735,6 +737,10 @@ class BSMT_PT_landmarks(bpy.types.Panel):
                           "every landmark stays the same size at any zoom.",
                           44):
             note.label(text=line)
+        if props.landmark_visibility == 'OCCLUDED':
+            for line in _wrap("Visible Surface Only hides a landmark while "
+                              "the mesh is in front of it.", 44):
+                note.label(text=line)
         if ((props.show_landmarks or props.show_landmark_labels)
                 and not overlay.is_registered()):
             warn = box.row()

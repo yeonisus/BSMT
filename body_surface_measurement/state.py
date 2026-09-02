@@ -861,6 +861,20 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         description="Show the landmark marker and label settings",
         default=False,
     )
+    landmark_visibility: EnumProperty(
+        name="Landmark Visibility",
+        description="Whether landmarks behind the mesh are still drawn",
+        items=(
+            ('ALWAYS', "Always on Top",
+             "Draw every landmark, including the ones on the far side of the "
+             "body"),
+            ('OCCLUDED', "Visible Surface Only",
+             "Hide a landmark's marker and label while the mesh is in front "
+             "of it"),
+        ),
+        default='ALWAYS',
+        update=_on_landmark_display_changed,
+    )
     landmark_label_scope: EnumProperty(
         name="Show",
         description="Which landmarks get a label",

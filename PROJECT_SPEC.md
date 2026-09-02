@@ -2810,6 +2810,90 @@ acceptance scripts, from Milestone 3.0 onward, re-run clean with 0 tracebacks.
 
 ---
 
+## 11n. Landmark visibility mode (v0.17.1, 2026-09-02)
+
+v0.17.0 draws every landmark on top of the scan, because a POST_PIXEL callback has no usable depth
+buffer. That is right for placing landmarks and wrong for reading a pose: on a body, half the
+markers belong to the far side. **Landmark Visibility** now offers *Always on Top* (unchanged
+default) and *Visible Surface Only*.
+
+### 11n.1 The test, and why it is a ray rather than a depth buffer
+
+Moving markers to POST_VIEW would give depth testing for free and cost exact pixel sizing — the
+whole point of 3.9. Instead, a landmark that is about to be drawn is checked with a ray:
+`overlay.hide_occluded()` casts from the viewer toward the landmark, against the BVH of **the mesh
+the landmark was picked on**, and drops the entry when the surface is hit in front of it. Marker
+and label go together — a name floating where its marker is not would be worse than either.
+
+The ray is built from the **same screen position the marker is drawn at**
+(`region_2d_to_origin_3d` / `region_2d_to_vector_3d`), not from a second camera model that could
+disagree. That is also what makes it correct in an **orthographic** view, where there is no single
+eye point and the origin is per-pixel.
+
+The canonical mesh is read with `peek()`, never `get()`. A draw callback must not be able to start
+a mesh rebuild; a mesh that has not been analysed yet simply occludes nothing. A test asserts
+`meshcache.get(` never appears in `overlay.py`.
+
+Everything from 3.9 is preserved: pixel marker size, pixel label size, the selection ring, status
+styling. *Always on Top* does no ray casting at all.
+
+### 11n.2 The tolerance is not optional
+
+A landmark sits exactly ON the surface, so the ray that looks for an occluder hits that same
+surface at the landmark's own position. Without a margin **every landmark would hide itself**.
+
+`OCCLUSION_TOLERANCE = 1e-3` is a **fraction of the distance from the viewer**, so it means the
+same thing at any zoom and in any unit — 2 mm at a 2 m view distance. Millimetres rather than
+microns because near a silhouette the ray grazes the body and hits a neighbouring triangle a
+fraction in front; and still nowhere near the ~200 mm of body thickness that hides a landmark on
+the far side. `is_occluded()` is pure and tested on its own.
+
+A related case is worth recording, because it looks like a bug: a landmark stored in single
+precision can sit a fraction **outside** the surface, and a ray aimed at it along the normal at a
+silhouette extremum can graze past and hit nothing. Observed in the acceptance run. Reporting
+"nothing in the way" is the correct answer there — the landmark is being looked at head on.
+
+### 11n.3 A performance problem found by measuring, not by guessing
+
+The first working version cost **2.34 ms per frame** for 100 landmarks — about 14% of a 60 fps
+frame, during exactly the orbiting where it runs. A BVH ray cast is not the expensive part: 100
+casts against a 239k-triangle mesh take 0.13 ms. Two other things were.
+
+`ray_hit_distance()` inverted the object matrix **once per ray**. Hoisted into
+`meshcache.hit_distance_caster()`, which prepares the inverse once per object and returns a
+closure: **2.34 ms → 1.23 ms**.
+
+The remainder was numpy. The BVH takes and returns mathutils Vectors, so a numpy inner loop
+converted twice per ray. Rewriting the hot path in mathutils: **1.23 ms → 0.556 ms**, a 4×
+improvement overall. *Always on Top* is unchanged at 0.25 ms.
+
+The shared local-space ray transform now has one definition (`meshcache._local_ray`), used by
+picking and by the occlusion test, so the two cannot disagree about where a world ray lands.
+
+### 11n.4 Verified in Blender 4.5.13
+
+50 checks, 0 failures, on a body-proportioned mesh with landmarks at the front, the back and the
+subject's left:
+
+| Case | Result |
+|---|---|
+| Viewed from the front | front visible, back hidden |
+| Viewed from the back | back visible, front hidden |
+| Viewed from the left | side visible, front and back hidden |
+| Viewed from the right | all three hidden — correct for these three positions |
+| Full 24-step orbit | every landmark visible somewhere; visibility changes; each visible over a contiguous arc of 11–13 steps, no flicker |
+| Head-on view of each landmark | none occludes itself |
+| Body rotated 180° | visibility swaps; rotating back restores it exactly |
+| Canonical mesh dropped | nothing hidden; rebuilding restores the same answer |
+| 100 landmarks | 0.556 ms per frame, 49 visible from the front |
+| Always on Top | all 100 drawn, one radius, one disc batch, one ring — 3.9 behaviour exactly |
+
+Offline: `tests/test_overlay.py` grows to 126 checks. Full regression 1,671 checks across twelve
+suites, 1,781 with pygeodesic staged, 0 failures. All fourteen Blender acceptance scripts re-run
+clean, and `tools/check_overlay_render.py` still renders on a real GPU.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

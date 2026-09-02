@@ -22,7 +22,7 @@ import time
 import bpy
 import numpy as np
 from bpy.app.handlers import persistent
-from mathutils import Vector
+from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
 
 from ..measurement import unit_multiplier
@@ -218,27 +218,94 @@ def invalidate(object_name=None):
         _CACHE.pop(object_name, None)
 
 
+def _local_ray(matrix_world, origin_world, direction_world):
+    """A world ray expressed in object-local coordinates, or None.
+
+    One definition, because both picking and the overlay's occlusion test have
+    to agree exactly about where a world ray lands in the local space the BVH
+    is built in.
+    """
+    matrix = np.asarray(matrix_world, dtype=np.float64)
+    linear = matrix[:3, :3]
+    if abs(float(np.linalg.det(linear))) < 1e-30:
+        return None
+
+    inverse = np.linalg.inv(linear)
+    translation = matrix[:3, 3]
+    origin_local = inverse @ (np.asarray(origin_world, dtype=np.float64)
+                              - translation)
+    direction_local = inverse @ np.asarray(direction_world, dtype=np.float64)
+    length = float(np.linalg.norm(direction_local))
+    if length == 0.0:
+        return None
+    return linear, translation, origin_local, direction_local / length
+
+
+def hit_distance_caster(canonical, matrix_world):
+    """A reusable "how far to the first surface hit" query for one object.
+
+    Returns a callable (origin_world, direction_world) -> distance-or-None, or
+    None if the transform is not invertible.
+
+    It exists so the matrix inverse is computed ONCE per object rather than
+    once per ray. The landmark overlay casts one ray per landmark on every
+    redraw, and inverting a 3x3 a hundred times a frame was measurably more
+    expensive than the ray casts themselves.
+
+    The distance is all it returns. A hit whose barycentric coordinates fail
+    to normalise is still a real occluder, so this deliberately does not go
+    through ray_cast_local's validation.
+    """
+    rows = np.asarray(matrix_world, dtype=np.float64)
+    if abs(float(np.linalg.det(rows[:3, :3]))) < 1e-30:
+        return None
+
+    # mathutils, not numpy, for everything the ray touches. The BVH takes and
+    # returns mathutils Vectors, so working in numpy would convert twice per
+    # ray - measurably more than the ray cast itself once there are a hundred
+    # landmarks and this runs on every redraw.
+    linear = Matrix([list(row[:3]) for row in rows[:3]])
+    inverse = linear.inverted()
+    translation = Vector(rows[:3, 3].tolist())
+
+    def cast(origin_world, direction_world):
+        origin = Vector((float(origin_world[0]), float(origin_world[1]),
+                         float(origin_world[2])))
+        direction_local = inverse @ Vector(
+            (float(direction_world[0]), float(direction_world[1]),
+             float(direction_world[2])))
+        if direction_local.length == 0.0:
+            return None
+        hit = canonical.bvh.ray_cast(inverse @ (origin - translation),
+                                     direction_local.normalized())
+        if hit is None or hit[0] is None:
+            # A miss is a real answer. It also covers the tangent case: a
+            # point stored in single precision can sit a fraction OUTSIDE the
+            # surface, and a ray aimed at it along the normal at a silhouette
+            # extremum can graze past. Reporting "nothing in the way" is the
+            # right answer there - the landmark is being looked at head on.
+            return None
+        return float(((linear @ hit[0]) + translation - origin).length)
+
+    return cast
+
+
+def ray_hit_distance(canonical, matrix_world, origin_world, direction_world):
+    """One-shot form of `hit_distance_caster`, for a single ray."""
+    cast = hit_distance_caster(canonical, matrix_world)
+    return None if cast is None else cast(origin_world, direction_world)
+
+
 def ray_cast_local(canonical, matrix_world, origin_world, direction_world):
     """Cast a world-space ray against the canonical BVH in local coordinates.
 
     Returns (triangle_index, location_local, location_world, bary) or None.
     The returned index directly indexes canonical.triangles.
     """
-    matrix = np.asarray(matrix_world, dtype=np.float64)
-    linear = matrix[:3, :3]
-    determinant = float(np.linalg.det(linear))
-    if abs(determinant) < 1e-30:
+    prepared = _local_ray(matrix_world, origin_world, direction_world)
+    if prepared is None:
         return None
-
-    inverse = np.linalg.inv(linear)
-    translation = matrix[:3, 3]
-
-    origin_local = inverse @ (np.asarray(origin_world, dtype=np.float64) - translation)
-    direction_local = inverse @ np.asarray(direction_world, dtype=np.float64)
-    length = float(np.linalg.norm(direction_local))
-    if length == 0.0:
-        return None
-    direction_local = direction_local / length
+    linear, translation, origin_local, direction_local = prepared
 
     hit = canonical.bvh.ray_cast(
         Vector(origin_local.tolist()), Vector(direction_local.tolist())
