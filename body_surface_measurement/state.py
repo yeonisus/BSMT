@@ -17,8 +17,8 @@ from bpy.props import (
     StringProperty,
 )
 
-from . import (alignment, geodesic, labels, landmarks, measurement,
-               measurements, preprocess, readiness, visualization)
+from . import (alignment, geodesic, landmarks, measurement, measurements,
+               overlay, preprocess, readiness, visualization)
 
 
 def _on_display_changed(self, context):
@@ -141,19 +141,18 @@ def _on_landmark_name_changed(self, context):
 
 
 def _on_landmark_display_changed(self, context):
-    """Re-apply landmark marker size, colour and visibility. Cosmetic only."""
-    visualization.apply_landmark_display(context, self)
-    labels.tag_redraw(context)
+    """A marker or label setting changes no object, so ask for a repaint.
 
-
-def _on_landmark_label_changed(self, context):
-    """A label setting changes no object, so ask the viewport to repaint.
-
-    Without this the overlay would keep the old size or colour until the 3D
-    view happened to redraw for some other reason, and the control would look
-    broken.
+    Since Milestone 3.9 both markers and labels are drawn by the screen-space
+    overlay, so nothing here touches an object at all. Without the redraw the
+    overlay would keep the old size or colour until the 3D view happened to
+    repaint for some other reason, and the control would look broken.
     """
-    labels.tag_redraw(context)
+    overlay.tag_redraw(context)
+
+
+#: Markers and labels are now the same overlay, so they refresh the same way.
+_on_landmark_label_changed = _on_landmark_display_changed
 
 
 class BSMT_Landmark(bpy.types.PropertyGroup):
@@ -797,14 +796,14 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         default=True,
         update=_on_landmark_display_changed,
     )
-    landmark_marker_size_mm: FloatProperty(
-        name="Marker Size (mm)",
-        description="Diameter of a landmark marker, in millimetres. The "
-                    "marker is a display helper; changing it never moves a "
-                    "landmark",
-        default=12.0,
-        min=0.1,
-        soft_max=100.0,
+    landmark_marker_size_px: IntProperty(
+        name="Marker Size (px)",
+        description="Diameter of a landmark marker in SCREEN PIXELS, so every "
+                    "landmark reads at exactly the same size however far you "
+                    "zoom. The marker is an annotation; changing it never "
+                    "moves a landmark",
+        default=overlay.DEFAULT_MARKER_SIZE,
+        min=2, max=20,
         update=_on_landmark_display_changed,
     )
     landmark_marker_color: FloatVectorProperty(
@@ -837,7 +836,7 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         name="Label Size",
         description="Label text height in SCREEN PIXELS, so labels stay the "
                     "same size however far you zoom",
-        default=labels.DEFAULT_LABEL_SIZE,
+        default=overlay.DEFAULT_LABEL_SIZE,
         min=6, max=64,
         update=_on_landmark_label_changed,
     )
@@ -846,7 +845,7 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         description="How far the label sits from the marker, in screen "
                     "pixels, so the text never covers the surface point it "
                     "names",
-        default=labels.DEFAULT_LABEL_OFFSET,
+        default=overlay.DEFAULT_LABEL_OFFSET,
         min=0, max=60,
         update=_on_landmark_label_changed,
     )

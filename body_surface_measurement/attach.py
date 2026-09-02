@@ -161,7 +161,10 @@ def refresh_alignment_points(props, watched=None, multiplier=None):
 
 
 def refresh_landmarks(props, watched=None, multiplier=None):
-    """Move named landmark markers to follow their object. Returns a note.
+    """Re-derive each landmark's world position from the live matrix.
+
+    The marker and the label are drawn from `world_xyz`, so keeping it current
+    IS keeping them attached - there is no helper object to move as well.
 
     Vectorised per source object (sect. 17): one canonical lookup, one
     gather, one matrix product for every landmark on that object. It never
@@ -252,6 +255,10 @@ def refresh_landmarks(props, watched=None, multiplier=None):
             point = item.surface_point
             if _changed(point.world_xyz, position):
                 point.world_xyz = tuple(float(v) for v in position)
+                # Counted here rather than from a helper object: since 3.9 the
+                # marker is DRAWN from this value, so "the landmark moved" and
+                # "the marker moved" are the same event.
+                moved += 1
             # Compared separately from the world position: a coordinate-unit
             # change moves nothing in the world but does change the physical
             # millimetre value, so keying this off "did it move" leaves a
@@ -259,8 +266,6 @@ def refresh_landmarks(props, watched=None, multiplier=None):
             wanted_mm = tuple(float(v) * multiplier for v in position)
             if _changed(point.physical_mm_xyz, wanted_mm):
                 point.physical_mm_xyz = wanted_mm
-            if visualization.move_landmark_marker(item.stable_id, position):
-                moved += 1
 
     note = "landmarks:moved=%d" % moved
     if missing:

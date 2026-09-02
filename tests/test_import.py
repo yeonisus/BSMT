@@ -129,7 +129,7 @@ def install_stubs():
     bpy.app = types.SimpleNamespace(
         version=(4, 5, 13),
         handlers=types.SimpleNamespace(
-            depsgraph_update_post=[], persistent=_persistent
+            depsgraph_update_post=[], load_post=[], persistent=_persistent
         ),
         # BSMT keeps the label draw handle here so it survives a Reload
         # Scripts, exactly as Blender's own driver namespace does.
@@ -138,6 +138,7 @@ def install_stubs():
     handlers_mod = types.ModuleType("bpy.app.handlers")
     handlers_mod.persistent = _persistent
     handlers_mod.depsgraph_update_post = bpy.app.handlers.depsgraph_update_post
+    handlers_mod.load_post = bpy.app.handlers.load_post
     sys.modules["bpy.app"] = types.ModuleType("bpy.app")
     sys.modules["bpy.app"].handlers = bpy.app.handlers
     sys.modules["bpy.app.handlers"] = handlers_mod
@@ -1018,6 +1019,74 @@ def test_landmark_modules_are_pure(bsmt):
           "fill_surface_point(" in state_source)
 
 
+def test_every_cross_module_call_resolves(bsmt):
+    """Every `module.function(` in the package names something that exists.
+
+    This is the guard for a specific, real mistake: Milestone 3.9 deleted
+    `visualization.remove_landmark_marker`, two operators still called it, and
+    `bsmt.remove_landmark` crashed. Nothing offline caught it, because those
+    operators only run inside Blender. A static check does catch it, and costs
+    nothing.
+    """
+    import re as _re
+    import os as _os
+
+    print("\ncross-module calls all resolve")
+    package = _os.path.join(ROOT, "body_surface_measurement")
+    modules = [name[:-3] for name in sorted(_os.listdir(package))
+               if name.endswith(".py") and name != "__init__.py"]
+    def imported_siblings(source):
+        """The sibling modules this file actually imports.
+
+        Only those are checked. A local variable that happens to share a
+        module's name - `landmarks = []` in protocol.py - is not a call into
+        that module, and `gpu.state.blend_set()` is not a call into state.py.
+        """
+        names = set()
+        for block in _re.findall(r"from \.\s+import\s+\(([^)]*)\)", source):
+            names.update(part.strip() for part in block.split(","))
+        for line in _re.findall(r"from \.\s+import\s+([^\n(]+)", source):
+            names.update(part.strip() for part in line.split(","))
+        return {name for name in names if name in modules}
+
+    missing = []
+    checked = 0
+    for name in modules:
+        source = open(_os.path.join(package, name + ".py")).read()
+        for other in sorted(imported_siblings(source)):
+            if other == name:
+                continue
+            target = getattr(bsmt, other, None)
+            if target is None:
+                continue
+            # (?<![.\w]) so `gpu.state.blend_set()` is not read as a call
+            # into BSMT's own state module.
+            for attribute in set(_re.findall(
+                    r"(?<![.\w])%s\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\(" % other,
+                    source)):
+                checked += 1
+                if not hasattr(target, attribute):
+                    missing.append("%s.py calls %s.%s()"
+                                   % (name, other, attribute))
+    check("every cross-module call resolves (%d checked)" % checked,
+          not missing, missing[:5])
+
+    # And the same for the geodesic subpackage, reached through the facade.
+    geodesic_missing = []
+    for name in modules:
+        source = open(_os.path.join(package, name + ".py")).read()
+        if "geodesic" not in imported_siblings(source) and \
+                "geodesic" not in source.split("\n\n")[0]:
+            pass
+        for attribute in set(_re.findall(
+                r"(?<![.\w])geodesic\.([a-z_][a-zA-Z0-9_]*)\s*\(", source)):
+            if not hasattr(bsmt.geodesic, attribute):
+                geodesic_missing.append("%s.py calls geodesic.%s()"
+                                        % (name, attribute))
+    check("every geodesic call resolves", not geodesic_missing,
+          geodesic_missing[:5])
+
+
 def test_ui_wording_is_consistent(bsmt):
     """Milestone 3.7: one word per concept, everywhere the user can see it.
 
@@ -1113,43 +1182,65 @@ def test_ui_wording_is_consistent(bsmt):
     # Milestone 3.8: the label overlay is a draw handler, not a pile of Text
     # objects. If it ever started creating datablocks, fifty landmarks would
     # mean fifty extra objects in the researcher's file.
-    labels_text = open(_os.path.join(ROOT, "body_surface_measurement",
-                                     "labels.py")).read()
-    check("labels module is loaded", hasattr(bsmt, "labels"))
+    overlay_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                      "overlay.py")).read()
+    init_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                   "__init__.py")).read()
+    state_text2 = open(_os.path.join(ROOT, "body_surface_measurement",
+                                     "state.py")).read()
+    check("overlay module is loaded", hasattr(bsmt, "overlay"))
+    check("and the old labels module is gone",
+          not _os.path.exists(_os.path.join(
+              ROOT, "body_surface_measurement", "labels.py")))
     # The handler must balance: register/unregister leaves nothing behind, and
     # a second register does not stack a duplicate overlay.
     handlers = sys.modules["bpy"].types._draw_handlers
     before = len(handlers)
-    bsmt.labels.register()
+    bsmt.overlay.register()
     check("register installs one draw handler", len(handlers) == before + 1)
-    bsmt.labels.register()
+    bsmt.overlay.register()
     check("registering again does not stack a second",
           len(handlers) == before + 1, len(handlers))
-    check("unregister removes it", bsmt.labels.unregister())
+    check("unregister removes it", bsmt.overlay.unregister())
     check("and leaves none behind", len(handlers) == before)
     check("unregistering twice is harmless",
-          bsmt.labels.unregister() is False)
-    check("labels are drawn with a SpaceView3D handler",
-          "SpaceView3D.draw_handler_add" in labels_text)
-    check("in POST_PIXEL space, so text is screen-sized",
-          "'POST_PIXEL'" in labels_text)
+          bsmt.overlay.unregister() is False)
+    check("the overlay uses a SpaceView3D handler",
+          "SpaceView3D.draw_handler_add" in overlay_text)
+    check("in POST_PIXEL space, so markers and text are screen-sized",
+          "'POST_PIXEL'" in overlay_text)
     check("and it creates no object of its own",
-          "objects.new" not in labels_text and "bpy.ops" not in labels_text)
+          "objects.new" not in overlay_text and "bpy.ops" not in overlay_text)
     check("the overlay is registered with the add-on",
-          "labels.register()" in open(_os.path.join(
-              ROOT, "body_surface_measurement", "__init__.py")).read())
-    check("and unregistered with it",
-          "labels.unregister()" in open(_os.path.join(
-              ROOT, "body_surface_measurement", "__init__.py")).read())
+          "overlay.register()" in init_text)
+    check("and unregistered with it", "overlay.unregister()" in init_text)
+
+    # Milestone 3.9: landmark markers are screen-space, so nothing builds a
+    # marker object any more, and no millimetre size reaches one.
+    check("no landmark marker object is ever created",
+          "update_landmark_marker" not in ops_text)
+    check("nor moved",
+          "move_landmark_marker" not in open(_os.path.join(
+              ROOT, "body_surface_measurement", "attach.py")).read())
+    check("the millimetre marker property is gone",
+          "landmark_marker_size_mm" not in state_text2)
+    check("and the pixel one replaces it",
+          "landmark_marker_size_px" in state_text2)
+    check("Point A/B keep their own millimetre marker",
+          "marker_size_mm: FloatProperty" in state_text2)
     check("label size is never a millimetre value",
-          "landmark_label_size_mm" not in
-          open(_os.path.join(ROOT, "body_surface_measurement",
-                             "state.py")).read())
+          "landmark_label_size_mm" not in state_text2)
+    check("markers left by older versions are swept",
+          "_sweep_legacy_landmark_markers" in init_text)
+    check("including in a file opened later",
+          "load_post" in init_text)
+
     check("the panel section is called Landmark Display",
           '"Landmark Display"' in panels_text)
     for expected in ("show_landmarks", "show_landmark_labels",
-                     "landmark_marker_color", "landmark_label_color",
-                     "landmark_label_size", "landmark_label_offset"):
+                     "landmark_marker_color", "landmark_marker_size_px",
+                     "landmark_label_color", "landmark_label_size",
+                     "landmark_label_offset"):
         check("the panel exposes %s" % expected,
               '"%s"' % expected in panels_text)
     check("landmark status text has one definition",
@@ -1176,6 +1267,7 @@ def main():
     test_extract_binds_submodules_directly(bsmt)
     test_landmark_modules_are_pure(bsmt)
     test_register_smoke(bsmt)
+    test_every_cross_module_call_resolves(bsmt)
     test_ui_wording_is_consistent(bsmt)
     test_broken_extract_module()
 

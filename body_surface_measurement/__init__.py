@@ -11,7 +11,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 16, 0),
+    "version": (0, 17, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (
@@ -26,7 +26,8 @@ bl_info = {
         "Milestone 3.5: automatic local non-manifold repair. "
         "Milestone 3.6: rigid anatomical alignment. "
         "Milestone 3.7: UI wording, measurement drafts, readiness. "
-        "Milestone 3.8: landmark labels and display controls"
+        "Milestone 3.8: landmark labels and display controls. "
+        "Milestone 3.9: screen-space landmark markers"
     ),
     "category": "3D View",
 }
@@ -36,9 +37,9 @@ if "bpy" in locals():
     import importlib
 
     from . import (
-        alignment, attach, geodesic, labels, landmarks, measurement,
-        measurements, meshrepair, panels, picking, preprocess, protocol,
-        readiness, repair, scancopy, state, visualization, viz, operators,
+        alignment, attach, geodesic, landmarks, measurement, measurements,
+        meshrepair, overlay, panels, picking, preprocess, protocol, readiness,
+        repair, scancopy, state, visualization, viz, operators,
     )
 
     importlib.reload(geodesic)
@@ -52,7 +53,7 @@ if "bpy" in locals():
     importlib.reload(protocol)
     importlib.reload(measurement)
     importlib.reload(visualization)
-    importlib.reload(labels)
+    importlib.reload(overlay)
     importlib.reload(state)
     importlib.reload(scancopy)
     importlib.reload(meshrepair)
@@ -63,9 +64,9 @@ if "bpy" in locals():
     importlib.reload(attach)
 else:
     from . import (
-        alignment, attach, geodesic, labels, landmarks, measurement,
-        measurements, meshrepair, operators, panels, picking, preprocess,
-        protocol, readiness, repair, scancopy, state, visualization, viz,
+        alignment, attach, geodesic, landmarks, measurement, measurements,
+        meshrepair, operators, overlay, panels, picking, preprocess, protocol,
+        readiness, repair, scancopy, state, visualization, viz,
     )
 
 import bpy  # noqa: E402  (kept after the reload guard on purpose)
@@ -79,6 +80,53 @@ def _version_string():
     return ".".join(str(part) for part in bl_info["version"])
 
 
+def _sweep_legacy_landmark_markers():
+    """Delete landmark marker OBJECTS left by BSMT 0.16.0 and earlier.
+
+    Since Milestone 3.9 a landmark marker is drawn in screen space, not built.
+    A file saved by an older version still contains one sphere per landmark;
+    left alone, the researcher would see two markers for every landmark, one
+    of them at the wrong size and selectable in the viewport.
+
+    Only objects carrying BSMT's own helper tag AND the landmark prefix are
+    touched, so nothing of the researcher's can be caught by this.
+    """
+    try:
+        removed = visualization.clear_landmark_markers()
+    except Exception:                                 # pragma: no cover
+        return 0
+    if removed:
+        print("[BSMT] removed %d legacy landmark marker object(s) - markers "
+              "are drawn in screen space since 0.17.0" % removed)
+    return removed
+
+
+@bpy.app.handlers.persistent
+def _on_load_post(_path):
+    """Sweep legacy markers in a file opened after the add-on registered."""
+    _sweep_legacy_landmark_markers()
+
+
+def _purge_load_handler():
+    handlers = bpy.app.handlers.load_post
+    for existing in list(handlers):
+        if existing is _on_load_post or (
+            getattr(existing, "__name__", "") == "_on_load_post"
+            and getattr(existing, "__module__", "").endswith(
+                "body_surface_measurement")
+        ):
+            handlers.remove(existing)
+
+
+def _register_load_handler():
+    _purge_load_handler()
+    bpy.app.handlers.load_post.append(_on_load_post)
+
+
+def _unregister_load_handler():
+    _purge_load_handler()
+
+
 def register():
     for module in _MODULES:
         module.register()
@@ -90,9 +138,11 @@ def register():
         geodesic.meshcache.register_handlers()
     attach.register()
 
-    # The landmark label overlay. A viewport draw handler, not one Text object
-    # per landmark: see labels.py for why.
-    labels.register()
+    # The landmark overlay: markers and name labels, drawn in screen space by
+    # one viewport handler rather than built as objects. See overlay.py.
+    overlay.register()
+    _sweep_legacy_landmark_markers()
+    _register_load_handler()
 
     # Repair and report Phase 2 module state at startup, so a fresh launch
     # never reaches the operator with a partially initialised package.
@@ -110,7 +160,8 @@ def register():
 
 
 def unregister():
-    labels.unregister()
+    _unregister_load_handler()
+    overlay.unregister()
     attach.unregister()
     if geodesic.MESHCACHE_AVAILABLE and geodesic.meshcache is not None:
         geodesic.meshcache.unregister_handlers()

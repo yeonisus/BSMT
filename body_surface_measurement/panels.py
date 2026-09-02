@@ -22,9 +22,9 @@ import math
 
 import bpy
 
-from . import (alignment, geodesic, labels, landmarks, measurement,
-               measurements, preprocess, repair, scancopy, state,
-               visualization, viz)
+from . import (alignment, geodesic, landmarks, measurement, measurements,
+               overlay, preprocess, repair, scancopy, state, visualization,
+               viz)
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
@@ -718,7 +718,7 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         marker = box.column(align=True)
         marker.enabled = bool(props.show_landmarks)
         marker.prop(props, "landmark_marker_color")
-        marker.prop(props, "landmark_marker_size_mm")
+        marker.prop(props, "landmark_marker_size_px")
 
         label = box.column(align=True)
         label.enabled = bool(props.show_landmark_labels)
@@ -731,13 +731,15 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         note = box.column(align=True)
         note.scale_y = 0.7
         note.enabled = False
-        for line in _wrap("Label size is in screen pixels, so labels stay "
-                          "readable at any zoom.", 44):
+        for line in _wrap("Marker and label sizes are in screen pixels, so "
+                          "every landmark stays the same size at any zoom.",
+                          44):
             note.label(text=line)
-        if props.show_landmark_labels and not labels.is_registered():
+        if ((props.show_landmarks or props.show_landmark_labels)
+                and not overlay.is_registered()):
             warn = box.row()
             warn.alert = True
-            warn.label(text="Label overlay is not running", icon='ERROR')
+            warn.label(text="Landmark overlay is not running", icon='ERROR')
 
     @staticmethod
     def _draw_protocol(layout, props):

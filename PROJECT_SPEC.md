@@ -2690,6 +2690,126 @@ re-run clean.
 
 ---
 
+## 11m. Milestone 3.9 — Screen-space landmark markers (v0.17.0, 2026-09-02)
+
+Real-Blender use of 0.16.0 showed three problems at once: P01, P02 and P03 did not look the same
+size, the selected landmark looked larger than the others, and even the smallest setting left
+markers bigger than a landmark wants to be. All three have the same cause — the marker was a UV
+sphere measured in **world units** — and one fix.
+
+### 11m.1 The marker is now drawn, not built
+
+Landmark markers moved into the same POST_PIXEL draw handler as the labels, which is why
+`labels.py` became **`overlay.py`**: it draws markers *and* names, and a module called `labels`
+that draws markers is exactly the drift that makes a codebase hard to read later.
+
+A world-unit sphere cannot satisfy "all markers the same size". It is the same size in *metres*,
+which means its apparent size depends on distance from the camera, on the field of view, and on
+whether the view is perspective or orthographic — so two landmarks at different depths on the same
+body genuinely render at different diameters. Nothing about tuning the radius fixes that; the unit
+is wrong. A marker whose job is "here, precisely" has to be measured in the space the researcher
+is actually looking at.
+
+In screen space every one of the symptoms disappears by construction:
+
+| Requirement | How it is met |
+|---|---|
+| identical size for every landmark | one `radius` for all, asserted |
+| same size at any zoom or depth | the radius is a pixel count; nothing projects it |
+| perspective and orthographic alike | the projection maps position only, never size |
+| substantially smaller than before | 2–20 px, default **6 px** |
+| nothing selectable added to the file | no datablock exists at all |
+
+`Marker Size (mm)` is gone and `Marker Size (px)` replaces it. **Point A and Point B are
+untouched**: they remain millimetre-sized helper objects, because they are a different tool with
+different semantics.
+
+### 11m.2 The selection is a ring, never a bigger dot
+
+0.16.0 emphasised the selected landmark by making its marker 1.35× larger, which is precisely what
+made the markers stop reading as one size. The core disc is now **identical for every landmark,
+selected or not** — asserted directly: the list of radii is the same whichever row is selected —
+and the selection is drawn as a white ring 2 px outside the core, plus two extra pixels of label.
+
+### 11m.3 Drawing
+
+Discs are flat `TRIS` lists (16 segments) and the ring is a `LINES` list. Neither is a stylistic
+choice: **`TRI_FAN` and `LINE_LOOP` were removed from Blender's GPU module in 3.2**, and a marker
+built from them would fail at draw time, in the viewport, with nothing to see in a headless test.
+
+Batches are grouped by colour, so 100 identical landmarks are **one** draw call and a single stale
+landmark adds exactly one more. The GPU shader is built on first use, never at import, because
+Blender refuses to create one in background mode — which is also why the drawing itself cannot be
+covered by the headless suite, and why `tools/check_overlay_render.py` exists.
+
+### 11m.4 Proving it renders, since headless cannot
+
+`tools/check_overlay_render.py` runs Blender **without** `--background`, draws the real marker
+batches into a `GPUOffScreen` buffer, and counts the pixels they actually paint. Measured on
+4.5.13:
+
+| Case | Painted | Expected |
+|---|---|---|
+| two radius-3 discs | 64 px | 2·π·9 = 57 |
+| radius 1 | 4 px | π = 3 |
+| radius 3 | 32 px | 9π = 28 |
+| radius 10 | 308 px | 100π = 314 |
+
+That is the claim "the size is in screen pixels" measured rather than asserted, and it is also the
+only proof that this Blender's GPU backend accepts the batch types used.
+
+### 11m.5 Anchoring and migration
+
+Everything is positioned from `SurfacePoint.world_xyz`, which `attach.refresh_landmarks` already
+maintained, so a rigid transform, Apply Alignment and Reset Alignment reach the marker through the
+one path that already existed. The marker and its label come from **one entry and one projection**,
+so they cannot separate. `attach` no longer moves a helper object, and counts world updates
+directly — since the marker is drawn from that value, "the landmark moved" and "the marker moved"
+are now the same event.
+
+A .blend saved by 0.16.0 or earlier still contains one marker object per landmark. Left alone the
+researcher would see two markers for every landmark, one of them at the wrong size and selectable.
+`_sweep_legacy_landmark_markers()` removes them at register and on `load_post`, touching only
+objects that carry BSMT's own helper tag *and* the landmark prefix — verified against a real 0.16.0
+file, including that an untagged look-alike of the same name is left alone.
+
+### 11m.6 A bug this milestone introduced, and the guard that now catches it
+
+Removing the marker machinery deleted `visualization.remove_landmark_marker`, and **two operators
+still called it**: `bsmt.remove_landmark` and `bsmt.clear_landmark_position` both raised
+`AttributeError`. The offline suite passed, because those operators only run inside Blender. The
+acceptance scripts caught it.
+
+The function is restored, as part of the legacy-cleanup surface — deleting a landmark must not
+leave an old file's marker behind. More usefully, `tests/test_import.py` now statically resolves
+**every `module.function(` call between BSMT modules** (222 of them) against the imported module,
+so a deleted function with a surviving call site fails offline. Verified by re-introducing the
+exact fault: the guard reports `operators.py calls visualization.remove_landmark_marker()`.
+
+### 11m.7 One deliberate behaviour change
+
+Markers now draw **on top of** the scan instead of being occluded by it. A POST_PIXEL callback has
+no usable depth buffer, and for landmark work the alternative is worse: a landmark on the far side
+of the body would be silently invisible rather than visibly behind. Labels already behaved this
+way, so the two are now consistent.
+
+### 11m.8 Verified in Blender 4.5.13
+
+92 checks, 0 failures. Three landmarks all report one radius; selecting P03 changes no radius,
+including its own; 2/3/6/20 px all give a uniform radius; no landmark marker object exists at all;
+the selection draws a ring outside the core while all three discs stay in one batch. Marker and
+label share one anchor through Apply and Reset Alignment, with triangle index, barycentric,
+component and geometry hash unchanged and landmarks still VALID.
+
+Performance improved with the objects gone: 100 landmarks now build in **0.220 ms** per frame
+(0.423 ms in 0.16.0), 50 in 0.111 ms, 10 in 0.025 ms.
+
+Offline: `tests/test_overlay.py` replaces `tests/test_labels.py`, 98 checks. Full regression 1,643
+checks across twelve suites, 1,753 with pygeodesic staged, 0 failures. All thirteen Blender
+acceptance scripts, from Milestone 3.0 onward, re-run clean with 0 tracebacks.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

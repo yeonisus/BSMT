@@ -50,10 +50,6 @@ REPAIR_BOUNDARY_COLOR = (0.15, 0.6, 1.0, 1.0)        # blue
 
 # Marker spheres are built once at radius 1.0 and resized with object scale, so
 # changing "Marker Size" never rebuilds geometry.
-#: The selected landmark's marker is drawn this much larger. Scale only: the
-#: stored landmark is not touched to highlight it (sect. 6).
-SELECTED_MARKER_SCALE = 1.35
-
 MARKER_BASE_RADIUS = 1.0
 BASE_RADIUS_KEY = "bsmt_base_radius"
 MIN_HELPER_RADIUS = 1e-9
@@ -65,14 +61,6 @@ def is_helper(obj):
         return False
     original = getattr(obj, "original", obj)
     return bool(original.get(HELPER_FLAG, False))
-
-
-def landmark_marker_radius(props):
-    """Named landmark marker radius in coordinate units, from the mm setting."""
-    return max(
-        measurement.mm_to_units(props.landmark_marker_size_mm * 0.5, props.unit),
-        MIN_HELPER_RADIUS,
-    )
 
 
 def landmark_object_name(stable_id):
@@ -363,44 +351,20 @@ def landmark_color(status, valid_color=None):
     return _LANDMARK_STATUS_COLORS.get(status, LANDMARK_COLOR)
 
 
-def update_landmark_marker(context, props, item, world_location):
-    """Create or move the marker for one named landmark. Returns the object."""
-    name = landmark_object_name(item.stable_id)
-    color = landmark_color(item.status,
-                           getattr(props, "landmark_marker_color", None))
-    obj = _existing_helper(name)
-    if (
-        obj is None
-        or not isinstance(obj.data, bpy.types.Mesh)
-        or obj.data.get(BASE_RADIUS_KEY) != MARKER_BASE_RADIUS
-    ):
-        if obj is not None:
-            remove_object(obj)
-        mesh = _sphere_mesh(name + "_Mesh", MARKER_BASE_RADIUS)
-        obj = new_helper_object(context, name, mesh, color)
-        obj.data.materials.append(
-            get_material("BSMT_Material_Landmark", LANDMARK_COLOR)
-        )
-    obj.location = Vector(world_location)
-    obj.color = color
-    apply_landmark_display(context, props)
-    return obj
-
-
-def move_landmark_marker(stable_id, world_location):
-    """Move an existing landmark marker. Cheap enough for a depsgraph handler."""
-    obj = _existing_helper(landmark_object_name(stable_id))
-    if obj is None:
-        return False
-    obj.location = (
-        float(world_location[0]),
-        float(world_location[1]),
-        float(world_location[2]),
-    )
-    return True
+# Milestone 3.9: a landmark marker is no longer an object. It is drawn by the
+# screen-space overlay in overlay.py, so that every landmark reads at exactly
+# the same pixel size whatever the zoom, and so that nothing selectable is
+# added to the researcher's file. What remains here is the cleanup path for
+# marker objects created by earlier versions.
 
 
 def remove_landmark_marker(stable_id):
+    """Delete one landmark's marker OBJECT, if an older file left one.
+
+    Nothing creates these since 3.9, but a .blend saved by 0.16.0 or earlier
+    holds one per landmark, and deleting the landmark must not leave its
+    marker floating in the scene.
+    """
     obj = _existing_helper(landmark_object_name(stable_id))
     return remove_object(obj) if obj is not None else False
 
@@ -423,39 +387,14 @@ def remove_orphan_landmark_markers(valid_stable_ids):
     return removed
 
 
-def apply_landmark_display(context, props):
-    """Push landmark marker size, colour and visibility. Cosmetic only.
-
-    Never creates, deletes or moves a marker, and never touches a stored
-    surface location. The selected landmark is drawn slightly larger - an
-    emphasis carried entirely by object SCALE, so nothing about the landmark
-    itself, not even its stored colour, is changed to highlight it (sect. 6).
-    """
-    radius = landmark_marker_radius(props)
-    show = bool(props.show_landmarks)
-    valid_color = getattr(props, "landmark_marker_color", None)
-    collection = getattr(context.scene, "bsmt_landmarks", None)
-    statuses = {}
-    selected_name = ""
-    if collection is not None:
-        for index, item in enumerate(collection):
-            statuses[landmark_object_name(item.stable_id)] = item.status
-            if index == int(getattr(props, "landmark_index", -1)):
-                selected_name = landmark_object_name(item.stable_id)
-
-    for obj in landmark_marker_objects():
-        scale = radius * (SELECTED_MARKER_SCALE
-                          if obj.name == selected_name else 1.0)
-        obj.scale = (scale, scale, scale)
-        obj.hide_viewport = not show
-        obj.hide_render = not show
-        status = statuses.get(obj.name)
-        if status is not None:
-            obj.color = landmark_color(status, valid_color)
-
-
 def clear_landmark_markers():
-    """Remove every named landmark marker. Returns how many were removed."""
+    """Remove every landmark marker OBJECT. Returns how many were removed.
+
+    Nothing creates these any more. The function is kept because a .blend
+    saved by BSMT 0.16.0 or earlier contains one per landmark, and leaving
+    them behind would mean two markers per landmark - one screen-space and
+    one, at the wrong size, in the scene.
+    """
     removed = 0
     for obj in landmark_marker_objects():
         if remove_object(obj):

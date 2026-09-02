@@ -11,8 +11,8 @@ from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        IntProperty, StringProperty)
 
 from . import (alignment, attach, geodesic, landmarks, measurement,
-               measurements, meshrepair, picking, preprocess, protocol,
-               repair, scancopy, state, visualization, viz)
+               measurements, meshrepair, overlay, picking, preprocess,
+               protocol, repair, scancopy, state, visualization, viz)
 
 def _addon_version():
     from . import bl_info
@@ -252,9 +252,7 @@ class BSMT_OT_pick_point(bpy.types.Operator):
 
         canonical = geodesic.meshcache.peek(item.surface_point.source_object)
         state.refresh_landmark_status(item, canonical)
-        visualization.update_landmark_marker(
-            context, props, item, item.surface_point.world_xyz
-        )
+        overlay.tag_redraw(context)
         # Targeted, not a sweep: only the definitions that reference THIS
         # landmark lose their result (sect. 13).
         affected = state.invalidate_measurements_for_landmark(
@@ -1654,7 +1652,11 @@ class BSMT_OT_remove_landmark(bpy.types.Operator):
         name = item.label
         stable_id = state.remove_landmark(context, props, props.landmark_index)
         if stable_id is not None:
+            # Nothing to delete since 3.9 - the marker is drawn, not built -
+            # but a marker object from an older file would otherwise outlive
+            # the landmark it belongs to.
             visualization.remove_landmark_marker(stable_id)
+        overlay.tag_redraw(context)
         self.report({'INFO'}, "BSMT: deleted landmark '%s'" % name)
         return {'FINISHED'}
 
@@ -1680,6 +1682,7 @@ class BSMT_OT_clear_landmark_position(bpy.types.Operator):
             return {'CANCELLED'}
         state.clear_landmark_position(item, context)
         visualization.remove_landmark_marker(item.stable_id)
+        overlay.tag_redraw(context)
         self.report({'INFO'}, "BSMT: cleared position of '%s'" % item.label)
         return {'FINISHED'}
 
@@ -1796,18 +1799,14 @@ class BSMT_OT_validate_landmarks(bpy.types.Operator):
                     float(v) * canonical.unit_multiplier for v in world
                 )
                 point.component_id = canonical.component_of(point.triangle_index)
-                visualization.update_landmark_marker(context, props, item, world)
-            elif point.valid:
-                # Keep the marker where it is, recoloured to show it can no
-                # longer be trusted. Never re-projected.
-                visualization.update_landmark_marker(
-                    context, props, item, point.world_xyz
-                )
 
+        # The overlay reads status and world position straight from the
+        # landmarks on the next redraw, so a landmark that has just become
+        # stale is recoloured with nothing to push. Never re-projected.
         visualization.remove_orphan_landmark_markers(
             [item.stable_id for item in collection]
         )
-        visualization.apply_landmark_display(context, props)
+        overlay.tag_redraw(context)
 
         counts, summary = landmarks.summarise(statuses)
         props.landmark_summary = summary
@@ -2004,6 +2003,7 @@ class BSMT_OT_load_protocol(bpy.types.Operator):
         if self.replace:
             state.clear_landmarks(context, props)
             visualization.clear_landmark_markers()
+            overlay.tag_redraw(context)
 
         added = 0
         skipped = []
