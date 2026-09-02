@@ -6,8 +6,9 @@
 **Target environment:** Blender 4.5.13 LTS, macOS 26.5 (Apple Silicon, arm64),
 bundled Python 3.11.15, numpy 1.26.4 — **all detected at runtime, 2026-09-02** (§5.1a)
 **Status:** Phase 1 complete and validated on a real human-body scan. Milestones 2.0, 2.0a,
-2.1, 2.2, 2.3, 3.0 (Landmark Manager) and **3.1 (Measurement Manager)** implemented and
-validated in Blender. Real-scan acceptance testing of 2.3, 3.0 and 3.1 is outstanding.
+2.1, 2.2, 2.3, 3.0 (Landmark Manager), 3.1 (Measurement Manager) and
+**3.2 (Measurement Visualisation)** implemented and validated in Blender. Real-scan acceptance
+testing of 2.3, 3.0, 3.1 and 3.2 is outstanding.
 
 > Note on this document's history: no `PROJECT_SPEC.md` existed in the project before this
 > revision. Phase 1 was specified conversationally and implemented from that specification.
@@ -26,7 +27,8 @@ on textured OBJ human-body scans.
 | 2 | Surface (geodesic) distance between the same two points | **This document.** Milestones 2.0, 2.0a, 2.1, 2.1a, 2.2, **2.3 done** (v0.7.0); 2.4–2.6 outstanding |
 | 3.0 | Named research landmark manager: protocols, guided picking, Validate All | **Done** (v0.8.0) |
 | 3.1 | User-defined measurement manager: definitions, batch calculation, templates | **Done** (v0.9.0) |
-| 3.2+ | CSV/XLSX export, surface path visualisation, alignment, automatic landmark detection | Not designed |
+| 3.2 | Measurement visualisation: straight chords and exact geodesic paths | **Done** (v0.10.0) |
+| 3.3+ | CSV/XLSX export, alignment, automatic landmark detection | Not designed |
 | Future | Anatomical scan alignment (§13) | Requirement recorded, not designed |
 
 Non-goals for Phase 2, explicitly: automatic landmark detection, mesh repair as a measurement
@@ -1722,6 +1724,95 @@ Verified in Blender: re-picking `P01` left the two dependent measurements showin
 with `— / —` and the unrelated one still `VALID` with its number; scaling the object put all
 three in `STALE` with no displayable value; and the invariant *a stored number implies VALID*
 held throughout.
+
+---
+
+## 11d. Milestone 3.2 — Measurement Visualisation (v0.10.0, 2026-09-02)
+
+Draws a selected measurement as a straight chord, an exact geodesic path, or both. Calculation
+and SurfacePoint are unchanged.
+
+### 11d.1 The path is never a side effect
+
+A surface path needs the **unbounded** `geodesicDistance()`, which cannot be bounded and sweeps
+the whole mesh — tens of seconds at scan scale (§5.1b). It is therefore computed only by
+`bsmt.compute_surface_path`, and never by Calculate Selected, Calculate All Defined, creating a
+measurement, picking a landmark, or switching a display mode on. A test asserts that
+`solve.surface_path(` appears exactly once in `operators.py` and nowhere in `state.py`,
+`panels.py` or `viz.py`.
+
+### 11d.2 One pipeline, two queries
+
+`solve._prepare()` and `solve._build_scratch()` were extracted so `surface_distance()` and
+`surface_path()` see **exactly the same endpoints on exactly the same scratch topology**. That
+makes the agreement structural rather than a convention two functions must remember.
+
+`surface_path()` refuses to return a path that disagrees with what is already stored:
+
+| Compared | Tolerance |
+|---|---|
+| polyline segment sum vs the solver's reported path distance | 1e-5 relative |
+| the path solve vs the stored production surface distance | 1e-5 relative |
+
+A disagreement raises `PATH_DISTANCE_MISMATCH` and **the stored measurement is never modified**.
+
+**The tolerance is set by storage, not by the solver.** Bounded and unbounded queries returned
+bit-identical values in 18/18 measured configurations, and a polyline matched its distance to
+≤ 6.7e-16 relative. But the reference handed in is read back out of a Blender `FloatProperty`,
+which is **single precision**: a measured 115.068 mm distance came back 1.9e-6 mm adrift for that
+reason alone. 1e-5 relative sits ~40× above that floor and orders below any real disagreement.
+
+### 11d.3 Geometry in local space, helpers tracking by matrix
+
+Helper curves store their points in the **scan object's local space** and the helper's
+`matrix_world` is kept equal to the scan's. Following a rigid transform is then one matrix
+assignment per helper instead of rewriting every point — decisive when a path has thousands —
+and "the path follows the scan" becomes true by construction. Verified: after translation the
+path moved by exactly **t** and was not recomputed.
+
+### 11d.4 Two defects found while building this
+
+**1. A mode round-trip destroyed a cached path.** Switching to STRAIGHT removed the path helper;
+switching back to BOTH found no helper, judged the cache dead, and dropped it — so a 15–30 s
+solve was thrown away by a display change, exactly what §6 forbids. The helper curve *is* the
+cached polyline, so it is now **hidden, never removed**, when a mode does not want it; it is
+removed only when the cache is genuinely dead.
+
+**2. Creating or removing any BSMT helper wiped the canonical mesh cache — a bug present since
+Milestone 2.1.** Measured on Blender 4.5.13: linking one helper raises `is_updated_geometry` on
+`Scene Collection` and `Collection`, neither helper-tagged, and the 2.1 handler cleared on any
+non-helper geometry update. Consequences: a ~1 s canonical rebuild every time a marker, line or
+path appeared, and — worse — `meshcache.peek()` returning `None`, which made the transform and
+metric checks silently skip, so **a scaled scan could keep reporting VALID**. The handler now
+clears only for `Object` and `Mesh` datablocks; a real mesh edit always reports on those, and
+membership churn no longer does. Re-verified both directions.
+
+### 11d.5 Result and path lifetimes are one
+
+`clear_measurement_result()` clears the cached path too. A path is solved against the same
+landmarks, geometry and metric as the distance, so a path outliving its result would claim to
+match a number that no longer exists. Invalidation therefore follows §12 exactly: re-pick,
+clear, delete, geometry edit, scale, non-uniform scale and unit change all drop the path; rigid
+translation and rotation do not.
+
+### 11d.6 Display offset
+
+The drawn path is lifted along the surface normal by 1.2× its bevel radius, using the canonical
+BVH. Display only: the polyline, its length and every reported distance are computed **before**
+the lift. Measured on a sphere the drawn curve is ~1.8 % longer than the stored path, and the
+stored value is unchanged — which is the point. The path helper is drawn with real occlusion so
+the far side of a wrapping geodesic is hidden by the body; the straight chord is drawn in front,
+since a chord passes through the body by its nature.
+
+### 11d.7 Lifetimes
+
+Measurement helpers are `BSMT_Measurement_<stable_id>_Straight|_Path`. Verified: `Clear Points`
+keeps them, `Clear All Measurement Visualizations` keeps A/B, landmark markers, definitions,
+results and the scan.
+
+**Outstanding: real-scan acceptance on 21_M_3400E** (§15 of the milestone brief), in particular
+the true path timing on a 314k-triangle mesh — the synthetic acceptance ran on a 2k-triangle
+sphere where the path took 0.014 s.
 
 ---
 

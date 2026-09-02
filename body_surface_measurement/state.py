@@ -310,6 +310,27 @@ def _on_target_picker(self, context):
     _adopt_landmark(self, context, "target", self.target_picker)
 
 
+def _on_visualization_style_changed(self, context):
+    """Colour or thickness changed. Cosmetic: no rebuild, no recomputation."""
+    try:
+        visualization.apply_measurement_display(context, self)
+    except Exception:                                 # pragma: no cover
+        pass
+
+
+def _on_visualization_changed(self, context):
+    """Display mode or scope changed. Rebuilds visibility, never geometry.
+
+    Switching mode must not recompute a distance or a path (sect. 6), so this
+    only ever shows, hides or removes helpers that already exist.
+    """
+    try:
+        from . import viz
+        viz.refresh(context, self)
+    except Exception:                                 # pragma: no cover
+        pass
+
+
 def _on_definition_changed(self, context):
     """Any change to what a measurement MEANS invalidates its result."""
     invalidate_measurement_result(self, "the measurement definition changed")
@@ -393,6 +414,31 @@ class BSMT_Measurement(bpy.types.PropertyGroup):
     attempts: IntProperty(default=0)
     elapsed_s: FloatProperty(default=0.0)
     surface_mode: StringProperty(default="")
+
+    # --- visualisation (Milestone 3.2) ------------------------------------
+    show_visualization: BoolProperty(
+        name="Show",
+        description="Draw this measurement in the viewport. Enabling it never "
+                    "computes a surface path",
+        default=False,
+    )
+
+    # --- cached surface path ---------------------------------------------
+    # The polyline itself lives in the helper curve, in the scan's local
+    # space. These fields are the provenance that says whether it is still
+    # the path for the current landmarks, geometry and metric.
+    path_valid: BoolProperty(default=False)
+    path_point_count: IntProperty(default=0)
+    path_length_mm: FloatProperty(default=0.0)
+    path_distance_mm: FloatProperty(default=0.0)
+    path_agreement_mm: FloatProperty(default=0.0)
+    path_elapsed_s: FloatProperty(default=0.0)
+    path_mode: StringProperty(default="")
+    path_object: StringProperty(default="")
+    path_geometry_hash: StringProperty(default="")
+    path_metric_tensor: FloatVectorProperty(size=9, default=(0.0,) * 9)
+    path_source_stable_id: IntProperty(default=0)
+    path_target_stable_id: IntProperty(default=0)
 
     # --- dependency fingerprint, for sect. 12 invalidation ---------------
     result_object: StringProperty(default="")
@@ -719,6 +765,59 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         name="Details", description="Show the selected measurement's detail",
         default=True,
     )
+    # ------------------------------------------------------------------
+    # Milestone 3.2 - measurement visualisation. Display only: nothing here
+    # can change a distance, a path or a measurement's validity.
+    # ------------------------------------------------------------------
+    viz_mode: EnumProperty(
+        name="Display Mode",
+        items=(
+            ('STRAIGHT', "Straight", "Draw only the straight chord"),
+            ('SURFACE', "Surface", "Draw only the exact geodesic path"),
+            ('BOTH', "Both", "Draw the chord and the surface path together"),
+        ),
+        default='BOTH',
+        update=_on_visualization_changed,
+    )
+    viz_straight_color: FloatVectorProperty(
+        name="Straight Color", subtype='COLOR', size=4,
+        default=(1.0, 0.85, 0.1, 1.0), min=0.0, max=1.0,
+        update=_on_visualization_style_changed,
+    )
+    viz_path_color: FloatVectorProperty(
+        name="Surface Path Color", subtype='COLOR', size=4,
+        default=(0.1, 0.9, 0.8, 1.0), min=0.0, max=1.0,
+        update=_on_visualization_style_changed,
+    )
+    viz_straight_thickness_mm: FloatProperty(
+        name="Straight Thickness (mm)", default=3.0, min=0.5, max=20.0,
+        update=_on_visualization_style_changed,
+    )
+    viz_path_thickness_mm: FloatProperty(
+        name="Path Thickness (mm)", default=3.0, min=0.5, max=20.0,
+        update=_on_visualization_style_changed,
+    )
+    viz_selected_only: BoolProperty(
+        name="Show Selected Measurement Only",
+        description="Draw only the selected definition. Turn off to show "
+                    "every measurement whose Show box is ticked",
+        default=True,
+        update=_on_visualization_changed,
+    )
+    viz_surface_offset: BoolProperty(
+        name="Lift Path Off Surface",
+        description="Offset the drawn path along the surface normal so it is "
+                    "not half-buried in the scan. Display only: it does not "
+                    "change the stored path or its length",
+        default=True,
+        update=_on_visualization_changed,
+    )
+    viz_status: StringProperty(name="Visualization Status", default="")
+    viz_running: BoolProperty(default=False, options={'SKIP_SAVE'})
+    show_measurement_visualization: BoolProperty(
+        name="Measurement Visualization", default=False,
+    )
+
     show_measurement_results: BoolProperty(
         name="Measurement Results",
         description="Show every defined measurement's result in order, "
@@ -1201,8 +1300,66 @@ def clear_measurements(context, props):
     return count
 
 
+def clear_measurement_path(item, remove_helper=True):
+    """Forget a cached surface path. The measurement result is untouched.
+
+    The polyline lives in the helper curve, so dropping the cache removes it:
+    a path that is no longer known to be current must not stay on screen.
+    """
+    had = bool(item.path_valid)
+    item.path_valid = False
+    item.path_point_count = 0
+    item.path_length_mm = 0.0
+    item.path_distance_mm = 0.0
+    item.path_agreement_mm = 0.0
+    item.path_elapsed_s = 0.0
+    item.path_mode = ""
+    item.path_object = ""
+    item.path_geometry_hash = ""
+    item.path_metric_tensor = (0.0,) * 9
+    item.path_source_stable_id = 0
+    item.path_target_stable_id = 0
+    if remove_helper:
+        try:
+            visualization.remove_measurement_helper(item.stable_id, 'PATH')
+        except Exception:                             # pragma: no cover
+            pass
+    return had
+
+
+def path_is_current(item, canonical=None, matrix_world=None):
+    """Whether a cached path still describes the current configuration.
+
+    A rigid transform deliberately cannot fail this: the metric tensor is
+    rotation invariant and carries no translation, so a translated or rotated
+    scan keeps its path and simply follows (sect. 11).
+    """
+    if not item.path_valid:
+        return False
+    if item.path_source_stable_id != item.source_stable_id:
+        return False
+    if item.path_target_stable_id != item.target_stable_id:
+        return False
+    if not visualization.measurement_helper_exists(item.stable_id, 'PATH'):
+        return False
+    if canonical is not None:
+        if canonical.geometry_hash != item.path_geometry_hash:
+            return False
+        if matrix_world is not None:
+            live = metric_tensor(matrix_world, canonical.unit_multiplier)
+            if not metric_tensors_match(live, item.path_metric_tensor):
+                return False
+    return True
+
+
 def clear_measurement_result(item):
-    """Forget a measurement's numbers. The definition is untouched."""
+    """Forget a measurement's numbers. The definition is untouched.
+
+    The cached surface path goes with them. A path is solved against the same
+    landmarks, geometry and metric as the distance, so a path that outlived
+    its result would be claiming to match a number that no longer exists.
+    """
+    clear_measurement_path(item)
     item.straight_valid = False
     item.straight_mm = 0.0
     item.surface_valid = False
@@ -1224,8 +1381,13 @@ def invalidate_measurement_result(item, reason):
     """Drop a stored result because a dependency changed (sect. 12).
 
     Never leaves a number behind: a distance whose landmarks, geometry or
-    metric have changed is not a measurement of anything.
+    metric have changed is not a measurement of anything. The cached surface
+    path goes with it - it was solved against the same configuration.
     """
+    # clear_measurement_result() drops the cached path too, but a
+    # measurement with no result can still hold one, so it is cleared here
+    # unconditionally.
+    clear_measurement_path(item)
     if item.has_result:
         clear_measurement_result(item)
         item.status = measurements.STATUS_NOT_READY

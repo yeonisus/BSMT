@@ -288,6 +288,19 @@ def _on_depsgraph_update(scene, depsgraph=None):
             identifier = getattr(update.id, "original", update.id)
             if _is_helper_id(identifier):
                 continue
+            # Only an Object or a Mesh datablock can mean the scan's geometry
+            # changed. Scene and Collection datablocks raise
+            # is_updated_geometry whenever their MEMBERSHIP changes, which
+            # happens every time BSMT links or unlinks a helper - measured on
+            # Blender 4.5.13: creating one marker reports geometry updates on
+            # 'Scene Collection' and 'Collection', neither of them helper
+            # tagged. Clearing on those threw the canonical mesh away every
+            # time a marker, line or path appeared, forcing a full rebuild
+            # (about a second on a 314k-triangle scan) and leaving peek()
+            # returning None so transform-dependent checks silently skipped.
+            # A real mesh edit always reports on the Object and its Mesh.
+            if not isinstance(identifier, (bpy.types.Object, bpy.types.Mesh)):
+                continue
             _CACHE.clear()
             return
     except Exception:                                # pragma: no cover

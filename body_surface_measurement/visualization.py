@@ -19,6 +19,9 @@ POINT_B_NAME = "BSMT_Point_B"
 LINE_NAME = "BSMT_Straight_Line"
 COMPONENT_PREFIX = "BSMT_Component_"
 LANDMARK_PREFIX = "BSMT_Landmark_"
+MEASUREMENT_PREFIX = "BSMT_Measurement_"
+STRAIGHT_SUFFIX = "_Straight"
+PATH_SUFFIX = "_Path"
 
 MARKER_NAMES = {'A': POINT_A_NAME, 'B': POINT_B_NAME}
 MARKER_COLORS = {
@@ -287,6 +290,10 @@ def clear_all(context):
             # Named research landmarks have their own lifetime and their own
             # Clear button. `Clear Points` is about A/B (sect. 20).
             continue
+        if obj.name.startswith(MEASUREMENT_PREFIX):
+            # Measurement visualisation likewise has its own lifetime and its
+            # own Clear buttons (sect. 14).
+            continue
         if remove_object(obj):
             removed += 1
 
@@ -415,3 +422,154 @@ def clear_landmark_markers():
         if remove_object(obj):
             removed += 1
     return removed
+
+
+# ---------------------------------------------------------------------------
+# measurement visualization (Milestone 3.2)
+# ---------------------------------------------------------------------------
+#
+# Geometry is stored in the SCAN OBJECT'S LOCAL SPACE and the helper's
+# matrix_world is kept equal to the scan's. A rigid transform is then one
+# matrix copy per helper instead of rewriting every point, which matters when
+# a geodesic path has thousands of them - and it makes "the path follows the
+# scan" true by construction rather than by a per-frame recomputation.
+#
+# These helpers have their own lifetime: `Clear Points` does not touch them
+# and clearing them does not touch A/B (sect. 14).
+
+
+def measurement_object_name(stable_id, kind):
+    """Helper object name for one measurement. Derived from its stable id."""
+    suffix = STRAIGHT_SUFFIX if kind == 'STRAIGHT' else PATH_SUFFIX
+    return "%s%06d%s" % (MEASUREMENT_PREFIX, int(stable_id), suffix)
+
+
+def measurement_helper_objects():
+    return [
+        obj for obj in bpy.data.objects
+        if obj.name.startswith(MEASUREMENT_PREFIX) and is_helper(obj)
+    ]
+
+
+def _poly_curve(name, point_count):
+    curve = bpy.data.curves.new(name, 'CURVE')
+    curve.dimensions = '3D'
+    curve.fill_mode = 'FULL'
+    curve.bevel_resolution = 2
+    spline = curve.splines.new('POLY')
+    spline.points.add(max(0, point_count - 1))
+    curve[HELPER_FLAG] = True
+    return curve
+
+
+def _set_curve_points(curve, points_local):
+    """Rewrite a poly curve's points. `points_local` is (k, 3)."""
+    spline = curve.splines[0] if curve.splines else None
+    wanted = len(points_local)
+    if spline is None or len(spline.points) != wanted:
+        curve.splines.clear()
+        spline = curve.splines.new('POLY')
+        spline.points.add(max(0, wanted - 1))
+    flat = []
+    for point in points_local:
+        flat.extend((float(point[0]), float(point[1]), float(point[2]), 1.0))
+    spline.points.foreach_set("co", flat)
+    return spline
+
+
+def thickness_radius(props, thickness_mm):
+    """Curve bevel radius in coordinate units, from a physical mm setting."""
+    return max(measurement.mm_to_units(float(thickness_mm) * 0.5, props.unit),
+               MIN_HELPER_RADIUS)
+
+
+def update_measurement_curve(context, props, stable_id, kind, points_local,
+                             matrix_world, color, thickness_mm,
+                             show_in_front):
+    """Create or refresh one measurement helper curve. Returns the object."""
+    name = measurement_object_name(stable_id, kind)
+    obj = _existing_helper(name)
+    if obj is None or not isinstance(obj.data, bpy.types.Curve):
+        if obj is not None:
+            remove_object(obj)
+        curve = _poly_curve(name + "_Curve", len(points_local))
+        obj = new_helper_object(context, name, curve, color)
+        obj.data.materials.append(
+            get_material("BSMT_Material_Measurement_" + kind.title(), color)
+        )
+    _set_curve_points(obj.data, points_local)
+    obj.data.bevel_depth = thickness_radius(props, thickness_mm)
+    obj.color = color
+    material = obj.data.materials[0] if obj.data.materials else None
+    if material is not None:
+        material.diffuse_color = color
+    obj.matrix_world = matrix_world
+    obj.show_in_front = bool(show_in_front)
+    return obj
+
+
+def sync_measurement_transform(stable_id, kind, matrix_world):
+    """Point a helper at the scan's current transform. One matrix copy."""
+    obj = _existing_helper(measurement_object_name(stable_id, kind))
+    if obj is None:
+        return False
+    obj.matrix_world = matrix_world
+    return True
+
+
+def set_measurement_helper_visible(stable_id, kind, visible):
+    """Show or hide a helper WITHOUT destroying it.
+
+    Load-bearing: the path helper's curve is where the computed polyline
+    lives, so removing it to hide it would throw away a solve that costs tens
+    of seconds. Switching display mode must never do that (sect. 6).
+    """
+    obj = _existing_helper(measurement_object_name(stable_id, kind))
+    if obj is None:
+        return False
+    obj.hide_viewport = not visible
+    obj.hide_render = not visible
+    return True
+
+
+def measurement_helper_exists(stable_id, kind):
+    return _existing_helper(measurement_object_name(stable_id, kind)) is not None
+
+
+def remove_measurement_helper(stable_id, kind):
+    obj = _existing_helper(measurement_object_name(stable_id, kind))
+    return remove_object(obj) if obj is not None else False
+
+
+def remove_measurement_helpers(stable_id):
+    """Both helpers for one measurement. Returns how many were removed."""
+    return sum(1 for kind in ('STRAIGHT', 'PATH')
+               if remove_measurement_helper(stable_id, kind))
+
+
+def clear_measurement_helpers():
+    """Every measurement helper. Never touches A/B, landmarks or the scan."""
+    removed = 0
+    for obj in measurement_helper_objects():
+        if remove_object(obj):
+            removed += 1
+    return removed
+
+
+def apply_measurement_display(context, props):
+    """Push colour and thickness onto existing helpers. Cosmetic only.
+
+    Never creates, deletes or moves a helper, never rewrites a curve point,
+    and therefore never recomputes a distance or a path.
+    """
+    straight_radius = thickness_radius(props, props.viz_straight_thickness_mm)
+    path_radius = thickness_radius(props, props.viz_path_thickness_mm)
+    for obj in measurement_helper_objects():
+        is_path = obj.name.endswith(PATH_SUFFIX)
+        color = (tuple(props.viz_path_color) if is_path
+                 else tuple(props.viz_straight_color))
+        if isinstance(obj.data, bpy.types.Curve):
+            obj.data.bevel_depth = path_radius if is_path else straight_radius
+            if obj.data.materials:
+                obj.data.materials[0].diffuse_color = color
+        obj.color = color

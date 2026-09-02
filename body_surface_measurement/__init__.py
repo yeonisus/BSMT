@@ -11,7 +11,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 9, 1),
+    "version": (0, 10, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (
@@ -19,7 +19,8 @@ bl_info = {
         "Phase 2 milestone 2.1: canonical mesh, BVH picking and SurfacePoint. "
         "Milestone 2.3: exact bounded MMP surface (geodesic) distance. "
         "Milestone 3.0: named research landmark manager. "
-        "Milestone 3.1: user-defined measurement manager"
+        "Milestone 3.1: user-defined measurement manager. "
+        "Milestone 3.2: measurement visualization and surface paths"
     ),
     "category": "3D View",
 }
@@ -30,7 +31,7 @@ if "bpy" in locals():
 
     from . import (
         attach, geodesic, landmarks, measurement, measurements, panels,
-        picking, protocol, state, visualization, operators,
+        picking, protocol, state, visualization, viz, operators,
     )
 
     importlib.reload(geodesic)
@@ -41,6 +42,7 @@ if "bpy" in locals():
     importlib.reload(measurement)
     importlib.reload(visualization)
     importlib.reload(state)
+    importlib.reload(viz)
     importlib.reload(picking)
     importlib.reload(operators)
     importlib.reload(panels)
@@ -48,7 +50,7 @@ if "bpy" in locals():
 else:
     from . import (
         attach, geodesic, landmarks, measurement, measurements, operators,
-        panels, picking, protocol, state, visualization,
+        panels, picking, protocol, state, visualization, viz,
     )
 
 import bpy  # noqa: E402  (kept after the reload guard on purpose)

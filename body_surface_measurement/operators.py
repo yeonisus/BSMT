@@ -9,7 +9,7 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 
 from . import (attach, geodesic, landmarks, measurement, measurements,
-               picking, protocol, state, visualization)
+               picking, protocol, state, visualization, viz)
 
 # Events that must keep working while the modal picker is active, so the user
 # can orbit / zoom / change the view before committing to a click.
@@ -2589,6 +2589,262 @@ class BSMT_OT_load_measurement_template(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Measurement visualisation (Milestone 3.2)
+# ---------------------------------------------------------------------------
+#
+# A surface PATH is never computed as a side effect. Not by Calculate
+# Selected, not by Calculate All Defined, not by creating a measurement, not
+# by picking a landmark, and not by switching a display mode on. It happens
+# only when the operator below is pressed, because it needs the unbounded
+# geodesicDistance() query - tens of seconds at scan scale (sect. 5.1b).
+
+
+class BSMT_OT_compute_surface_path(bpy.types.Operator):
+    """Compute the exact geodesic path for the selected measurement.
+
+    Expensive and explicit: this runs the unbounded exact solve and will
+    block Blender for tens of seconds on a dense scan. It never changes the
+    already-calculated surface distance
+    """
+
+    bl_idname = "bsmt.compute_surface_path"
+    bl_label = "Compute Surface Path"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or props.viz_running or props.measurement_running:
+            return False
+        item = state.active_measurement(context, props)
+        return item is not None and item.surface_valid
+
+    def execute(self, context):
+        props = state.get_props(context)
+        item = state.active_measurement(context, props)
+        if props is None or item is None:
+            return {'CANCELLED'}
+        if props.viz_running:
+            self.report({'WARNING'}, "BSMT: a path computation is already running")
+            return {'CANCELLED'}
+
+        if not item.surface_valid:
+            message = ("calculate the surface distance for '%s' before asking "
+                       "for its path" % item.label)
+            props.viz_status = message
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        unavailable = geodesic.ensure_loaded() or geodesic.measure_error()
+        if unavailable:
+            props.viz_status = unavailable
+            self.report({'ERROR'}, "BSMT: " + unavailable)
+            return {'CANCELLED'}
+
+        source, target = state.resolve_measurement_landmarks(context, item)
+        if source is None or target is None:
+            message = "the referenced landmark no longer exists"
+            props.viz_status = message
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        object_name = source.surface_point.source_object
+        obj = bpy.data.objects.get(object_name)
+        if obj is None or obj.type != 'MESH':
+            message = "source object '%s' is missing" % object_name
+            props.viz_status = message
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        props.viz_running = True
+        props.viz_status = "Computing exact surface path..."
+        print("[BSMT] Computing exact surface path for %s '%s' - Blender will "
+              "not redraw until the solver returns"
+              % (item.protocol_id, item.label))
+        self._nudge(context)
+        started = time.perf_counter()
+        try:
+            return self._solve(context, props, item, obj, source, target,
+                               started)
+        finally:
+            props.viz_running = False
+
+    def _solve(self, context, props, item, obj, source, target, started):
+        solve = geodesic.solve
+        try:
+            canonical = geodesic.meshcache.get(context, obj, props.unit)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            message = "canonical mesh unavailable (%s)" % exc
+            props.viz_status = message
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        specs = []
+        for landmark in (source, target):
+            point = landmark.surface_point
+            specs.append(solve.PointSpec(
+                point.triangle_index,
+                np.array(point.barycentric, dtype=np.float64),
+                component_id=point.component_id,
+                source_object=point.source_object,
+                geometry_hash=point.geometry_hash,
+                status=point.status,
+                valid=point.valid,
+            ))
+
+        try:
+            # The stored surface distance is passed in as the reference the
+            # path must agree with. A disagreement refuses the path; it never
+            # rewrites the measurement.
+            result = solve.surface_path(
+                canonical.vertices_solver,
+                canonical.triangles,
+                specs[0], specs[1],
+                geometry_hash=canonical.geometry_hash,
+                expected_distance_mm=item.surface_mm,
+            )
+        except solve.MeasurementError as exc:
+            state.clear_measurement_path(item)
+            props.viz_status = exc.message
+            print("[BSMT] %s" % exc.message)
+            self.report({'ERROR'}, "BSMT: " + exc.message)
+            return {'CANCELLED'}
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            state.clear_measurement_path(item)
+            message = "surface path failed (%s: %s)" % (type(exc).__name__, exc)
+            props.viz_status = message
+            self.report({'ERROR'}, "BSMT: " + message + " - see the console")
+            return {'CANCELLED'}
+
+        elapsed = time.perf_counter() - started
+
+        item.path_point_count = int(result.point_count)
+        item.path_length_mm = float(result.polyline_length_mm)
+        item.path_distance_mm = float(result.distance_mm)
+        item.path_agreement_mm = float(result.agreement_mm)
+        item.path_elapsed_s = float(elapsed)
+        item.path_mode = result.mode
+        item.path_object = canonical.source_object
+        item.path_geometry_hash = canonical.geometry_hash
+        item.path_metric_tensor = state.metric_tensor(
+            obj.matrix_world, canonical.unit_multiplier
+        )
+        item.path_source_stable_id = int(item.source_stable_id)
+        item.path_target_stable_id = int(item.target_stable_id)
+        item.path_valid = True
+
+        if not viz.build_path(context, props, item, result.polyline_solver,
+                              canonical):
+            state.clear_measurement_path(item)
+            message = "the path was computed but could not be drawn"
+            props.viz_status = message
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        if not item.show_visualization:
+            item.show_visualization = True
+        viz.refresh(context, props)
+
+        props.viz_status = (
+            "Path computed | Elapsed: %.2f s | Points: %d"
+            % (elapsed, result.point_count)
+        )
+        summary = (
+            "path %.4f mm, polyline %.4f mm, stored surface %.4f mm "
+            "(agreement %.3e mm), %d points, %.2f s"
+            % (result.distance_mm, result.polyline_length_mm, item.surface_mm,
+               result.agreement_mm, result.point_count, elapsed)
+        )
+        print("[BSMT] %s %s: %s" % (item.protocol_id, item.label, summary))
+        self.report({'INFO'}, "BSMT: " + summary)
+        return {'FINISHED'}
+
+    @staticmethod
+    def _nudge(context):
+        try:
+            if context.area is not None:
+                context.area.tag_redraw()
+        except Exception:                             # pragma: no cover
+            pass
+
+
+class BSMT_OT_refresh_visualization(bpy.types.Operator):
+    """Rebuild the measurement visualisation from what is already computed.
+
+    Never solves anything: a measurement with no cached path simply gets no
+    path drawn
+    """
+
+    bl_idname = "bsmt.refresh_visualization"
+    bl_label = "Refresh Visualization"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is None:
+            return {'CANCELLED'}
+        outcome = viz.refresh(context, props)
+        self.report({'INFO'}, "BSMT: visualization refreshed (%s)" % outcome)
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_visualization(bpy.types.Operator):
+    """Remove the selected measurement's visualisation helpers.
+
+    Definitions, results, landmarks, A/B and the scan are untouched
+    """
+
+    bl_idname = "bsmt.clear_visualization"
+    bl_label = "Clear Selected Visualization"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return state.active_measurement(context) is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        item = state.active_measurement(context, props)
+        if item is None:
+            return {'CANCELLED'}
+        removed = viz.clear_for(item)
+        item.show_visualization = False
+        # The cached path lived in the helper that has just been removed, so
+        # the cache goes with it rather than pointing at nothing.
+        state.clear_measurement_path(item)
+        props.viz_status = ""
+        self.report({'INFO'}, "BSMT: removed %d helper(s) for '%s'"
+                    % (removed, item.label))
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_all_visualizations(bpy.types.Operator):
+    """Remove every measurement visualisation helper.
+
+    Definitions, results, landmarks, A/B and the scan are untouched
+    """
+
+    bl_idname = "bsmt.clear_all_visualizations"
+    bl_label = "Clear All Measurement Visualizations"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_measurements(context)
+        removed = viz.clear_all()
+        if collection:
+            for item in collection:
+                item.show_visualization = False
+                state.clear_measurement_path(item, remove_helper=False)
+        if props is not None:
+            props.viz_status = ""
+        self.report({'INFO'}, "BSMT: removed %d measurement helper(s)" % removed)
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_topology(bpy.types.Operator):
     """Clear the topology diagnostics report"""
 
@@ -2640,6 +2896,10 @@ classes = (
     BSMT_OT_refresh_measurements,
     BSMT_OT_save_measurement_template,
     BSMT_OT_load_measurement_template,
+    BSMT_OT_compute_surface_path,
+    BSMT_OT_refresh_visualization,
+    BSMT_OT_clear_visualization,
+    BSMT_OT_clear_all_visualizations,
 )
 
 

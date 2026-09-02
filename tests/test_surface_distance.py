@@ -725,6 +725,117 @@ def test_insertion_does_not_touch_the_canonical_arrays():
           str(result.added_vertex_count))
 
 
+def test_surface_path_shares_the_distance_pipeline():
+    print("\n[path] the path solve sees the same endpoints as the distance")
+    if not HAVE_BACKEND:
+        skip("surface path", registry.unavailable_reason())
+        return
+    V, F = selftest.cylinder_mesh(50.0, 200.0, 48, 24)
+    a = spec(7, np.array([0.5, 0.3, 0.2]))
+    b = spec(900, np.array([0.25, 0.35, 0.4]))
+
+    distance = solve.surface_distance(V, F, a, b)
+    path = solve.surface_path(V, F, a, b,
+                              expected_distance_mm=distance.distance_mm)
+
+    check("the path solve agrees with the bounded distance",
+          abs(path.distance_mm - distance.distance_mm) < 1e-9,
+          "%.12f vs %.12f" % (path.distance_mm, distance.distance_mm))
+    check("the polyline's segments sum to the reported distance",
+          abs(path.polyline_length_mm - path.distance_mm) < 1e-9,
+          "%.12f vs %.12f" % (path.polyline_length_mm, path.distance_mm))
+    check("the polyline has at least two points", path.point_count >= 2)
+    check("the polyline is (k, 3) float64",
+          path.polyline_solver.shape[1] == 3
+          and path.polyline_solver.dtype == np.float64)
+    check("path >= straight", path.distance_mm >= path.straight_mm - 1e-9)
+    check("the mode matches the distance solve", path.mode == distance.mode,
+          "%s vs %s" % (path.mode, distance.mode))
+
+    # The endpoints must be the landmarks, not nearby mesh vertices.
+    corners_a = V[F[a.triangle_index]]
+    xyz_a = np.asarray(a.barycentric) @ corners_a
+    check("the polyline starts at the picked landmark",
+          float(np.linalg.norm(path.polyline_solver[0] - xyz_a)) < 1e-9)
+
+
+def test_surface_path_refuses_a_disagreeing_distance():
+    print("\n[path] a disagreeing path is refused, never substituted")
+    if not HAVE_BACKEND:
+        skip("path mismatch", registry.unavailable_reason())
+        return
+    V, F = selftest.plane_grid(10, 10, 6.0)
+    a = spec(7, np.array([0.5, 0.3, 0.2]))
+    b = spec(160, np.array([0.25, 0.35, 0.4]))
+    truth = solve.surface_distance(V, F, a, b).distance_mm
+
+    try:
+        solve.surface_path(V, F, a, b,
+                           expected_distance_mm=truth * 1.5)
+    except solve.MeasurementError as exc:
+        check("a mismatched reference raises PATH_DISTANCE_MISMATCH",
+              exc.code == 'PATH_DISTANCE_MISMATCH', exc.code)
+        check("the message says the measurement was not changed",
+              "NOT been changed" in exc.message, exc.message)
+    else:
+        check("a mismatched reference raises PATH_DISTANCE_MISMATCH", False,
+              "returned a path")
+
+    # Within tolerance it is accepted. The reference is stored as float32 in
+    # Blender, so the tolerance must sit above single-precision noise.
+    nudged = float(np.float32(truth))
+    result = solve.surface_path(V, F, a, b, expected_distance_mm=nudged)
+    check("a float32-rounded reference is still accepted",
+          result.distance_mm > 0.0)
+    check("the agreement figure is recorded",
+          result.agreement_mm >= 0.0)
+    check("the tolerance is above float32 storage noise",
+          solve.PATH_AGREEMENT_REL_TOL > 1.2e-7,
+          str(solve.PATH_AGREEMENT_REL_TOL))
+
+
+def test_surface_path_analytic_cases():
+    print("\n[path] same-triangle and A->A need no solver")
+    if not HAVE_BACKEND:
+        skip("analytic paths", registry.unavailable_reason())
+        return
+    V, F = selftest.plane_grid(8, 8, 5.0)
+
+    a = spec(0, np.array([0.6, 0.3, 0.1]))
+    b = spec(0, np.array([0.1, 0.3, 0.6]))
+    path = solve.surface_path(V, F, a, b)
+    check("same triangle gives a two-point path", path.point_count == 2)
+    check("same triangle path length == straight",
+          abs(path.polyline_length_mm - path.straight_mm) < 1e-12)
+    check("same triangle mode", path.mode == solve.MODE_SAME_TRIANGLE)
+
+    same = spec(12, np.array([0.4, 0.35, 0.25]))
+    path = solve.surface_path(V, F, same, same)
+    check("A -> A path length is exactly 0", path.polyline_length_mm == 0.0)
+    check("A -> A mode is ZERO", path.mode == solve.MODE_ZERO)
+
+
+def test_surface_path_validation_is_shared():
+    print("\n[path] the path solve refuses everything the distance refuses")
+    V, F = selftest.plane_grid(6, 6, 5.0)
+    good_a = spec(0, centroid())
+    good_b = spec(30, centroid())
+    expect_failure("path: missing point", 'POINTS_MISSING',
+                   lambda: solve.surface_path(V, F, None, good_b))
+    expect_failure("path: stale point", 'STALE_POINTS',
+                   lambda: solve.surface_path(
+                       V, F, spec(0, centroid(), status="STALE: x"), good_b))
+    expect_failure("path: different objects", 'DIFFERENT_OBJECTS',
+                   lambda: solve.surface_path(
+                       V, F, good_a, spec(30, centroid(), obj="Other")))
+    expect_failure("path: disconnected", 'DISCONNECTED',
+                   lambda: solve.surface_path(
+                       V, F, good_a, spec(30, centroid(), component=2)))
+    expect_failure("path: geometry hash differs", 'STALE_POINTS',
+                   lambda: solve.surface_path(V, F, good_a, good_b,
+                                              geometry_hash="different"))
+
+
 def main():
     print("BSMT Milestone 2.3 - offline surface distance tests")
     print("  python     : %s" % sys.version.split()[0])
@@ -754,6 +865,10 @@ def main():
         test_bounded_matches_unbounded_on_every_factor,
         test_disconnected_pair_never_reaches_the_solver,
         test_insertion_does_not_touch_the_canonical_arrays,
+        test_surface_path_shares_the_distance_pipeline,
+        test_surface_path_refuses_a_disagreeing_distance,
+        test_surface_path_analytic_cases,
+        test_surface_path_validation_is_shared,
     ):
         test()
 

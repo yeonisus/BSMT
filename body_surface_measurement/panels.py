@@ -2,7 +2,8 @@
 
 import bpy
 
-from . import geodesic, landmarks, measurement, measurements, state
+from . import (geodesic, landmarks, measurement, measurements, state,
+               visualization)
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
@@ -943,6 +944,119 @@ class BSMT_PT_measurements(bpy.types.Panel):
         note.label(text="Templates carry definitions, not results.")
 
 
+class BSMT_PT_measurement_visualization(bpy.types.Panel):
+    """Draw the selected measurement as a chord, a surface path, or both.
+
+    Display only. Nothing here computes a distance, and the surface path is
+    computed only when its button is pressed.
+    """
+
+    bl_label = "Measurement Visualization"
+    bl_idname = "BSMT_PT_measurement_visualization"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "BSMT"
+    bl_parent_id = "BSMT_PT_measurements"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = state.get_props(context)
+        collection = state.get_measurements(context)
+        if props is None or collection is None:
+            layout.label(text="Add-on state unavailable", icon='ERROR')
+            return
+
+        item = state.active_measurement(context, props)
+        box = layout.box()
+        if item is None:
+            box.label(text="No measurement selected")
+            return
+        # The Measurement Manager's selection IS the visualisation target.
+        # There is deliberately no second selection system.
+        box.label(text="Selected: %s  %s \u2192 %s" % (
+            item.protocol_id,
+            item.source_name or item.source_protocol_id or "?",
+            item.target_name or item.target_protocol_id or "?",
+        ))
+        drawn = []
+        if visualization.measurement_helper_exists(item.stable_id, 'STRAIGHT'):
+            drawn.append("LINE")
+        if visualization.measurement_helper_exists(item.stable_id, 'PATH'):
+            drawn.append("PATH")
+        if drawn:
+            state_row = box.row()
+            state_row.enabled = False
+            state_row.label(text="Showing: %s" % ("BOTH" if len(drawn) > 1
+                                                  else drawn[0]))
+
+        layout.prop(props, "viz_mode", text="Mode")
+        row = layout.row(align=True)
+        row.prop(props, "viz_selected_only")
+        if not props.viz_selected_only:
+            layout.prop(item, "show_visualization", text="Show This Measurement")
+
+        self._draw_path_controls(layout, props, item)
+
+        style = layout.box()
+        style.label(text="Straight")
+        style.prop(props, "viz_straight_color", text="Color")
+        style.prop(props, "viz_straight_thickness_mm", text="Thickness (mm)")
+        style.label(text="Surface Path")
+        style.prop(props, "viz_path_color", text="Color")
+        style.prop(props, "viz_path_thickness_mm", text="Thickness (mm)")
+        style.prop(props, "viz_surface_offset")
+
+        layout.separator()
+        layout.operator("bsmt.refresh_visualization", icon='FILE_REFRESH')
+        row = layout.row(align=True)
+        row.operator("bsmt.clear_visualization", text="Clear Selected",
+                     icon='X')
+        row.operator("bsmt.clear_all_visualizations", text="Clear All",
+                     icon='TRASH')
+
+    @staticmethod
+    def _draw_path_controls(layout, props, item):
+        box = layout.box()
+        if props.viz_running:
+            box.label(text="Computing exact surface path...", icon='TIME')
+            return
+
+        if item.path_valid:
+            column = box.column(align=True)
+            column.scale_y = 0.75
+            column.label(text="Path computed", icon='CHECKMARK')
+            column.label(text="Elapsed: %.2f s" % item.path_elapsed_s)
+            column.label(text="Points:  %d" % item.path_point_count)
+            column.label(text="Path length:   %s"
+                              % measurement.format_mm(item.path_length_mm))
+            column.label(text="Solver path:   %s"
+                              % measurement.format_mm(item.path_distance_mm))
+            column.label(text="Stored surface: %s"
+                              % measurement.format_mm(item.surface_mm))
+            column.label(text="Agreement: %.3e mm" % item.path_agreement_mm)
+            box.operator("bsmt.compute_surface_path", text="Recompute Path",
+                         icon='FILE_REFRESH')
+            return
+
+        if props.viz_mode in ('SURFACE', 'BOTH'):
+            note = box.column(align=True)
+            note.scale_y = 0.75
+            note.label(text="Surface path not computed", icon='INFO')
+            if not item.surface_valid:
+                note.label(text="Calculate the surface distance first.")
+            else:
+                note.label(text="This runs the unbounded exact solve and")
+                note.label(text="may block Blender for tens of seconds.")
+        box.operator("bsmt.compute_surface_path", icon='PLAY')
+
+        if props.viz_status:
+            status = box.column(align=True)
+            status.scale_y = 0.7
+            for line in _wrap(props.viz_status, 42):
+                status.label(text=line)
+
+
 classes = (
     BSMT_PT_body_measurement,
     BSMT_PT_diagnostics,
@@ -951,6 +1065,7 @@ classes = (
     BSMT_PT_landmarks,
     BSMT_UL_measurements,
     BSMT_PT_measurements,
+    BSMT_PT_measurement_visualization,
 )
 
 

@@ -310,6 +310,16 @@ def refresh(props, watched=None, reason="manual"):
 
     notes.append(refresh_landmarks(props, watched, multiplier))
 
+    # Measurement visualisation follows the scan by matrix, not by rewriting
+    # points: a geodesic path can have thousands of them.
+    try:
+        from . import viz
+        synced = viz.sync_transforms(None, props)
+        if synced:
+            notes.append("measurement-helpers:%d" % synced)
+    except Exception:                                 # pragma: no cover
+        pass
+
     STATS["refresh_count"] += 1
     outcome = "%s | line=%s | %s" % (reason, line_state, " ".join(notes) or "nothing")
     STATS["last_outcome"] = outcome

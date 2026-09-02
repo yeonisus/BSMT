@@ -283,6 +283,7 @@ def test_fresh_import():
     check("fresh: operators module loaded", hasattr(bsmt, "operators"))
     check("fresh: landmarks module loaded", hasattr(bsmt, "landmarks"))
     check("fresh: measurements module loaded", hasattr(bsmt, "measurements"))
+    check("fresh: viz module loaded", hasattr(bsmt, "viz"))
     check("fresh: protocol module loaded", hasattr(bsmt, "protocol"))
     check("fresh: register/unregister present",
           callable(bsmt.register) and callable(bsmt.unregister))
@@ -850,8 +851,27 @@ def test_landmark_modules_are_pure(bsmt):
         for forbidden in ("itertools.combinations", "all_pairs", "allpairs"):
             check("%s contains no %s" % (path, forbidden),
                   forbidden not in lowered)
+    # Milestone 3.2: a surface PATH must never be a side effect. Only the
+    # explicit operator may call the path solve.
+    for path in ("state.py", "panels.py", "viz.py"):
+        text = open(_os.path.join(ROOT, "body_surface_measurement", path)).read()
+        check("%s never calls surface_path()" % path,
+              "surface_path(" not in text, path)
     ops_text = open(_os.path.join(ROOT, "body_surface_measurement",
                                   "operators.py")).read()
+    check("only one place calls the path solve",
+          ops_text.count("solve.surface_path(") == 1,
+          str(ops_text.count("solve.surface_path(")))
+    for op_name in ("calculate_measurement", "calculate_all_measurements",
+                    "add_measurement", "pick_landmark"):
+        # crude but effective: the path solve must not appear inside these
+        start = ops_text.find("bl_idname = \"bsmt.%s\"" % op_name)
+        if start < 0:
+            continue
+        end = ops_text.find("\nclass ", start)
+        body = ops_text[start:end if end > 0 else len(ops_text)]
+        check("bsmt.%s does not compute a path" % op_name,
+              "surface_path(" not in body)
     check("operators.py never reads a landmark picker back",
           "source_picker" not in ops_text and "target_picker" not in ops_text,
           "the picker remaps by index and must never decide identity")
