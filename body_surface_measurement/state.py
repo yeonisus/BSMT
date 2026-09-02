@@ -238,6 +238,62 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         default=False,
     )
 
+    # ------------------------------------------------------------------
+    # Milestone 2.2 - exact geodesic backend proof of concept.
+    # Development diagnostics only. None of this participates in the Phase 1
+    # straight-line measurement or in any displayed research result, and no
+    # surface distance is written anywhere in Phase 2 until Milestone 2.3.
+    # ------------------------------------------------------------------
+    show_geodesic_backend: BoolProperty(
+        name="Geodesic Backend",
+        description=(
+            "Show the Milestone 2.2 exact-geodesic backend diagnostics panel"
+        ),
+        default=False,
+    )
+    env_report: StringProperty(
+        name="Environment Report",
+        description="Most recent runtime environment report",
+        default="",
+    )
+    env_report_valid: BoolProperty(default=False)
+
+    backend_test_report: StringProperty(
+        name="Backend Self-Test Report",
+        description="Most recent synthetic exact-geodesic backend test output",
+        default="",
+    )
+    backend_test_valid: BoolProperty(default=False)
+
+    backend_test_dense: BoolProperty(
+        name="Include Dense Benchmark",
+        description=(
+            "Also benchmark a synthetic mesh of roughly the real scan's "
+            "triangle count. This takes seconds to minutes and Blender will "
+            "not redraw while it runs. The real scan is never loaded"
+        ),
+        default=True,
+    )
+    backend_test_triangles: IntProperty(
+        name="Benchmark Triangles",
+        description=(
+            "Target triangle count for the dense benchmark. Defaults to the "
+            "triangle count of the reference scan 21_M_3400E"
+        ),
+        default=314086,
+        min=1000,
+        max=5000000,
+    )
+    backend_test_dijkstra: BoolProperty(
+        name="Compare Edge-Dijkstra",
+        description=(
+            "Also report edge-graph Dijkstra on the planar meshes, to show "
+            "its triangulation-dependent positive bias. DIAGNOSTIC ONLY: it "
+            "is never a BSMT measurement backend"
+        ),
+        default=True,
+    )
+
     components: CollectionProperty(
         name="Components",
         description="Connected components found by the last preview",
@@ -378,6 +434,19 @@ def clear_topology(props):
     props.topology_valid = False
     props.topology_object = ""
     props.topology_report = ""
+
+
+def clear_backend_reports(props):
+    """Forget the Milestone 2.2 diagnostics output.
+
+    Separate from clear_topology() and from reset(): the backend proof has
+    nothing to do with the measurement points and must not be cleared by
+    Clear Points, nor clear them.
+    """
+    props.env_report = ""
+    props.env_report_valid = False
+    props.backend_test_report = ""
+    props.backend_test_valid = False
 
 
 def reset(props):

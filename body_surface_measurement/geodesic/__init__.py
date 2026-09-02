@@ -8,6 +8,8 @@ Module layout, per PROJECT_SPEC.md sect. 11:
     spaces.py    pure numpy - solver space, geometry_hash, metric_key
     topology.py  pure numpy - mesh analysis
     extract.py   requires bpy - evaluated mesh extraction
+    envreport.py stdlib - runtime environment detection (2.2)
+    backends/    pure numpy - geodesic solver backends (2.2, dev only)
 
 spaces and topology import outside Blender and are unit tested there.
 extract imports bpy and is expected to import only inside Blender.
@@ -57,12 +59,26 @@ PREVIEW_AVAILABLE = False
 PREVIEW_IMPORT_ERROR = ""
 PREVIEW_IMPORT_TRACEBACK = ""
 
+# envreport + backends: Milestone 2.2, development diagnostics only.
+# NOTHING here may block topology diagnostics, picking or the Phase 1
+# straight distance: the exact geodesic backend is optional by construction
+# and BSMT must load normally when pygeodesic is absent.
+ENVREPORT_AVAILABLE = False
+ENVREPORT_IMPORT_ERROR = ""
+ENVREPORT_IMPORT_TRACEBACK = ""
+
+BACKENDS_AVAILABLE = False
+BACKENDS_IMPORT_ERROR = ""
+BACKENDS_IMPORT_TRACEBACK = ""
+
 spaces = None
 topology = None
 surface_point = None
 extract = None
 meshcache = None
 preview = None
+envreport = None
+backends = None
 
 
 def _describe(exc):
@@ -172,12 +188,66 @@ def _load_preview():
     return True
 
 
+def _load_envreport():
+    """Import the runtime environment reporter. Returns True on success."""
+    global envreport
+    global ENVREPORT_AVAILABLE, ENVREPORT_IMPORT_ERROR, ENVREPORT_IMPORT_TRACEBACK
+
+    try:
+        envreport = importlib.import_module(".envreport", __name__)
+    except Exception as exc:
+        envreport = None
+        ENVREPORT_AVAILABLE = False
+        ENVREPORT_IMPORT_ERROR = _describe(exc)
+        ENVREPORT_IMPORT_TRACEBACK = traceback.format_exc()
+        print("[BSMT] failed to import envreport module: %s" % ENVREPORT_IMPORT_ERROR)
+        print(ENVREPORT_IMPORT_TRACEBACK)
+        return False
+
+    ENVREPORT_AVAILABLE = True
+    ENVREPORT_IMPORT_ERROR = ""
+    ENVREPORT_IMPORT_TRACEBACK = ""
+    return True
+
+
+def _load_backends():
+    """Import the backends subpackage. Returns True on success.
+
+    This is NOT the same question as "is pygeodesic installed". The
+    subpackage guards that import itself and loads successfully either way;
+    a failure here means BSMT's own wrapper is broken.
+    """
+    global backends
+    global BACKENDS_AVAILABLE, BACKENDS_IMPORT_ERROR, BACKENDS_IMPORT_TRACEBACK
+
+    try:
+        backends = importlib.import_module(".backends", __name__)
+    except Exception as exc:
+        backends = None
+        BACKENDS_AVAILABLE = False
+        BACKENDS_IMPORT_ERROR = _describe(exc)
+        BACKENDS_IMPORT_TRACEBACK = traceback.format_exc()
+        print("[BSMT] failed to import backends package: %s" % BACKENDS_IMPORT_ERROR)
+        print(BACKENDS_IMPORT_TRACEBACK)
+        return False
+
+    BACKENDS_AVAILABLE = True
+    BACKENDS_IMPORT_ERROR = ""
+    BACKENDS_IMPORT_TRACEBACK = ""
+    return True
+
+
 if NUMPY_AVAILABLE:
     # extract depends on spaces, so it is only attempted once analysis loads.
     if _load_analysis():
         if _load_extract():
             _load_meshcache()
         _load_preview()
+        _load_backends()
+
+# envreport needs neither numpy nor bpy: it must work precisely when they are
+# the thing that is broken.
+_load_envreport()
 
 
 def ensure_loaded():
@@ -201,6 +271,12 @@ def ensure_loaded():
             _load_meshcache()
         if ANALYSIS_AVAILABLE and (not PREVIEW_AVAILABLE or preview is None):
             _load_preview()
+        if ANALYSIS_AVAILABLE and (not BACKENDS_AVAILABLE or backends is None):
+            _load_backends()
+        elif backends is not None:
+            backends.ensure_loaded()
+    if not ENVREPORT_AVAILABLE or envreport is None:
+        _load_envreport()
     return diagnostics_error()
 
 
@@ -284,6 +360,70 @@ def reload_submodules():
     Safe when a submodule failed to import: reloading the package itself has
     already retried the import.
     """
-    for module in (spaces, topology, surface_point, extract, meshcache, preview):
+    for module in (spaces, topology, surface_point, extract, meshcache, preview,
+                   envreport):
         if module is not None:
             importlib.reload(module)
+    if backends is not None:
+        importlib.reload(backends)
+        backends.reload_submodules()
+
+
+def environment_error():
+    """Why the environment report is unavailable, or '' when it is usable."""
+    if not ENVREPORT_AVAILABLE or envreport is None:
+        return (
+            "Environment report unavailable: failed to import envreport "
+            "module: %s" % (ENVREPORT_IMPORT_ERROR or "not loaded")
+        )
+    return ""
+
+
+def backend_status():
+    """Exact-geodesic backend availability record, never raising.
+
+    Returns the same dict shape whether or not anything imported, so the
+    diagnostics panel has one code path. A missing pygeodesic is reported,
+    not hidden, and its original import error is carried verbatim.
+    """
+    if backends is None:
+        return {
+            "backend_name": "pygeodesic-MMP",
+            "wrapper_version": "",
+            "available": False,
+            "version": "",
+            "module_path": "",
+            "import_error": "",
+            "import_traceback": "",
+            "wrapper_error": (
+                BACKENDS_IMPORT_ERROR
+                or "geodesic.backends was not loaded (numpy unavailable?)"
+            ),
+            "wrapper_traceback": BACKENDS_IMPORT_TRACEBACK,
+        }
+    return backends.status()
+
+
+def backend_available():
+    """True when an exact geodesic backend can be used right now."""
+    return bool(backends is not None and backends.availability())
+
+
+def backend_error():
+    """One-line reason the exact backend is unusable, or ''."""
+    if backends is None:
+        return (
+            "Exact geodesic backend unavailable: %s"
+            % (BACKENDS_IMPORT_ERROR
+               or "geodesic.backends was not loaded (numpy unavailable?)")
+        )
+    return backends.unavailable_reason()
+
+
+def backend_import_traceback():
+    """Complete original traceback of the backend import failure, or ''."""
+    if BACKENDS_IMPORT_TRACEBACK:
+        return BACKENDS_IMPORT_TRACEBACK
+    if backends is None:
+        return ""
+    return backends.status().get("import_traceback", "")

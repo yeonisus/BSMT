@@ -245,9 +245,106 @@ class BSMT_PT_diagnostics(bpy.types.Panel):
             isolate.index = item.index
 
 
+class BSMT_PT_geodesic_backend(bpy.types.Panel):
+    """Milestone 2.2 development panel: exact geodesic backend proof.
+
+    Deliberately NOT part of the Body Measurement result area. Nothing here
+    produces or displays a research measurement; Surface Distance arrives in
+    Milestone 2.3.
+    """
+
+    bl_label = "Geodesic Backend (dev)"
+    bl_idname = "BSMT_PT_geodesic_backend"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "BSMT"
+    bl_parent_id = "BSMT_PT_body_measurement"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = state.get_props(context)
+
+        status = geodesic.backend_status()
+        available = bool(status.get("available"))
+
+        box = layout.box()
+        column = box.column(align=True)
+        column.scale_y = 0.7
+        column.label(
+            text="pygeodesic: %s" % ("Available" if available else "Unavailable"),
+            icon='CHECKMARK' if available else 'ERROR',
+        )
+        column.label(text="Version: %s" % (status.get("version") or "-"))
+        path = status.get("module_path") or "-"
+        column.label(text="Import path:")
+        for line in _wrap(path, 46):
+            column.label(text="  " + line)
+
+        if not available:
+            if status.get("wrapper_error"):
+                column.separator()
+                column.label(text="BSMT wrapper error:")
+                for line in _wrap(status["wrapper_error"], 46):
+                    column.label(text="  " + line)
+            if status.get("import_error"):
+                column.separator()
+                column.label(text="Import error:")
+                for line in _wrap(status["import_error"], 46):
+                    column.label(text="  " + line)
+                column.label(text="Full traceback: system console")
+            column.separator()
+            column.label(text="BSMT and Phase 1 measurement are unaffected.")
+            column.label(text="Run Check Environment for the install command.")
+
+        layout.operator("bsmt.check_geodesic_env", icon='CONSOLE')
+
+        run = layout.column(align=True)
+        run.enabled = available
+        run.operator("bsmt.run_backend_selftest", icon='PLAY')
+        if props is not None:
+            run.prop(props, "backend_test_dijkstra")
+            run.prop(props, "backend_test_dense")
+            dense = run.row()
+            dense.enabled = props.backend_test_dense
+            dense.prop(props, "backend_test_triangles")
+            if props.backend_test_dense:
+                warn = layout.column(align=True)
+                warn.scale_y = 0.7
+                warn.label(text="Dense benchmark blocks the UI while it runs.",
+                           icon='INFO')
+
+        if props is None:
+            return
+
+        if props.env_report_valid or props.backend_test_valid:
+            layout.operator("bsmt.clear_backend_reports", text="Clear Reports",
+                            icon='X')
+
+        self._draw_report(layout, "Environment", props.env_report_valid,
+                          props.env_report)
+        self._draw_report(layout, "Synthetic Backend Tests",
+                          props.backend_test_valid, props.backend_test_report)
+
+    @staticmethod
+    def _draw_report(layout, title, valid, text):
+        if not valid or not text:
+            return
+        layout.separator()
+        layout.label(text=title)
+        column = layout.box().column(align=True)
+        column.scale_y = 0.7
+        for line in text.split("\n"):
+            if line.strip():
+                column.label(text=line)
+            else:
+                column.separator()
+
+
 classes = (
     BSMT_PT_body_measurement,
     BSMT_PT_diagnostics,
+    BSMT_PT_geodesic_backend,
 )
 
 

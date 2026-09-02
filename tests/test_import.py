@@ -217,6 +217,46 @@ def check_package(bsmt, label):
     check("%s: import_traceback() is empty" % label,
           geodesic.import_traceback() == "")
 
+    # Milestone 2.2. Same placeholder-shadowing hazard as every other
+    # submodule, so it gets the same wiring check.
+    check("%s: geodesic.envreport is not None" % label,
+          geodesic.envreport is not None, geodesic.ENVREPORT_IMPORT_ERROR)
+    check("%s: environment_error() is empty" % label,
+          geodesic.environment_error() == "", geodesic.environment_error())
+    check("%s: envreport.collect/format_report exist" % label,
+          geodesic.envreport is not None
+          and all(callable(getattr(geodesic.envreport, n, None))
+                  for n in ("collect", "format_report")))
+    check("%s: geodesic.backends is not None" % label,
+          geodesic.backends is not None, geodesic.BACKENDS_IMPORT_ERROR)
+    check("%s: backends.exact_mmp is not None" % label,
+          geodesic.backends is not None
+          and geodesic.backends.exact_mmp is not None)
+    check("%s: backends.selftest is not None" % label,
+          geodesic.backends is not None
+          and geodesic.backends.selftest is not None)
+    check("%s: selftest_error() is empty" % label,
+          geodesic.backends is not None
+          and geodesic.backends.selftest_error() == "")
+
+    # The binding Milestone 2.2 invariant: the add-on's own health must not
+    # depend on whether pygeodesic happens to be installed.
+    status = geodesic.backend_status()
+    check("%s: backend_status() is a dict" % label, isinstance(status, dict))
+    check("%s: backend wrapper itself loaded" % label,
+          status.get("wrapper_error") == "", status.get("wrapper_error"))
+    check("%s: diagnostics unaffected by backend availability" % label,
+          geodesic.diagnostics_error() == "")
+    if geodesic.backend_available():
+        check("%s: backend_error() empty while available" % label,
+              geodesic.backend_error() == "")
+    else:
+        check("%s: backend_error() explains the absence" % label,
+              bool(geodesic.backend_error()))
+        check("%s: absence does not break preview/diagnostics" % label,
+              geodesic.preview_error() == ""
+              and geodesic.diagnostics_error() == "")
+
 
 def test_fresh_import():
     print("\nfresh import of the add-on package (stubbed bpy)")
@@ -319,6 +359,90 @@ def test_stale_state_is_repaired(bsmt):
         (geodesic.extract, geodesic.EXTRACT_AVAILABLE,
          geodesic.spaces, geodesic.topology,
          geodesic.ANALYSIS_AVAILABLE) = saved
+
+
+def test_backend_modules_are_repaired(bsmt):
+    """ensure_loaded() must repair the Milestone 2.2 modules too.
+
+    Same failure shape as the 0.3.0 defect: Blender keeps the package alive
+    across disable/enable and Reload Scripts, so a submodule left at None
+    would stay None until a restart.
+    """
+    print("\nMilestone 2.2 modules are repaired by ensure_loaded()")
+    geodesic = bsmt.geodesic
+    saved = (geodesic.backends, geodesic.BACKENDS_AVAILABLE,
+             geodesic.envreport, geodesic.ENVREPORT_AVAILABLE)
+    try:
+        geodesic.backends = None
+        geodesic.BACKENDS_AVAILABLE = False
+        geodesic.BACKENDS_IMPORT_ERROR = "stale state"
+        geodesic.envreport = None
+        geodesic.ENVREPORT_AVAILABLE = False
+        geodesic.ENVREPORT_IMPORT_ERROR = "stale state"
+
+        check("stale backends: status() still returns a dict",
+              isinstance(geodesic.backend_status(), dict))
+        check("stale backends: backend_available() is False",
+              geodesic.backend_available() is False)
+        check("stale backends: backend_error() names the problem",
+              "stale state" in geodesic.backend_error())
+        check("stale envreport: environment_error() is populated",
+              bool(geodesic.environment_error()))
+        check("stale backends do NOT break topology diagnostics",
+              geodesic.diagnostics_error() == "",
+              geodesic.diagnostics_error())
+
+        geodesic.ensure_loaded()
+        check("repair: backends restored", geodesic.backends is not None)
+        check("repair: envreport restored", geodesic.envreport is not None)
+        check("repair: BACKENDS_IMPORT_ERROR cleared",
+              geodesic.BACKENDS_IMPORT_ERROR == "")
+        check("repair: environment_error() cleared",
+              geodesic.environment_error() == "")
+    finally:
+        (geodesic.backends, geodesic.BACKENDS_AVAILABLE,
+         geodesic.envreport, geodesic.ENVREPORT_AVAILABLE) = saved
+
+
+def test_backend_absence_never_blocks_phase_one(bsmt):
+    """A missing pygeodesic must not affect anything outside the dev panel."""
+    print("\na missing exact backend leaves BSMT fully functional")
+    geodesic = bsmt.geodesic
+    exact = geodesic.backends.exact_mmp
+
+    saved = (exact.AVAILABLE, exact._geodesic, exact.IMPORT_ERROR)
+    try:
+        exact.AVAILABLE = False
+        exact._geodesic = None
+        exact.IMPORT_ERROR = "ImportError: simulated missing backend"
+
+        check("simulated absence: availability() is False",
+              exact.availability() is False)
+        check("simulated absence: backend_available() is False",
+              geodesic.backend_available() is False)
+        check("simulated absence: reason carries the original error",
+              "simulated missing backend" in geodesic.backend_error())
+        check("simulated absence: diagnostics still fine",
+              geodesic.diagnostics_error() == "")
+        check("simulated absence: preview still fine",
+              geodesic.preview_error() == "")
+
+        # And the backend must raise rather than return a substitute number.
+        import numpy as _np
+        vertices = _np.array([[0.0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]])
+        faces = _np.array([[0, 1, 2], [1, 3, 2]], dtype=_np.int32)
+        try:
+            exact.compute_distance_and_path(vertices, faces, 0, 3)
+        except exact.BackendUnavailable:
+            check("simulated absence: raises BackendUnavailable", True)
+        except Exception as exc:
+            check("simulated absence: raises BackendUnavailable", False,
+                  "raised %s" % type(exc).__name__)
+        else:
+            check("simulated absence: raises BackendUnavailable", False,
+                  "returned a value")
+    finally:
+        (exact.AVAILABLE, exact._geodesic, exact.IMPORT_ERROR) = saved
 
 
 def test_extract_binds_submodules_directly(bsmt):
@@ -654,6 +778,8 @@ def main():
     bsmt = test_fresh_import()
     test_reload(bsmt)
     test_stale_state_is_repaired(bsmt)
+    test_backend_modules_are_repaired(bsmt)
+    test_backend_absence_never_blocks_phase_one(bsmt)
     test_attach_transform_following(bsmt)
     test_refresh_without_cached_canonical_mesh(bsmt)
     test_handler_persistence_and_duplicates(bsmt)

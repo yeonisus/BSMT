@@ -1,10 +1,13 @@
 # BSMT — Body Surface Measurement Tool
 ## Project Specification
 
-**Document version:** 0.2
-**Date:** 2026-09-01
-**Target environment:** Blender 4.5.13, macOS (Apple Silicon), bundled Python 3.11
-**Status:** Phase 1 complete and validated on a real human-body scan. Phase 2 designed, not implemented.
+**Document version:** 0.3
+**Date:** 2026-09-02
+**Target environment:** Blender 4.5.13 LTS, macOS 26.5 (Apple Silicon, arm64),
+bundled Python 3.11.15, numpy 1.26.4 — **all detected at runtime, 2026-09-02** (§5.1a)
+**Status:** Phase 1 complete and validated on a real human-body scan. Milestones 2.0, 2.0a and
+2.1 implemented and validated in Blender. Milestone 2.2 implemented; its in-Blender proof is
+recorded in §5.1a.
 
 > Note on this document's history: no `PROJECT_SPEC.md` existed in the project before this
 > revision. Phase 1 was specified conversationally and implemented from that specification.
@@ -20,7 +23,7 @@ on textured OBJ human-body scans.
 | Phase | Content | Status |
 |---|---|---|
 | 1 | Straight-line (Euclidean) distance between two ray-cast surface points | **Done** (v0.2.0) |
-| 2 | Surface (geodesic) distance between the same two points | **This document** |
+| 2 | Surface (geodesic) distance between the same two points | **This document.** Milestones 2.0, 2.0a, 2.1, 2.1a, **2.2 done** (v0.6.0); 2.3–2.6 outstanding |
 | 3+ | Preprocessing, landmark templates, automatic landmark detection, export, batch measurement | Not designed |
 | Future | Anatomical scan alignment (§13) | Requirement recorded, not designed |
 
@@ -179,10 +182,148 @@ pygeodesic.geodesic.PyGeodesicAlgorithmExact(points, faces)
 **Performance concern to carry into Milestone 2.3.** One query on an 81,920-triangle icosphere
 took **1.88 s** (construction only 0.04 s). 21_M_3400E has 314,086 triangles, 3.8x larger, so a
 single A-B measurement is likely to take **several seconds at best**, since MMP window
-propagation grows faster than linearly. Milestone 2.3 must therefore not appear frozen while it
+propagation grows faster than linearly. **This estimate was measured in Milestone 2.2 and proved
+optimistic: 16.8 s and ~1.7 GB at 327,680 triangles inside Blender (§5.1a).** Milestone 2.3 must therefore not appear frozen while it
 runs, must measure the real cost on the real scan, and must not assume a batch or all-pairs
 workflow is affordable. If it proves too slow the options are early termination, the VTP variant,
 or the edge-flip solver — all changes of backend, not of architecture.
+
+### 5.1a Measured environment proof — Milestone 2.2 (2026-09-02)
+
+Everything below was **detected at runtime**, not assumed. Source: `tools/check_geodesic_env.py`
+run under `Blender --background`, which now delegates to `geodesic/envreport.py` and
+`geodesic/backends/selftest.py` so the standalone tool and the in-Blender panel report identical
+numbers.
+
+**Detected environment**
+
+| Item | Detected value |
+|---|---|
+| Blender | 4.5.13 LTS, `/Applications/Blender.app/Contents/MacOS/Blender` |
+| `sys.version` | 3.11.15 (main, Apr 25 2025) [Clang 15.0.0] |
+| `sys.executable` | `/Applications/Blender.app/Contents/Resources/4.5/python/bin/python3.11` |
+| `platform.system()` / `machine()` | `Darwin` / `arm64` (macOS 26.5) |
+| numpy | 1.26.4, from Blender's bundled site-packages |
+| Required wheel tag | `cp311`, macosx arm64 |
+| pygeodesic resolved | **0.1.11**, `pygeodesic-0.1.11-cp311-cp311-macosx_11_0_arm64.whl` |
+
+The Python-3.11 assumption of §5.1 is therefore **confirmed**, and the arm64 wheel exists.
+
+**Two environment facts that change the install procedure**
+
+1. **Blender runs its Python with `no_user_site = 1`.** `site.ENABLE_USER_SITE` is `True` for the
+   bundled interpreter launched from a shell but `False` inside Blender itself. Consequently
+   `pip install --user` puts the package in `~/.local/lib/python3.11/site-packages`, which Blender
+   never searches: it imports in Terminal and fails inside Blender. The earlier version of
+   `tools/check_geodesic_env.py` recommended exactly that and was wrong. The install target is now
+   derived at runtime from the paths the live interpreter actually imports from.
+
+2. **pygeodesic 0.1.11 declares `numpy<3,>=2`, but Blender bundles numpy 1.26.4.** The declared
+   floor is *metadata only*: the compiled extension imports and runs correctly against numpy
+   1.26.4 (measured, both in the bundled interpreter and inside Blender). A plain
+   `pip install pygeodesic` would honour the metadata and place numpy 2.x ahead of Blender's own
+   numpy on `sys.path`, silently changing the numpy every other part of Blender uses. **`--no-deps`
+   is therefore mandatory, not a convenience.**
+
+**Recorded install command** (no `sudo`; target survives a Blender update and is on Blender's
+`sys.path` unconditionally):
+
+```
+"/Applications/Blender.app/Contents/Resources/4.5/python/bin/python3.11" -m pip install \
+    --no-deps \
+    --target "/Users/yeoni/Library/Application Support/Blender/4.5/scripts/addons/modules" \
+    pygeodesic
+```
+
+**Measured backend results, inside Blender 4.5.13 / Python 3.11.15 / numpy 1.26.4 / arm64.**
+The wheel was staged on `sys.path` rather than installed for this run; the numbers are from
+Blender's own interpreter.
+
+*Plane — the only test that isolates algorithmic error, because a planar polyhedron IS the plane:*
+
+| Triangulation | Triangles | Exact rel. error | Edge-Dijkstra rel. error |
+|---|---|---|---|
+| forward diagonals, 20x20 | 800 | 0.000e+00 | 0.000e+00 |
+| backward diagonals, 20x20 | 800 | 0.000e+00 | **4.142e-01** |
+| alternating (checkerboard) | 800 | 0.000e+00 | 0.000e+00 |
+| sliver (aspect ratio 40:1) | 800 | 1.421e-16 | 1.421e-16 |
+| forward, 8x8 | 128 | 0.000e+00 | 0.000e+00 |
+| forward, 60x60 | 7200 | 0.000e+00 | 4.019e-16 |
+
+The exact backend's algorithmic error is at the floating-point floor on **every** triangulation,
+including slivers. The Dijkstra column is the §5.3 diagnostic and is the clearest available
+demonstration of metrication bias: on the *backward* grid, where no edge runs along the A-B
+direction, it overestimates by √2 − 1 = 41.4%; on grids whose diagonal happens to align with the
+query it is accidentally exact. **The bias is triangulation-dependent, which is precisely why an
+edge-graph method can never be the research backend.**
+
+*Cylinder — R = 50 mm, H = 200 mm, quarter turn plus half height, endpoints on mesh vertices.
+Reference: the analytically unrolled distance 127.155428 mm.*
+
+| n_θ × n_z | Triangles | h (mm) | Polyhedral (mm) | Abs. error (mm) | Rel. error | Observed order |
+|---|---|---|---|---|---|---|
+| 24 × 10 | 480 | 18.978 | 127.017130 | 0.138298 | 0.1088% | — |
+| 48 × 20 | 1 920 | 9.496 | 127.120808 | 0.034620 | 0.0272% | **2.00** |
+| 96 × 40 | 7 680 | 4.749 | 127.146770 | 0.008658 | 0.0068% | **2.00** |
+| 192 × 80 | 30 720 | 2.375 | 127.153263 | 0.002165 | 0.0017% | **2.00** |
+
+*Sphere — icosphere R = 100 mm, source at the pole, target the vertex nearest 90° (a unique
+geodesic; an antipodal pair has infinitely many). Reference: great circle 157.079633 mm.*
+
+| Subdiv. | Triangles | h (mm) | Polyhedral (mm) | Abs. error (mm) | Rel. error | Observed order |
+|---|---|---|---|---|---|---|
+| 2 | 320 | 29.834 | 155.665910 | 1.413723 | 0.9000% | — |
+| 3 | 1 280 | 15.008 | 156.717368 | 0.362265 | 0.2306% | 1.98 |
+| 4 | 5 120 | 7.516 | 156.986814 | 0.092819 | 0.0591% | 1.97 |
+| 5 | 20 480 | 3.759 | 157.056487 | 0.023146 | 0.0147% | 2.00 |
+
+Both curved cases are **signed negative at every resolution**: the inscribed polyhedron's chords
+cut corners, so it underestimates the smooth surface. This difference is **representation error**
+(§4.1), not algorithmic error, and it converges at the measured order ≈ 2 predicted but not
+assumed by §4.4. The §4.4 discriminating signature is reproduced in full: the exact method's error
+shrinks as O(h²) while edge-Dijkstra's does not shrink at all.
+
+*Path/distance consistency* — `sum(|polyline segments|)` vs the reported distance: relative
+difference 0.000e+00 (plane), 6.707e-16 (cylinder), 3.628e-16 (icosphere); path endpoints
+coincide with the requested vertices to 0 mm.
+
+**Dense-mesh benchmark — the most consequential result for Milestone 2.3.**
+Synthetic icosphere of 327 680 triangles / 163 842 vertices, chosen to bracket the real scan's
+314 086. The real scan was **not** loaded, opened or modified.
+
+| Quantity | Measured |
+|---|---|
+| Mesh generation (BSMT's own generator) | 0.53 s |
+| **Solver construction** | **0.14 s** |
+| **First A–B query** | **16.77 s** |
+| **Repeated identical query** | **16.67 s** (mean of 2) |
+| Returned path points | 383 |
+| Peak RSS before / after | 306 MB / 1 978 MB |
+| Peak RSS delta | **≈ 1.67 GB** |
+
+Three findings, all binding on Milestone 2.3:
+
+- **Construction is free; the query is not.** 0.14 s vs 16.8 s. Caching the constructed solver
+  buys almost nothing; the cost is entirely MMP window propagation.
+- **A repeated query costs the same as the first.** `PyGeodesicAlgorithmExact` does not retain
+  usable state between `geodesicDistance` calls, so an N-landmark session costs N × 16.8 s unless
+  `geodesicDistances` (one-to-all) is used instead. That is worth measuring before 2.3 commits to
+  a per-pair call.
+- **≈1.7 GB peak RSS for one query at scan scale.** This must be stated as a system requirement
+  and re-measured on the real scan.
+
+This is **substantially worse than the ~7 s floor extrapolated in §5.1** from the 81 920-triangle
+timing, confirming that MMP cost grows faster than linearly. Milestone 2.3 therefore cannot call
+this synchronously from a panel button without progress feedback, and an all-pairs or batch
+workflow is not affordable at this backend's current cost. If it proves unusable the options
+remain those named in §5.1 — early termination, the VTP variant, or an edge-flip solver — all
+changes of backend, not of architecture.
+
+*Failure behaviour* — all twelve cases of §12/11 behave as required: empty vertex array, empty
+triangle array, wrong array shape, non-finite coordinate, float triangle indices, out-of-range and
+negative triangle indices, index-degenerate triangle, out-of-range source and target index, and a
+1-point polyline each raise a typed `InvalidMeshError` with a specific message; `source == target`
+returns exactly `0.0` with no solver call. No case returns a substitute number.
 
 ### 5.2 No approximate production fallback in Phase 2
 
@@ -662,16 +803,23 @@ and the plausibility of the surface/straight ratio.
 ## 10. Packaging decision
 
 **For now:** develop and validate on the current macOS Blender 4.5.13 environment.
-`pygeodesic` is installed into Blender's bundled Python via pip. BSMT stays a legacy `bl_info`
-add-on. The add-on must load and Phase 1 must work with the backend absent.
+`pygeodesic` is installed with Blender's own `pip`, **into Blender's user scripts modules
+directory, not into the app bundle and never with `--user`** (§5.1a explains why each of those
+matters). BSMT stays a legacy `bl_info` add-on. The add-on must load and Phase 1 must work with
+the backend absent — verified in Blender 4.5.13 with pygeodesic uninstalled, 2026-09-02.
 
 **Later, after Phase 2 is validated:** migrate BSMT to the Blender 4.2+ extension format
 (`blender_manifest.toml`) and bundle platform-specific wheels for distribution.
 
-Known risks of the interim approach, to be verified in Milestone 2.2: Blender updates can wipe
-the bundled site-packages; the wheel architecture must match the Blender binary (arm64 vs
-x86_64 under Rosetta); and the wheel's compiled numpy ABI must be compatible with Blender's
-bundled numpy.
+Known risks of the interim approach, **as resolved by Milestone 2.2 (§5.1a)**:
+
+| Risk | Status after measurement |
+|---|---|
+| Blender updates wipe the bundled site-packages | Avoided: the recorded target is `~/Library/Application Support/Blender/4.5/scripts/addons/modules`, outside the app bundle and on Blender's `sys.path` unconditionally. It is version-scoped to `4.5`, so a move to Blender 5.x needs a fresh install — not a silent breakage, but it must be re-run. |
+| Wheel architecture must match the Blender binary | Resolved: Blender's binary is arm64 and its own `pip` resolves `pygeodesic-0.1.11-cp311-cp311-macosx_11_0_arm64.whl`. Using Blender's interpreter to install is what guarantees this — a Rosetta or system `pip` would not. |
+| Compiled numpy ABI vs Blender's bundled numpy | Resolved, with a caveat: the extension imports and runs correctly against numpy 1.26.4, but its metadata declares `numpy<3,>=2`. `--no-deps` is mandatory so pip does not install numpy 2.x over Blender's numpy. |
+| App-bundle write permissions | Not encountered, because nothing is written into the bundle. |
+| `pip` writing to the wrong interpreter | Avoided by always invoking `"<Blender's python3.11>" -m pip`, and by the `--background --python-expr` verification step, which proves the import inside Blender rather than in a shell. |
 
 ---
 
@@ -689,10 +837,12 @@ body_surface_measurement/
     preview.py         bpy-side connected-component visualisation (2.0a)
     meshcache.py       canonical mesh, BVH, geometry_hash / metric_key, cache (2.1)
     surface_point.py   SurfacePoint, barycentrics, insertion (2.1)
+    envreport.py       stdlib-only runtime environment detection (2.2)
     registry.py        backend discovery, availability, provenance (2.3)
     backends/
-      __init__.py
-      exact_mmp.py     pygeodesic (2.3)
+      __init__.py      guarded backend loader + status (2.2)
+      exact_mmp.py     pygeodesic wrapper (2.2 dev-only, wired to production in 2.3)
+      selftest.py      synthetic proof suite: generators, analytic refs, benchmark (2.2)
       dijkstra.py      diagnostics/validation only (2.5)
 ```
 
@@ -701,15 +851,25 @@ with the add-on:
 
 ```
 tests/
-  test_topology.py   pure-numpy unit tests, runnable without Blender (2.0)
+  test_topology.py     pure-numpy unit tests, runnable without Blender (2.0)
+  test_surface_point.py  barycentrics, classification, insertion (2.1)
+  test_import.py       add-on module wiring, with a stubbed bpy (2.0)
+  test_backend_exact.py  backend wrapper guards + numerics, without Blender (2.2)
   analytic.py        closed-form distances (2.5)
   synthetic.py       mesh generators (2.5)
   run_validation.py  headless Blender entry point (2.5)
 ```
 
-`topology.py` and `spaces.py` deliberately import **only numpy** — no `bpy` — so the diagnostic
-core and the §6.2–6.4 coordinate-space semantics are unit-testable outside Blender. All Blender
-coupling lives in `extract.py`.
+`topology.py`, `spaces.py`, `surface_point.py` and everything under `backends/` deliberately
+import **only numpy** — no `bpy` — so the diagnostic core, the §6.2–6.4 coordinate-space
+semantics and the solver backends are unit-testable outside Blender. `envreport.py` goes further
+and needs only the standard library, because it must produce a useful report precisely when numpy
+is the thing that is broken. All Blender coupling lives in `extract.py`, `meshcache.py` and
+`preview.py`.
+
+`backends/exact_mmp.py` guards its own `pygeodesic` import, so **nothing in the BSMT import graph
+depends on the backend being installed**. That is a binding invariant, not an implementation
+detail: it is what lets Phase 1 keep working on a machine with no exact backend at all.
 
 ### Milestone 2.0 — Topology diagnostics
 
@@ -843,28 +1003,68 @@ internal detail of the solver-space array.
 
 ### Milestone 2.2 — pygeodesic environment proof-of-concept
 
-**Create:** `tools/check_geodesic_env.py` (a standalone script, not part of the add-on)
-**Change:** none in the add-on
+**Created:** `geodesic/envreport.py`, `geodesic/backends/__init__.py`,
+`geodesic/backends/exact_mmp.py`, `geodesic/backends/selftest.py`,
+`tests/test_backend_exact.py`
+**Changed:** `geodesic/__init__.py` (guarded `envreport` + `backends` loaders,
+`backend_status()` / `backend_available()` / `backend_error()` /
+`backend_import_traceback()` / `environment_error()`), `state.py` (report storage and
+benchmark options), `operators.py` (`bsmt.check_geodesic_env`,
+`bsmt.run_backend_selftest`, `bsmt.clear_backend_reports`), `panels.py`
+(`BSMT_PT_geodesic_backend`, a development panel), `__init__.py` (version 0.6.0),
+`tools/check_geodesic_env.py` (rewritten: corrected install advice, numerics delegated)
+**Not touched:** `surface_point.py`, `meshcache.py`, `topology.py`, `spaces.py`,
+`extract.py`, `preview.py`, `picking.py`, `attach.py`, `visualization.py`,
+`measurement.py`. The SurfacePoint representation and the canonical triangle indexing
+are unchanged.
 
-**Status 2026-09-01:** the script is written and validated against real pygeodesic 0.1.11
-outside Blender (see §5.1). The Blender-side run is outstanding and is what actually closes
-this milestone.
+**Scope boundary.** This milestone proves the backend works in the target environment and
+nothing more. The backend is reachable only from the development panel. No Surface Distance
+is added to the measurement result, no `SurfacePoint` reaches the solver, no endpoint
+insertion runs, and no path is visualised. All of that is Milestone 2.3 and 2.4.
 
-**Success criteria**
-- `sys.version` inside Blender 4.5.13 confirmed (expected 3.11); architecture confirmed arm64.
-- `pygeodesic` imports inside Blender's Python without a numpy ABI error.
+**Status 2026-09-02: closed.** Full detected environment, install procedure and measured
+results are in §5.1a. Summary: Blender 4.5.13 LTS / Python 3.11.15 / numpy 1.26.4 /
+Darwin arm64; pygeodesic 0.1.11 (`cp311`, macosx_11_0_arm64) imports and runs inside
+Blender's own interpreter; the planar test is exact to the floating-point floor on every
+triangulation tested; cylinder and sphere converge at measured order ≈ 2; every failure
+mode raises a typed exception; and the add-on loads and Phase 1 measures normally with the
+backend uninstalled.
+
+**Carried into Milestone 2.3, from the §5.1a benchmark:** at 327 680 triangles a single
+A–B query costs **16.8 s** and **≈1.7 GB** peak RSS, while solver construction costs only
+0.14 s, and a repeated identical query costs the same as the first. The expensive thing is
+the query, not the setup, and it is not amortised by reuse.
+
+**Success criteria** — all met, 2026-09-02 (§5.1a)
+- `sys.version` inside Blender 4.5.13 confirmed (3.11.15); architecture confirmed arm64. ✔
+- `pygeodesic` imports inside Blender's Python without a numpy ABI error. ✔
 - On an icosphere of known radius, vertex-to-vertex distance is within the expected
-  discretisation margin of the great-circle value, and a path polyline is returned.
-- Wall-clock timing recorded for one query on a scan-sized mesh (>100k triangles).
-- The exact install command and the resolved backend version are recorded in this spec.
+  discretisation margin of the great-circle value, and a path polyline is returned. ✔
+- Wall-clock timing recorded for one query on a scan-sized mesh (>100k triangles). ✔
+- The exact install command and the resolved backend version are recorded in this spec. ✔
+- **Added:** the add-on loads, registers and measures with pygeodesic absent. ✔
+- **Added:** the sum of the returned polyline's segment lengths equals the reported distance
+  to ≤ 6.8e-16 relative. ✔
+- **Added:** every failure mode raises a typed exception; no approximate value ever
+  substitutes for a failed exact result. ✔
 
-**Failure modes**
+**Failure modes** — and what actually happened
 - Python is not 3.11 → no cp311 wheel applies; the whole backend choice must be revisited.
+  *Did not occur: 3.11.15 detected.*
 - x86_64 wheel installed under a Rosetta pip for an arm64 Blender → import error or crash.
+  *Avoided by resolving the wheel with Blender's own interpreter.*
 - numpy ABI mismatch with Blender's bundled numpy → segfault, not a clean exception.
+  *Did not occur, but the near miss is real and is recorded in §5.1a: pygeodesic 0.1.11
+  declares `numpy<3,>=2` while Blender bundles 1.26.4. The binary is compatible; the
+  metadata is not. `--no-deps` is what keeps pip from acting on the metadata.*
 - `pip` writing outside Blender's site-packages (wrong interpreter) → import succeeds in Terminal
-  but fails in Blender.
-- Permission errors writing into the app bundle.
+  but fails in Blender. **This is the failure mode that nearly shipped.** The previous
+  `tools/check_geodesic_env.py` recommended `pip install --user`, and Blender sets
+  `no_user_site = 1`, so that install would have been invisible inside Blender while working
+  perfectly in a shell. Fixed; the target is now derived from the live interpreter's own
+  import paths.
+- Permission errors writing into the app bundle. *Avoided entirely: nothing is written there.*
 
 ### Milestone 2.3 — Exact A–B surface distance
 
@@ -963,11 +1163,17 @@ this milestone.
 
 ## 12. Open items requiring decisions
 
-1. Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).
+1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~
+   **Resolved 2026-09-02 (§5.1a): Python 3.11.15, Darwin arm64, numpy 1.26.4.**
 2. Whether landmark pairs may wrap a limb or torso; affects interpretation, not the algorithm.
 3. Typical scan triangle count and whether scans arrive pre-cropped.
 4. Whether Phase 3 requires all-pairs landmark fields (would justify adding a heat-method backend
-   for one-to-many queries, alongside — never replacing — the exact backend).
+   for one-to-many queries, alongside — never replacing — the exact backend). **The §5.1a
+   benchmark sharpens this: at 16.8 s per pair with no reuse benefit, an all-pairs workflow over
+   more than a handful of landmarks is already unaffordable with the exact backend alone.**
+5. **New, from §5.1a:** whether `geodesicDistances` (one-to-all) amortises better than repeated
+   `geodesicDistance` calls. To be measured at the start of Milestone 2.3, before the operator
+   commits to a per-pair call.
 
 ---
 
@@ -975,11 +1181,14 @@ this milestone.
 
 **Status: requirement recorded only. Not designed, not scheduled, and explicitly
 NOT part of Milestone 2.2 or any other Phase 2 milestone.**
+*Extended 2026-09-02 at the researcher's request; still documentation only, and
+no alignment code exists anywhere in the add-on.*
 
 Handheld human-body scans arrive in whatever coordinate system the capture
 software produced. The imported OBJ axes need not correspond to anatomical
 front/back, left/right or vertical directions. BSMT must eventually support
-bringing a scan into an anatomical frame.
+bringing a scan into an anatomical frame through a **non-destructive
+alignment / preprocessing phase**.
 
 ### 13.1 Position in the pipeline
 
@@ -993,30 +1202,37 @@ Import → Alignment → Geometry preprocessing (if required) → Landmark picki
 
 ### 13.2 Required modes
 
-**1. Manual alignment**
-- translation and rotation controls;
-- convenient front and side alignment;
+**Mode A — Manual alignment**
+- convenient translation and rotation of the scan;
+- **front, side and back viewing assistance** — one-click views along the
+  working anatomical axes, so the operator can judge the alignment from each
+  of the three conventional directions;
+- record the alignment transform as data;
 - reset to the original imported transform;
-- save/record the alignment transform.
+- **never modifies mesh topology.**
 
-**2. Landmark-based anatomical alignment**
+**Mode B — Landmark-based anatomical alignment**
 
-The researcher defines four reference locations:
+The researcher selects reference `SurfacePoint`s defining four roles:
 
-| Reference | Role |
+| Role | Purpose |
 |---|---|
-| horizontal left | defines the medio-lateral axis with its right counterpart |
-| horizontal right | |
-| vertical upper | defines the longitudinal axis with its lower counterpart |
-| vertical lower | |
+| left reference | with `right reference`, defines the medio-lateral axis |
+| right reference | |
+| superior reference | with `inferior reference`, defines the longitudinal (vertical) axis |
+| inferior reference | |
 
-An orthonormal anatomical frame is constructed from these references (the two
-axes will not be exactly perpendicular in practice, so the construction must
-orthonormalise explicitly and record the residual as a quality figure).
+An orthonormal anatomical frame is constructed from these references. The two
+constructed axes will not be exactly perpendicular on a real scan, so the
+construction must orthonormalise explicitly (Gram–Schmidt or an SVD-based
+nearest-rotation fit) and **record the residual non-orthogonality as a quality
+figure** rather than discarding it. The antero-posterior axis is then the cross
+product of the other two.
 
-**Anatomical landmark names must not be hard-coded.** The researcher chooses
-appropriate bilateral and vertical landmarks per protocol; BSMT stores roles,
-not names.
+**Anatomical landmark names must not be hard-coded.** Different scan protocols
+require different reference landmarks. BSMT stores the four *roles* and the
+`SurfacePoint` bound to each; it never stores or assumes a named anatomical
+landmark.
 
 ### 13.3 Requirements
 
@@ -1025,13 +1241,23 @@ not names.
 - **Preserve SurfacePoint triangle indices and barycentric coordinates.** This
   follows from §6.3: alignment is a rigid transform, so canonical surface
   locations are untouched by construction.
-- Record the alignment matrix as data, not just as a modified object transform.
+- **Save the alignment matrix** as data in its own right, not merely as a
+  mutated object transform, so it can be inspected, exported and reapplied.
 - Provide **Reset Alignment**.
-- Preserve the original imported transform so the operation is reversible.
+- **Preserve the original imported transform** so the operation is fully
+  reversible.
 - Keep alignment transforms **distinguishable from geometry editing**, in both
   the data model and the cache-invalidation rules of §6.4: an alignment changes
   `metric_key` only if it is non-rigid (it should not be), and never changes
   `geometry_hash`.
+- **Support reproducible alignment across multiple posture scans.** A saved
+  alignment — whether a manual matrix or a set of landmark roles — must be
+  reapplicable to another scan of the same subject in a different posture, so
+  that a series of scans can be brought into a common anatomical frame by a
+  documented, repeatable procedure rather than by eye. What this requires of
+  the data model (roles stored independently of any one scan's `SurfacePoint`s,
+  and an alignment record that survives being detached from the object it was
+  authored on) is a design question for that phase, not a decision taken here.
 
 ### 13.4 Relationship to measurement correctness
 

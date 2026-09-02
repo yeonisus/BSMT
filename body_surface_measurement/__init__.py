@@ -11,12 +11,13 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 5, 2),
+    "version": (0, 6, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (
         "Phase 1: straight-line distance between two picked surface points. "
-        "Phase 2 milestone 2.1: canonical mesh, BVH picking and SurfacePoint"
+        "Phase 2 milestone 2.1: canonical mesh, BVH picking and SurfacePoint. "
+        "Milestone 2.2: exact geodesic backend environment proof (dev only)"
     ),
     "category": "3D View",
 }

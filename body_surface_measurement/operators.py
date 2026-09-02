@@ -834,6 +834,183 @@ class BSMT_OT_isolate_component(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class BSMT_OT_check_geodesic_env(bpy.types.Operator):
+    """Report the Python environment Blender is actually running (dev tool).
+
+    Milestone 2.2. Read-only: it inspects the interpreter and reports the
+    exact pip command for it. It installs nothing and modifies nothing
+    """
+
+    bl_idname = "bsmt.check_geodesic_env"
+    bl_label = "Check Environment"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        geodesic.ensure_loaded()
+
+        unavailable = geodesic.environment_error()
+        if unavailable:
+            print("[BSMT] " + unavailable)
+            self.report({'ERROR'}, "BSMT: " + unavailable)
+            return {'CANCELLED'}
+
+        try:
+            info = geodesic.envreport.collect()
+            lines = geodesic.envreport.format_report(info)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report(
+                {'ERROR'},
+                "BSMT: environment report failed (%s: %s) - traceback in the "
+                "system console" % (type(exc).__name__, exc),
+            )
+            return {'CANCELLED'}
+
+        text = "\n".join(lines)
+        if props is not None:
+            props.env_report = text
+            props.env_report_valid = True
+
+        print("\n" + text + "\n")
+
+        # A failed backend import must reach the console complete, never
+        # summarised: an ABI or architecture problem is only diagnosable from
+        # the original traceback.
+        original = geodesic.backend_import_traceback()
+        if original:
+            print("[BSMT] original backend import traceback:")
+            print(original)
+
+        available = geodesic.backend_available()
+        level = 'INFO' if available and not info["mismatches"] else 'WARNING'
+        self.report(
+            {level},
+            "BSMT: %s, Python %s, %s %s, numpy %s - pygeodesic %s. Full report "
+            "in the panel and the system console."
+            % (
+                info["blender_version"] or "outside Blender",
+                info["python_version"],
+                info["system"],
+                info["machine"],
+                info["numpy_version"] or "MISSING",
+                "available" if available else "UNAVAILABLE",
+            ),
+        )
+        return {'FINISHED'}
+
+
+class BSMT_OT_run_backend_selftest(bpy.types.Operator):
+    """Run the synthetic exact-geodesic backend proof (dev tool).
+
+    Milestone 2.2. Uses generated meshes only. It does not read Point A or
+    Point B, does not touch the scan, and produces no measurement result
+    """
+
+    bl_idname = "bsmt.run_backend_selftest"
+    bl_label = "Run Synthetic Backend Tests"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        geodesic.ensure_loaded()
+
+        if geodesic.backends is None:
+            message = geodesic.backend_error()
+            print("[BSMT] " + message)
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        blocked = geodesic.backends.selftest_error()
+        if blocked:
+            print("[BSMT] " + blocked)
+            self.report({'ERROR'}, "BSMT: " + blocked)
+            return {'CANCELLED'}
+
+        if not geodesic.backend_available():
+            # Not a crash and not a silent skip: the reason is reported with
+            # the original import error, and no substitute result is produced.
+            message = geodesic.backend_error()
+            original = geodesic.backend_import_traceback()
+            print("[BSMT] " + message)
+            if original:
+                print(original)
+            if props is not None:
+                props.backend_test_report = "\n".join([
+                    "BSMT Milestone 2.2 - exact geodesic backend self-test",
+                    "",
+                    "NOT RUN: " + message,
+                    "",
+                    "BSMT loads and Phase 1 measurement works without this",
+                    "backend. Install it with the command shown by",
+                    "Check Environment, then run this again.",
+                ])
+                props.backend_test_valid = True
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        selftest = geodesic.backends.selftest
+        dense = True if props is None else bool(props.backend_test_dense)
+        triangles = (
+            selftest.REFERENCE_SCAN_TRIANGLES if props is None
+            else int(props.backend_test_triangles)
+        )
+        dijkstra = True if props is None else bool(props.backend_test_dijkstra)
+
+        started = time.perf_counter()
+        try:
+            report = selftest.run_all(
+                include_dense=dense,
+                dense_triangles=triangles,
+                include_dijkstra=dijkstra,
+            )
+            lines = selftest.format_report(report)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report(
+                {'ERROR'},
+                "BSMT: backend self-test failed (%s: %s) - traceback in the "
+                "system console" % (type(exc).__name__, exc),
+            )
+            return {'CANCELLED'}
+        elapsed = time.perf_counter() - started
+
+        text = "\n".join(lines)
+        if props is not None:
+            props.backend_test_report = text
+            props.backend_test_valid = True
+        print("\n" + text + "\n")
+
+        for suite in report.get("suites", []):
+            if suite.get("traceback"):
+                print("[BSMT] %s raised:" % suite.get("name"))
+                print(suite["traceback"])
+
+        passed = bool(report.get("pass"))
+        self.report(
+            {'INFO'} if passed else {'ERROR'},
+            "BSMT: backend self-test %s in %.2f s (%d suites). Full report in "
+            "the panel and the system console."
+            % ("PASSED" if passed else "FAILED", elapsed,
+               len(report.get("suites", []))),
+        )
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_backend_reports(bpy.types.Operator):
+    """Clear the Milestone 2.2 environment and backend test reports"""
+
+    bl_idname = "bsmt.clear_backend_reports"
+    bl_label = "Clear Backend Reports"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is not None:
+            state.clear_backend_reports(props)
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_topology(bpy.types.Operator):
     """Clear the topology diagnostics report"""
 
@@ -861,6 +1038,9 @@ classes = (
     BSMT_OT_verify_components,
     BSMT_OT_clear_component_preview,
     BSMT_OT_isolate_component,
+    BSMT_OT_check_geodesic_env,
+    BSMT_OT_run_backend_selftest,
+    BSMT_OT_clear_backend_reports,
 )
 
 
