@@ -23,6 +23,8 @@ MEASUREMENT_PREFIX = "BSMT_Measurement_"
 REPAIR_PREFIX = "BSMT_Repair_"
 REPAIR_NON_MANIFOLD = REPAIR_PREFIX + "NonManifold"
 REPAIR_BOUNDARY = REPAIR_PREFIX + "Boundary"
+ALIGN_PREFIX = "BSMT_Align_"
+ALIGN_AXES = ALIGN_PREFIX + "Axes"
 STRAIGHT_SUFFIX = "_Straight"
 PATH_SUFFIX = "_Path"
 
@@ -305,6 +307,9 @@ def clear_all(context):
             continue
         if obj.name.startswith(REPAIR_PREFIX):
             # Repair highlights have their own Clear button too.
+            continue
+        if obj.name.startswith(ALIGN_PREFIX):
+            # So does the alignment axis preview.
             continue
         if remove_object(obj):
             removed += 1
@@ -633,3 +638,63 @@ def clear_repair_highlights():
 
 def repair_highlight_exists(name):
     return _existing_helper(name) is not None
+
+
+# ---------------------------------------------------------------------------
+# alignment axis preview (Milestone 3.6)
+# ---------------------------------------------------------------------------
+#
+# Three coloured axis lines drawn at the object, so the researcher can check
+# upright / left-right / front-back by eye before committing. An overlay only:
+# it never touches the object or its mesh, and it has its own Clear button so
+# it cannot be confused with measurement helpers.
+
+ALIGN_AXIS_COLORS = {
+    'X': (1.0, 0.2, 0.2, 1.0),      # subject's LEFT
+    'Y': (0.2, 1.0, 0.2, 1.0),      # POSTERIOR
+    'Z': (0.2, 0.4, 1.0, 1.0),      # SUPERIOR
+}
+
+
+def show_alignment_axes(context, origin_world, length, matrix_world=None):
+    """Draw the anatomical frame at `origin_world`. Returns the object."""
+    existing = _existing_helper(ALIGN_AXES)
+    if existing is not None:
+        remove_object(existing)
+    if length <= 0.0:
+        return None
+
+    # Drawn in world space with an identity transform: the axes describe the
+    # WORLD anatomical frame the object has been aligned to, not the object's
+    # own local axes, so they must not inherit the object's rotation.
+    points = [(0.0, 0.0, 0.0)]
+    edges = []
+    for index, axis in enumerate(('X', 'Y', 'Z')):
+        direction = [0.0, 0.0, 0.0]
+        direction[index] = length
+        points.append(tuple(direction))
+        edges.append((0, len(points) - 1))
+
+    mesh = bpy.data.meshes.new(ALIGN_AXES + "_Mesh")
+    mesh.from_pydata(points, edges, [])
+    mesh.update()
+    mesh[HELPER_FLAG] = True
+    obj = new_helper_object(context, ALIGN_AXES, mesh, ALIGN_AXIS_COLORS['Z'])
+    obj.show_in_front = True
+    obj.display_type = 'WIRE'
+    obj.location = tuple(float(v) for v in origin_world)
+    obj.rotation_euler = (0.0, 0.0, 0.0)
+    return obj
+
+
+def clear_alignment_helpers():
+    removed = 0
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith(ALIGN_PREFIX) and is_helper(obj):
+            if remove_object(obj):
+                removed += 1
+    return removed
+
+
+def alignment_helper_exists():
+    return _existing_helper(ALIGN_AXES) is not None

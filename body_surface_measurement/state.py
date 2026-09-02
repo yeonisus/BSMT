@@ -17,8 +17,8 @@ from bpy.props import (
     StringProperty,
 )
 
-from . import (geodesic, landmarks, measurement, measurements, preprocess,
-               visualization)
+from . import (alignment, geodesic, landmarks, measurement, measurements,
+               preprocess, visualization)
 
 
 def _on_display_changed(self, context):
@@ -833,6 +833,49 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         default=True,
     )
     # ------------------------------------------------------------------
+    # Milestone 3.6 - rigid anatomical alignment. Object transforms only:
+    # nothing here touches mesh geometry, so a SurfacePoint cannot go stale.
+    # ------------------------------------------------------------------
+    align_mode: EnumProperty(
+        name="Mode",
+        items=(
+            ('LANDMARK', "Landmark-Based",
+             "Build an anatomical frame from four picked reference points"),
+            ('MANUAL', "Manual", "Rotate and reset by hand"),
+        ),
+        default='LANDMARK',
+    )
+    align_left: PointerProperty(type=BSMT_SurfacePoint)
+    align_right: PointerProperty(type=BSMT_SurfacePoint)
+    align_superior: PointerProperty(type=BSMT_SurfacePoint)
+    align_inferior: PointerProperty(type=BSMT_SurfacePoint)
+
+    align_object: StringProperty(name="Aligned Object", default="")
+    align_applied: BoolProperty(default=False)
+    align_method: StringProperty(default="")
+    align_created: StringProperty(default="")
+    align_report: StringProperty(default="")
+    align_previous_matrix: FloatVectorProperty(size=16, default=(
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+    align_applied_matrix: FloatVectorProperty(size=16, default=(
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+    align_residual_degrees: FloatProperty(default=0.0)
+    align_fine_degrees: FloatProperty(
+        name="Fine Rotation", default=5.0, min=-180.0, max=180.0,
+        description="Degrees applied by the fine rotation buttons",
+    )
+    align_move_to_origin: BoolProperty(
+        name="Move To Origin",
+        description="Also translate the inferior reference to the world "
+                    "origin when applying a landmark alignment",
+        default=True,
+    )
+    align_preview: BoolProperty(default=False)
+    show_alignment: BoolProperty(name="Alignment", default=False)
+
+    # ------------------------------------------------------------------
     # Milestone 3.4 - controlled mesh repair.
     # ------------------------------------------------------------------
     repair_object: StringProperty(name="Repair Target", default="")
@@ -1637,6 +1680,83 @@ def invalidate_all_measurement_results(context, reason):
             invalidate_measurement_result(item, reason)
             count += 1
     return count
+
+
+# ---------------------------------------------------------------------------
+# Alignment (Milestone 3.6)
+# ---------------------------------------------------------------------------
+
+ALIGN_SLOTS = ('LEFT', 'RIGHT', 'SUPERIOR', 'INFERIOR')
+
+
+def align_point(props, slot):
+    """The alignment reference SurfacePoint for one slot.
+
+    These are alignment references, deliberately separate from the research
+    landmarks of the Landmark Manager - but they reuse BSMT_SurfacePoint, so
+    there is still exactly one surface-location representation.
+
+    Returns None if the property is absent. That is not a hypothetical: the
+    depsgraph handler that follows transforms can fire against a scene whose
+    property group has not finished (re)registering, and a missing alignment
+    reference must never take the A/B refresh down with it.
+    """
+    return getattr(props, {
+        'LEFT': "align_left",
+        'RIGHT': "align_right",
+        'SUPERIOR': "align_superior",
+        'INFERIOR': "align_inferior",
+    }[slot], None)
+
+
+def _align_valid(point):
+    return point is not None and point.valid
+
+
+def align_points_ready(props):
+    """(ready, missing) for the four references."""
+    missing = [slot for slot in ALIGN_SLOTS
+               if not _align_valid(align_point(props, slot))]
+    return (not missing), missing
+
+
+def align_objects(props):
+    """The set of objects the four references were picked on."""
+    names = set()
+    for slot in ALIGN_SLOTS:
+        point = align_point(props, slot)
+        if _align_valid(point) and point.source_object:
+            names.add(point.source_object)
+    return names
+
+
+def clear_align_points(props):
+    for slot in ALIGN_SLOTS:
+        point = align_point(props, slot)
+        if point is not None:
+            clear_surface_point(point)
+
+
+def clear_alignment_state(props, keep_points=True):
+    """Forget the alignment record. No object or mesh is touched."""
+    if not keep_points:
+        clear_align_points(props)
+    props.align_applied = False
+    props.align_object = ""
+    props.align_method = ""
+    props.align_created = ""
+    props.align_report = ""
+    props.align_residual_degrees = 0.0
+    props.align_preview = False
+
+
+def matrix_to_flat(matrix):
+    return tuple(float(matrix[row][col]) for row in range(4) for col in range(4))
+
+
+def flat_to_rows(flat):
+    values = [float(v) for v in flat]
+    return [values[0:4], values[4:8], values[8:12], values[12:16]]
 
 
 def clear_repair_lists(props):

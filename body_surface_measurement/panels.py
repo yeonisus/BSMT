@@ -1,9 +1,11 @@
 """Sidebar UI: View3D > Sidebar (N) > BSMT > Body Measurement."""
 
+import math
+
 import bpy
 
-from . import (geodesic, landmarks, measurement, measurements, preprocess,
-               repair, scancopy, state, visualization)
+from . import (alignment, geodesic, landmarks, measurement, measurements,
+               preprocess, repair, scancopy, state, visualization)
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
@@ -1367,6 +1369,157 @@ class BSMT_PT_repair(bpy.types.Panel):
             note.label(text=line)
 
 
+class BSMT_PT_alignment(bpy.types.Panel):
+    """Rigid anatomical alignment (Milestone 3.6).
+
+    Object transforms only - the mesh is never touched, so landmarks and
+    stored distances stay valid through any alignment.
+    """
+
+    bl_label = "Alignment"
+    bl_idname = "BSMT_PT_alignment"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "BSMT"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = state.get_props(context)
+        if props is None:
+            layout.label(text="Add-on state unavailable", icon='ERROR')
+            return
+
+        obj = context.active_object
+        names = state.align_objects(props)
+        target_name = (sorted(names)[0] if len(names) == 1
+                       else (obj.name if obj is not None else "-"))
+
+        box = layout.box()
+        if obj is None or obj.type != 'MESH':
+            box.label(text="Select a mesh object", icon='INFO')
+            return
+        column = box.column(align=True)
+        column.scale_y = 0.75
+        column.label(text="Object: %s" % target_name)
+        column.label(text="Location: %.1f, %.1f, %.1f"
+                          % tuple(obj.location))
+        column.label(text="Rotation: %.1f, %.1f, %.1f deg"
+                          % tuple(math.degrees(v) for v in obj.rotation_euler))
+        column.label(text="Scale:    %.4f, %.4f, %.4f" % tuple(obj.scale))
+        report = alignment.scale_report(obj.matrix_world)
+        if not report["unity"]:
+            warn = box.column(align=True)
+            warn.scale_y = 0.75
+            warn.alert = not report["uniform"]
+            for line in _wrap(report["message"], 44):
+                warn.label(text=line, icon='ERROR')
+            if not report["uniform"]:
+                for line in _wrap("Alignment is refused on a non-uniformly "
+                                  "scaled scan. Apply the scale first.", 44):
+                    warn.label(text=line)
+
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap(alignment.AXIS_DESCRIPTION, 44):
+            note.label(text=line)
+
+        layout.prop(props, "align_mode", text="Mode")
+        if props.align_mode == 'MANUAL':
+            self._draw_manual(layout, props)
+        else:
+            self._draw_landmark(layout, props)
+
+        layout.separator()
+        row = layout.row(align=True)
+        row.operator("bsmt.flip_front_back", icon='ARROW_LEFTRIGHT')
+        row.operator("bsmt.reset_alignment", icon='LOOP_BACK')
+
+        status = layout.box()
+        status.label(text="Status: %s"
+                          % ("Aligned (%s)" % props.align_method
+                             if props.align_applied else "Not aligned"),
+                     icon='CHECKMARK' if props.align_applied else 'BLANK1')
+        if props.align_report:
+            column = status.column(align=True)
+            column.scale_y = 0.7
+            for line in props.align_report.split("\n"):
+                if line.strip():
+                    column.label(text=line)
+
+    @staticmethod
+    def _draw_manual(layout, props):
+        box = layout.box()
+        box.label(text="Rotate 90 degrees")
+        for axis in ('X', 'Y', 'Z'):
+            row = box.row(align=True)
+            minus = row.operator("bsmt.manual_align", text="%s -90" % axis)
+            minus.axis = axis
+            minus.degrees = -90.0
+            minus.action = 'ROTATE'
+            plus = row.operator("bsmt.manual_align", text="%s +90" % axis)
+            plus.axis = axis
+            plus.degrees = 90.0
+            plus.action = 'ROTATE'
+
+        box.prop(props, "align_fine_degrees")
+        row = box.row(align=True)
+        for axis in ('X', 'Y', 'Z'):
+            fine = row.operator("bsmt.manual_align", text="%s fine" % axis)
+            fine.axis = axis
+            fine.degrees = props.align_fine_degrees
+            fine.action = 'ROTATE'
+
+        origin = box.operator("bsmt.manual_align", text="Move To Origin",
+                              icon='OBJECT_ORIGIN')
+        origin.action = 'ORIGIN'
+
+    @staticmethod
+    def _draw_landmark(layout, props):
+        box = layout.box()
+        box.label(text="Anatomical References")
+        for slot, label in (('LEFT', "LEFT      "), ('RIGHT', "RIGHT     "),
+                            ('SUPERIOR', "SUPERIOR  "),
+                            ('INFERIOR', "INFERIOR  ")):
+            point = state.align_point(props, slot)
+            row = box.row(align=True)
+            row.label(text=label,
+                      icon='CHECKMARK' if point.valid else 'BLANK1')
+            pick = row.operator("bsmt.pick_alignment_reference",
+                                text="Re-pick" if point.valid else "Pick",
+                                icon='EYEDROPPER')
+            pick.slot = slot
+        ready, missing = state.align_points_ready(props)
+        if not ready:
+            hint = box.row()
+            hint.enabled = False
+            hint.label(text="Still to pick: %s" % ", ".join(missing))
+        box.operator("bsmt.clear_alignment_references", text="Clear References",
+                     icon='X')
+
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("LEFT and RIGHT are the SUBJECT'S left and right, "
+                          "not the viewer's. Use Flip Front/Back if they end "
+                          "up swapped.", 44):
+            note.label(text=line)
+
+        column = layout.column(align=True)
+        row = column.row(align=True)
+        row.operator("bsmt.preview_alignment", icon='HIDE_OFF')
+        row.operator("bsmt.clear_alignment_preview", text="Clear Preview",
+                     icon='X')
+        column.prop(props, "align_move_to_origin")
+        column.operator("bsmt.apply_alignment", icon='CON_ROTLIKE')
+        if props.align_residual_degrees:
+            residual = column.row()
+            residual.enabled = False
+            residual.label(text="Residual non-orthogonality: %.2f deg"
+                                % props.align_residual_degrees)
+
+
 classes = (
     BSMT_PT_body_measurement,
     BSMT_PT_diagnostics,
@@ -1377,6 +1530,7 @@ classes = (
     BSMT_PT_measurements,
     BSMT_PT_measurement_visualization,
     BSMT_PT_preprocessing,
+    BSMT_PT_alignment,
     BSMT_UL_boundary_loops,
     BSMT_UL_repair_components,
     BSMT_PT_repair,

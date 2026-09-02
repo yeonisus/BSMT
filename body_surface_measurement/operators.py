@@ -6,11 +6,13 @@ import traceback
 import numpy as np
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
+from mathutils import Matrix
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
+                       IntProperty, StringProperty)
 
-from . import (attach, geodesic, landmarks, measurement, measurements,
-               meshrepair, picking, preprocess, protocol, repair,
-               scancopy, state, visualization, viz)
+from . import (alignment, attach, geodesic, landmarks, measurement,
+               measurements, meshrepair, picking, preprocess, protocol,
+               repair, scancopy, state, visualization, viz)
 
 def _addon_version():
     from . import bl_info
@@ -63,6 +65,8 @@ class BSMT_OT_pick_point(bpy.types.Operator):
             ('AB', "A/B Point", "Store into the Phase 1 A/B slot"),
             ('LANDMARK', "Named Landmark",
              "Store into the selected named research landmark"),
+            ('ALIGN', "Alignment Reference",
+             "Store into an alignment reference slot"),
         ),
         default='AB',
         options={'SKIP_SAVE'},
@@ -71,6 +75,15 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         name="Landmark Index",
         description="Row in scene.bsmt_landmarks to store into",
         default=-1,
+        options={'SKIP_SAVE'},
+    )
+    align_slot: EnumProperty(
+        name="Alignment Slot",
+        items=(('LEFT', "Left", "Subject's LEFT reference"),
+               ('RIGHT', "Right", "Subject's RIGHT reference"),
+               ('SUPERIOR', "Superior", "Upper reference"),
+               ('INFERIOR', "Inferior", "Lower reference")),
+        default='LEFT',
         options={'SKIP_SAVE'},
     )
 
@@ -157,6 +170,8 @@ class BSMT_OT_pick_point(bpy.types.Operator):
 
         self._warn_if_source_has_copy(self, obj)
 
+        if self.target == 'ALIGN':
+            return self._pick_alignment(context, props, obj, coord, location)
         if self.target == 'LANDMARK':
             return self._pick_landmark(context, props, obj, coord, location)
 
@@ -186,6 +201,27 @@ class BSMT_OT_pick_point(bpy.types.Operator):
                 surface_note,
             ),
         )
+        return {'FINISHED'}
+
+    def _pick_alignment(self, context, props, obj, coord, location):
+        """Store this click into one alignment reference slot.
+
+        Alignment references are separate from the research landmarks, but
+        they are the same BSMT_SurfacePoint type, so there is still one
+        surface-location representation and they follow a transform for free.
+        """
+        point = state.align_point(props, self.align_slot)
+        note = self._attach_surface_point(context, props, obj, coord, point)
+        if not note.startswith("triangle"):
+            state.clear_surface_point(point)
+            self.report({'WARNING'}, "BSMT: %s" % note)
+            return {'RUNNING_MODAL'}
+        # A new reference invalidates any preview drawn from the old frame.
+        props.align_preview = False
+        visualization.clear_alignment_helpers()
+        self._restore(context)
+        self.report({'INFO'}, "BSMT: %s reference set on '%s' - %s"
+                    % (self.align_slot, obj.name, note))
         return {'FINISHED'}
 
     def _pick_landmark(self, context, props, obj, coord, location):
@@ -343,7 +379,10 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         )
 
     def _set_status(self, context):
-        if self.target == 'LANDMARK':
+        if self.target == 'ALIGN':
+            text = ("BSMT: Left click to set the %s alignment reference   |   "
+                    "ESC or Right click: cancel" % self.align_slot)
+        elif self.target == 'LANDMARK':
             label = "landmark"
             collection = state.get_landmarks(context)
             props = state.get_props(context)
@@ -4180,6 +4219,414 @@ class BSMT_OT_clear_repair_report(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Rigid anatomical alignment (Milestone 3.6)
+# ---------------------------------------------------------------------------
+#
+# Object transforms only. No mesh vertex is touched, so geometry_hash cannot
+# change and metric_key - built from the rotation-invariant L^T L - cannot
+# either. SurfacePoints therefore stay VALID and stored distances stay
+# untouched by construction, not by care.
+
+
+def _align_target(context, props):
+    """The object to align, and why not. Returns (obj, reason).
+
+    The references decide, not the selection: if the four points were picked
+    on a mesh, that is the mesh being aligned. Falls back to the active object
+    only when no reference has been picked yet.
+    """
+    names = state.align_objects(props)
+    if len(names) > 1:
+        return None, ("the alignment references are on different objects (%s)"
+                      % ", ".join(sorted(names)))
+    if names:
+        name = sorted(names)[0]
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            return None, "the reference object '%s' is missing" % name
+        return obj, ""
+    obj = context.active_object
+    if obj is None or obj.type != 'MESH' or visualization.is_helper(obj):
+        return None, "select a mesh object"
+    return obj, ""
+
+
+def _apply_world_matrix(obj, matrix_rows):
+    obj.matrix_world = Matrix([[float(v) for v in row] for row in matrix_rows])
+
+
+def _remember_pre_alignment(props, obj):
+    """Record the transform to return to, once per alignment session."""
+    if not props.align_applied or props.align_object != obj.name:
+        props.align_previous_matrix = state.matrix_to_flat(obj.matrix_world)
+        props.align_object = obj.name
+
+
+def _refresh_after_alignment(context, props, obj, method, lines):
+    """Re-derive helper positions and confirm nothing metric changed."""
+    import datetime
+
+    props.align_applied = True
+    props.align_object = obj.name
+    props.align_method = method
+    props.align_created = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    props.align_applied_matrix = state.matrix_to_flat(obj.matrix_world)
+    props.align_report = "\n".join(lines)
+
+    context.view_layer.update()
+    attach.refresh(props, reason="alignment")
+    print("\n[BSMT] " + "\n".join(lines) + "\n")
+
+
+class BSMT_OT_pick_alignment_reference(bpy.types.Operator):
+    """Pick one anatomical alignment reference on the surface"""
+
+    bl_idname = "bsmt.pick_alignment_reference"
+    bl_label = "Pick Alignment Reference"
+    bl_options = {'REGISTER'}
+
+    slot: EnumProperty(
+        name="Slot",
+        items=(('LEFT', "Left", "Subject's LEFT"),
+               ('RIGHT', "Right", "Subject's RIGHT"),
+               ('SUPERIOR', "Superior", "Upper reference"),
+               ('INFERIOR', "Inferior", "Lower reference")),
+        default='LEFT',
+        options={'SKIP_SAVE'},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return (context.area is not None and context.area.type == 'VIEW_3D'
+                and context.active_object is not None
+                and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        return bpy.ops.bsmt.pick_point('INVOKE_DEFAULT', target='ALIGN',
+                                       align_slot=self.slot)
+
+
+class BSMT_OT_clear_alignment_references(bpy.types.Operator):
+    """Forget the four alignment references. No object is moved"""
+
+    bl_idname = "bsmt.clear_alignment_references"
+    bl_label = "Clear References"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is not None:
+            state.clear_align_points(props)
+            props.align_preview = False
+        visualization.clear_alignment_helpers()
+        self.report({'INFO'}, "BSMT: alignment references cleared")
+        return {'FINISHED'}
+
+
+class BSMT_OT_manual_align(bpy.types.Operator):
+    """Rotate the object about a world axis, or move it to the origin.
+
+    Object transform only: the mesh is never touched
+    """
+
+    bl_idname = "bsmt.manual_align"
+    bl_label = "Manual Align"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    axis: EnumProperty(
+        items=(('X', "X", ""), ('Y', "Y", ""), ('Z', "Z", "")),
+        default='Z', options={'SKIP_SAVE'},
+    )
+    degrees: FloatProperty(default=90.0, options={'SKIP_SAVE'})
+    action: EnumProperty(
+        items=(('ROTATE', "Rotate", ""),
+               ('ORIGIN', "Move To Origin", "")),
+        default='ROTATE', options={'SKIP_SAVE'},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return props is not None and _align_target(context, props)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _align_target(context, props)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+
+        ok, why = alignment.check_alignable(obj.matrix_world)
+        if not ok:
+            self.report({'ERROR'}, "BSMT: " + why)
+            return {'CANCELLED'}
+
+        _remember_pre_alignment(props, obj)
+        current = np.array(obj.matrix_world, dtype=np.float64)
+
+        if self.action == 'ORIGIN':
+            updated = current.copy()
+            updated[:3, 3] = 0.0
+            label = "moved to the world origin"
+        else:
+            rotation = alignment.axis_rotation(self.axis, self.degrees)
+            # Turn about the object's own origin so the body rotates in place.
+            pivot = current[:3, 3].copy()
+            updated = alignment.compose(current, rotation, pivot=pivot)
+            label = "rotated %+.1f deg about world %s" % (self.degrees, self.axis)
+
+        _apply_world_matrix(obj, updated)
+        lines = ["Manual alignment of '%s'" % obj.name, "  " + label,
+                 "  " + alignment.AXIS_DESCRIPTION]
+        _refresh_after_alignment(context, props, obj,
+                                 alignment.METHOD_MANUAL, lines)
+        self.report({'INFO'}, "BSMT: %s %s" % (obj.name, label))
+        return {'FINISHED'}
+
+
+class BSMT_OT_preview_alignment(bpy.types.Operator):
+    """Draw the anatomical axes the current references would produce.
+
+    Nothing is moved: this is a look before you leap
+    """
+
+    bl_idname = "bsmt.preview_alignment"
+    bl_label = "Preview Alignment"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return props is not None and state.align_points_ready(props)[0]
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _align_target(context, props)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        try:
+            frame, _points = _build_frame(props)
+        except alignment.AlignmentError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        origin = np.array(state.align_point(props, 'INFERIOR').world_xyz,
+                          dtype=np.float64)
+        length = max(frame["vertical_mm"] * 0.35, 1.0) \
+            / measurement.unit_multiplier(props.unit)
+        visualization.show_alignment_axes(context, origin, length)
+        props.align_preview = True
+        props.align_residual_degrees = frame["residual_degrees"]
+
+        lines = alignment.alignment_report(
+            frame, alignment.scale_report(obj.matrix_world))
+        lines.insert(1, "  preview only - nothing has been moved")
+        props.align_report = "\n".join(lines)
+        print("\n[BSMT] " + "\n".join(lines) + "\n")
+        self.report(
+            {'WARNING'} if not frame["residual_ok"] else {'INFO'},
+            "BSMT: preview drawn - residual %.2f deg. Red=+X subject's left, "
+            "green=+Y posterior, blue=+Z superior."
+            % frame["residual_degrees"],
+        )
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_alignment_preview(bpy.types.Operator):
+    """Remove the alignment axis helper"""
+
+    bl_idname = "bsmt.clear_alignment_preview"
+    bl_label = "Clear Preview"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        removed = visualization.clear_alignment_helpers()
+        props = state.get_props(context)
+        if props is not None:
+            props.align_preview = False
+        self.report({'INFO'}, "BSMT: removed %d alignment helper(s)" % removed)
+        return {'FINISHED'}
+
+
+def _build_frame(props):
+    """The anatomical frame from the four references, in world space."""
+    points = {}
+    for slot in state.ALIGN_SLOTS:
+        point = state.align_point(props, slot)
+        if not point.valid:
+            raise alignment.AlignmentError(
+                "the %s reference has not been picked" % slot
+            )
+        points[slot] = np.array(point.world_xyz, dtype=np.float64)
+    frame = alignment.anatomical_frame(
+        points['LEFT'], points['RIGHT'], points['SUPERIOR'], points['INFERIOR'])
+    return frame, points
+
+
+class BSMT_OT_apply_alignment(bpy.types.Operator):
+    """Rotate the object so its anatomical axes match the world axes.
+
+    Rigid only - rotation and translation, never scale. The mesh is not
+    touched, so landmarks and stored distances stay valid
+    """
+
+    bl_idname = "bsmt.apply_alignment"
+    bl_label = "Apply Alignment"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return props is not None and state.align_points_ready(props)[0]
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _align_target(context, props)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+
+        ok, why = alignment.check_alignable(obj.matrix_world)
+        if not ok:
+            self.report({'ERROR'}, "BSMT: " + why)
+            return {'CANCELLED'}
+
+        try:
+            frame, points = _build_frame(props)
+            rotation = alignment.rotation_to_world(frame)
+        except alignment.AlignmentError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        if not alignment.is_rigid(rotation):
+            self.report({'ERROR'},
+                        "BSMT: the computed alignment is not rigid - refused")
+            return {'CANCELLED'}
+
+        before_matrix = np.array(obj.matrix_world, dtype=np.float64)
+        before_scale = alignment.linear_scale(before_matrix)
+        _remember_pre_alignment(props, obj)
+
+        pivot = points['INFERIOR']
+        updated = alignment.compose(
+            before_matrix, rotation, pivot=pivot,
+            translate_to=(np.zeros(3) if props.align_move_to_origin else None))
+
+        after_scale = alignment.linear_scale(updated)
+        if not np.allclose(before_scale, after_scale, atol=1e-9):
+            self.report({'ERROR'},
+                        "BSMT: alignment would change scale (%s -> %s) - "
+                        "refused" % (before_scale, after_scale))
+            return {'CANCELLED'}
+
+        _apply_world_matrix(obj, updated)
+
+        lines = alignment.alignment_report(
+            frame, alignment.scale_report(obj.matrix_world))
+        lines.insert(1, "  object: %s" % obj.name)
+        lines.append("  rotation applied about the INFERIOR reference")
+        if props.align_move_to_origin:
+            lines.append("  inferior reference moved to the world origin")
+        lines.append("  rigid: rotation + translation only, no scale")
+        lines.append("  mesh geometry, geometry hash and metric key unchanged")
+        props.align_residual_degrees = frame["residual_degrees"]
+        _refresh_after_alignment(context, props, obj,
+                                 alignment.METHOD_LANDMARK, lines)
+
+        if props.align_preview:
+            visualization.show_alignment_axes(
+                context, np.zeros(3) if props.align_move_to_origin else pivot,
+                max(frame["vertical_mm"] * 0.35, 1.0)
+                / measurement.unit_multiplier(props.unit))
+
+        self.report(
+            {'WARNING'} if not frame["residual_ok"] else {'INFO'},
+            "BSMT: '%s' aligned - residual %.2f deg. %s"
+            % (obj.name, frame["residual_degrees"], alignment.AXIS_DESCRIPTION),
+        )
+        return {'FINISHED'}
+
+
+class BSMT_OT_flip_front_back(bpy.types.Operator):
+    """Turn the object 180 degrees about Z.
+
+    This is the correction for having labelled the subject's left and right
+    the wrong way round, which also reverses front and back
+    """
+
+    bl_idname = "bsmt.flip_front_back"
+    bl_label = "Flip Front / Back"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return props is not None and _align_target(context, props)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _align_target(context, props)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+
+        _remember_pre_alignment(props, obj)
+        current = np.array(obj.matrix_world, dtype=np.float64)
+        pivot = current[:3, 3].copy()
+        point = state.align_point(props, 'INFERIOR')
+        if point.valid:
+            pivot = np.array(point.world_xyz, dtype=np.float64)
+        updated = alignment.compose(current, alignment.flip_matrix(),
+                                    pivot=pivot)
+        _apply_world_matrix(obj, updated)
+
+        lines = ["Flip front/back on '%s'" % obj.name,
+                 "  180 deg about Z - the correction for swapped left/right",
+                 "  " + alignment.AXIS_DESCRIPTION]
+        _refresh_after_alignment(context, props, obj, props.align_method
+                                 or alignment.METHOD_MANUAL, lines)
+        self.report({'INFO'}, "BSMT: '%s' flipped front/back" % obj.name)
+        return {'FINISHED'}
+
+
+class BSMT_OT_reset_alignment(bpy.types.Operator):
+    """Restore the object transform recorded before alignment began.
+
+    The mesh is never touched, here or anywhere else in alignment
+    """
+
+    bl_idname = "bsmt.reset_alignment"
+    bl_label = "Reset Alignment"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return props is not None and bool(props.align_object)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj = bpy.data.objects.get(props.align_object)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: '%s' is missing" % props.align_object)
+            return {'CANCELLED'}
+
+        _apply_world_matrix(obj, state.flat_to_rows(props.align_previous_matrix))
+        context.view_layer.update()
+        attach.refresh(props, reason="alignment reset")
+        visualization.clear_alignment_helpers()
+
+        props.align_applied = False
+        props.align_preview = False
+        props.align_report = ("Alignment reset - '%s' restored to its "
+                              "pre-alignment transform" % obj.name)
+        print("[BSMT] " + props.align_report)
+        self.report({'INFO'}, "BSMT: " + props.align_report)
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_topology(bpy.types.Operator):
     """Clear the topology diagnostics report"""
 
@@ -4238,6 +4685,14 @@ classes = (
     BSMT_OT_create_measurement_copy,
     BSMT_OT_toggle_measurement_copy,
     BSMT_OT_clear_preprocess_report,
+    BSMT_OT_pick_alignment_reference,
+    BSMT_OT_clear_alignment_references,
+    BSMT_OT_manual_align,
+    BSMT_OT_preview_alignment,
+    BSMT_OT_clear_alignment_preview,
+    BSMT_OT_apply_alignment,
+    BSMT_OT_flip_front_back,
+    BSMT_OT_reset_alignment,
     BSMT_OT_analyse_repair,
     BSMT_OT_show_non_manifold,
     BSMT_OT_show_boundary_loop,

@@ -123,6 +123,43 @@ def _landmark_collection(props):
     return getattr(scene, "bsmt_landmarks", None) if scene is not None else None
 
 
+def refresh_alignment_points(props, watched=None, multiplier=None):
+    """Move the four alignment references with their object.
+
+    They are SurfacePoints like any other, so their world position is derived
+    from triangle + barycentric + the live matrix. Without this their cached
+    world_xyz is left at its pre-alignment value the moment the object is
+    aligned - which makes every check performed against them, including "is
+    the subject's left now at +X", silently read the old pose.
+    """
+    slots = ('LEFT', 'RIGHT', 'SUPERIOR', 'INFERIOR')
+    if multiplier is None:
+        multiplier = measurement.unit_multiplier(props.unit)
+    meshcache = geodesic.meshcache if geodesic.MESHCACHE_AVAILABLE else None
+
+    moved = 0
+    for slot in slots:
+        point = state.align_point(props, slot)
+        if point is None or not point.valid or not point.source_object:
+            continue
+        if watched is not None and point.source_object not in watched:
+            continue
+        obj = bpy.data.objects.get(point.source_object)
+        if obj is None:
+            continue
+        canonical = (meshcache.peek(point.source_object)
+                     if meshcache is not None else None)
+        local, _origin = _local_position(point, canonical)
+        world = _apply(np.array(obj.matrix_world, dtype=np.float64), local)
+        if _changed(point.world_xyz, world):
+            point.world_xyz = tuple(float(v) for v in world)
+            moved += 1
+        wanted_mm = tuple(float(v) * multiplier for v in world)
+        if _changed(point.physical_mm_xyz, wanted_mm):
+            point.physical_mm_xyz = wanted_mm
+    return "align-refs:moved=%d" % moved
+
+
 def refresh_landmarks(props, watched=None, multiplier=None):
     """Move named landmark markers to follow their object. Returns a note.
 
@@ -309,6 +346,7 @@ def refresh(props, watched=None, reason="manual"):
                 notes.append("distance=%.4f mm" % distance)
 
     notes.append(refresh_landmarks(props, watched, multiplier))
+    notes.append(refresh_alignment_points(props, watched, multiplier))
 
     # Measurement visualisation follows the scan by matrix, not by rewriting
     # points: a geodesic path can have thousands of them.
@@ -372,6 +410,10 @@ def _watched_objects(props):
             point = item.surface_point
             if point.valid and point.source_object:
                 names.add(point.source_object)
+    for slot in ('LEFT', 'RIGHT', 'SUPERIOR', 'INFERIOR'):
+        point = state.align_point(props, slot)
+        if point is not None and point.valid and point.source_object:
+            names.add(point.source_object)
     return names
 
 

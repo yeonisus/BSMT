@@ -288,6 +288,7 @@ def test_fresh_import():
     check("fresh: scancopy module loaded", hasattr(bsmt, "scancopy"))
     check("fresh: repair module loaded", hasattr(bsmt, "repair"))
     check("fresh: meshrepair module loaded", hasattr(bsmt, "meshrepair"))
+    check("fresh: alignment module loaded", hasattr(bsmt, "alignment"))
     check("fresh: protocol module loaded", hasattr(bsmt, "protocol"))
     check("fresh: register/unregister present",
           callable(bsmt.register) and callable(bsmt.unregister))
@@ -821,7 +822,7 @@ def test_landmark_modules_are_pure(bsmt):
     import ast as _ast
     import os as _os
     for name in ("landmarks", "protocol", "measurements", "preprocess",
-                 "repair"):
+                 "repair", "alignment"):
         path = _os.path.join(ROOT, "body_surface_measurement", name + ".py")
         tree = _ast.parse(open(path).read())
         imported = set()
@@ -867,6 +868,26 @@ def test_landmark_modules_are_pure(bsmt):
     # Milestone 3.3: every route to the native solver passes the gate first.
     ops_gate = open(_os.path.join(ROOT, "body_surface_measurement",
                                   "operators.py")).read()
+    # Milestone 3.6: alignment is object-transform only. If it ever touched
+    # mesh vertices, geometry_hash would change and every landmark on the
+    # object would go stale - the exact opposite of what alignment is for.
+    align_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                    "alignment.py")).read()
+    check("alignment.py never touches vertices",
+          "vertices" not in align_text.replace("vertex", ""),
+          "it is object-transform maths only")
+    check("the axis convention is documented",
+          "subject's left" in align_text.lower())
+    for marker in ("obj.data.vertices", "mesh.vertices", "bmesh"):
+        check("the alignment operators never touch %s" % marker,
+              marker not in ops_gate.split("Rigid anatomical alignment")[-1]
+              .split("class BSMT_OT_clear_topology")[0])
+    check("alignment applies matrix_world",
+          "_apply_world_matrix" in ops_gate)
+    check("and checks rigidity before applying",
+          "alignment.is_rigid(rotation)" in ops_gate)
+    check("and refuses non-uniform scale",
+          "alignment.check_alignable" in ops_gate)
     check("the safety gate exists once", ops_gate.count("def solver_preflight") == 1)
     # Three CALL sites - A/B, the measurement manager and the path solve -
     # counted by parsing rather than by grepping, so the `def` line does not

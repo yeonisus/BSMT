@@ -2243,6 +2243,141 @@ Milestone 3.3 and 3.5a acceptance re-run unchanged.
 
 ---
 
+## 11j. Milestone 3.6 — Anatomical alignment (v0.14.0, 2026-09-02)
+
+Handheld scans arrive in whatever frame the capture software produced. §13 recorded the
+requirement; this milestone implements it. Alignment is **rigid and object-level only**: it
+writes `Object.matrix_world` and nothing else. No vertex is read, written or reprojected, so
+mesh geometry, UVs, materials and textures are untouched by construction, not by care.
+
+### 11j.1 The axis convention, and why the sign is what it is
+
+`alignment.py` (pure numpy, no `bpy`) commits to one convention and states it on every frame it
+returns:
+
+> **+X = the subject's LEFT, +Y = POSTERIOR (anterior is −Y), +Z = SUPERIOR.**
+
++Z superior and X along the left–right axis are forced by the brief. The *sign* of X is the only
+free choice, and it is made so that Blender's Front view (Numpad 1, looking from −Y toward +Y)
+shows the subject's anatomical **front**. Y then follows from right-handedness: `Y = Z × X` is
+posterior. Choosing +X = subject's right would have put Blender's Front view behind the subject.
+
+The frame is built from four references and is **orthonormal by construction**:
+
+```
+z = normalise(superior − inferior)                  # primary; the body axis is trusted most
+x = normalise((left − right) − ((left − right)·z) z) # orthogonalised against z
+y = z × x                                            # posterior
+```
+
+Superior–inferior is primary because it is the longest and most reliably picked span on a
+standing scan. The left–right pick is projected onto the plane perpendicular to it.
+
+**The residual is reported, never absorbed.** `residual_degrees = |90° − ∠(left−right, superior−
+inferior)|` is the angle the orthogonalisation had to remove. It is shown in the panel before
+Apply, and flagged above `RESIDUAL_WARN_DEGREES = 20°`. Silently orthogonalising a bad pick and
+saying nothing would be exactly the "silent approximation" §6 forbids. The acceptance run picks a
+deliberately sloppy left/right pair, reports 17.47°, and still produces an exactly orthonormal
+frame.
+
+Degenerate reference sets — coincident superior/inferior, coincident left/right, a left–right
+axis parallel to the body axis, a non-finite coordinate — raise `AlignmentError`. Nothing is
+guessed.
+
+### 11j.2 Flip Front/Back is a derivation, not a heuristic
+
+If the operator labels left and right the wrong way round, X negates, and Y (= Z × X) negates
+with it, while Z is untouched. That is **exactly a 180° rotation about Z**. So Flip Front/Back is
+not an anatomical guess — it is the precise correction for a swapped left/right pick, and
+`tests/test_alignment.py` asserts `flip_matrix() @ frame == swapped_frame` to 1e-12.
+
+### 11j.3 Why alignment cannot change a measurement
+
+This is the property that makes the whole feature safe, and it was designed for in Milestone 2.3
+before any alignment code existed:
+
+- `geometry_hash` **excludes `matrix_world`**. A rigid transform cannot change it, so no
+  `SurfacePoint` goes stale — landmarks stay VALID, exactly as the brief requires.
+- Invalidation compares the **metric tensor** `T = (LᵀL)·multiplier²`. For a rotation `R` applied
+  on the left, `(RL)ᵀ(RL) = LᵀRᵀRL = LᵀL`. The metric is invariant, so a cached distance survives.
+- A `SurfacePoint` is triangle + barycentric, which a transform does not touch either.
+
+Apply therefore refuses anything that is not rigid, at three separate points: `check_alignable`
+rejects **non-uniform scale** outright (with instructions to apply scale first); `is_rigid` guards
+the computed rotation; and the scale is compared before and after the write, so an alignment that
+somehow changed it is rejected rather than committed.
+
+### 11j.4 A real bug found during acceptance
+
+The four alignment references are `SurfacePoint`s, and after Apply their cached `world_xyz` was
+left at its **pre-alignment** value. Every check made against them — "is the subject's left now at
++X", "is the inferior reference at the origin" — was silently reading the old pose. Fixed by
+`attach.refresh_alignment_points()`, called from `attach.refresh()` beside `refresh_landmarks`,
+with the four align slots added to `_watched_objects`. The stored point never changed; only its
+cached world evaluation was stale.
+
+`state.align_point()` returns `None` for an absent property rather than raising: the depsgraph
+handler that follows transforms can fire against a scene whose property group has not finished
+re-registering, and a missing alignment reference must not take the A/B refresh down with it.
+
+### 11j.5 `metric_key` drifts under rotation, and it does not matter
+
+`metric_key` is a *hash*, computed from float32 `matrix_world` values. Rotating an object changes
+its low bits, so the hash changes even though the metric is mathematically identical. This is
+harmless, and provably so: `metric_key` is **never compared anywhere** — verified by grep, it is
+stored and displayed only. Every invalidation decision goes through
+`state.metric_tensors_match()` with `METRIC_RELATIVE_TOLERANCE = 1e-6`, which is float32-tolerant
+by design (§11c: `RᵀR` differs from identity by ~3.6e-8 in single precision). The acceptance run
+reports the hash change as **informational**, and asserts that the tensor comparison that actually
+drives invalidation is unchanged.
+
+### 11j.6 What the panel offers
+
+**Manual** — ±90° rotations about X/Y/Z, a fine rotation by an arbitrary angle, move-to-origin,
+and reset. **Landmark-based** — pick LEFT / RIGHT / SUPERIOR / INFERIOR, preview the resulting
+frame as an axis helper (`BSMT_Align_Axes`, red = subject's left, green = posterior, blue =
+superior) without moving anything, then Apply. Apply rotates about the INFERIOR reference as
+pivot, optionally translating it to the world origin.
+
+Apply records `align_previous_matrix`, `align_applied_matrix`, `align_method`, `align_created`
+and `align_report`. **Reset restores the recorded pre-alignment matrix exactly** — it is not an
+inverse computed afresh.
+
+Not implemented, and deliberately: no ICP, no PCA, no automatic landmark detection, no cropping,
+no brightness correction, no export, no batch.
+
+### 11j.7 Verified in Blender 4.5.13
+
+A textured body proxy was rotated to an arbitrary scanner orientation (51.6°, −34.4°, 120.3°), a
+straight and a surface measurement taken, then landmark alignment applied.
+
+| Check | Result |
+|---|---|
+| Transform rigid, no scale introduced | `[1,1,1] → [1,1,1]` |
+| Body upright | 0.023° from world +Z |
+| The reference frame **is** the world frame | identity to 1e-4 |
+| Subject's LEFT at +X | +98.6 vs −100.4 mm |
+| Inferior reference at the origin | `[0,0,0]` |
+| `geometry_hash` | unchanged |
+| Metric tensor comparison | unchanged |
+| triangle + barycentric + component | identical |
+| Landmarks | all still VALID |
+| Straight distance | 292.586700 → 292.586700 mm |
+| Surface distance | 304.282837 → 304.282837 mm |
+| Cached surface path | survived; recompute agrees, 41 points |
+| Texture / topology | preserved / unchanged |
+| Flip Front/Back | exactly 180° about Z; still rigid; measurement still VALID |
+| Manual X+90 then X−90 | returns to the original transform |
+| Reset | restores the pre-alignment matrix; measurement still valid; mesh never touched |
+| Non-uniform scale (1, 2, 0.5) | **Apply refused**; allowed again at unit scale |
+
+The one reported non-match is the informational `metric_key` hash (§11j.5).
+
+Offline: `tests/test_alignment.py`, 83 checks. Full regression 1,363 checks across ten suites,
+with and without pygeodesic staged, 0 failures.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~
@@ -2263,10 +2398,12 @@ Milestone 3.3 and 3.5a acceptance re-run unchanged.
 
 ## 13. Future phase — anatomical scan alignment
 
-**Status: requirement recorded only. Not designed, not scheduled, and explicitly
-NOT part of Milestone 2.2 or any other Phase 2 milestone.**
-*Extended 2026-09-02 at the researcher's request; still documentation only, and
-no alignment code exists anywhere in the add-on.*
+**Status: IMPLEMENTED in Milestone 3.6 (v0.14.0, 2026-09-02). See §11j for what
+was actually built, the axis convention it commits to, and its Blender acceptance.**
+*This section is retained as the original requirement, written before any alignment
+code existed. Where the two differ, §11j is authoritative — in particular §11j.1 fixes
+the axis signs this section left open ("choose sign conventions consistently"), and the
+automatic-detection ideas below remain unimplemented by design.*
 
 Handheld human-body scans arrive in whatever coordinate system the capture
 software produced. The imported OBJ axes need not correspond to anatomical

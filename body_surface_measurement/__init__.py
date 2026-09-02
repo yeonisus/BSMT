@@ -11,7 +11,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 13, 2),
+    "version": (0, 14, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (
@@ -23,7 +23,8 @@ bl_info = {
         "Milestone 3.2: measurement visualization and surface paths. "
         "Milestone 3.3: scan preprocessing and solver safety gate. "
         "Milestone 3.4: controlled mesh repair. "
-        "Milestone 3.5: automatic local non-manifold repair"
+        "Milestone 3.5: automatic local non-manifold repair. "
+        "Milestone 3.6: rigid anatomical alignment"
     ),
     "category": "3D View",
 }
@@ -33,14 +34,15 @@ if "bpy" in locals():
     import importlib
 
     from . import (
-        attach, geodesic, landmarks, measurement, measurements, meshrepair,
-        panels, picking, preprocess, protocol, repair, scancopy, state,
-        visualization, viz, operators,
+        alignment, attach, geodesic, landmarks, measurement, measurements,
+        meshrepair, panels, picking, preprocess, protocol, repair, scancopy,
+        state, visualization, viz, operators,
     )
 
     importlib.reload(geodesic)
     geodesic.reload_submodules()
     importlib.reload(landmarks)
+    importlib.reload(alignment)
     importlib.reload(measurements)
     importlib.reload(preprocess)
     importlib.reload(repair)
@@ -57,9 +59,9 @@ if "bpy" in locals():
     importlib.reload(attach)
 else:
     from . import (
-        attach, geodesic, landmarks, measurement, measurements, meshrepair,
-        operators, panels, picking, preprocess, protocol, repair, scancopy,
-        state, visualization, viz,
+        alignment, attach, geodesic, landmarks, measurement, measurements,
+        meshrepair, operators, panels, picking, preprocess, protocol, repair,
+        scancopy, state, visualization, viz,
     )
 
 import bpy  # noqa: E402  (kept after the reload guard on purpose)
