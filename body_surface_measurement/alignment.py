@@ -47,6 +47,14 @@ import numpy as np
 #: so the residual is recorded rather than assumed away.
 RESIDUAL_WARN_DEGREES = 20.0
 
+#: UI GUIDANCE ONLY (Milestone 3.7, sect. 12). These bands tell a researcher
+#: whether their four picks look self-consistent. They are NOT a validated
+#: anthropometric criterion, and no measurement is accepted or refused on the
+#: strength of them - the residual is reported either way, and the frame is
+#: exactly orthonormal at any residual. `quality()` says so in its own words.
+RESIDUAL_GOOD_DEGREES = 5.0
+RESIDUAL_CHECK_DEGREES = 15.0
+
 #: Tolerance for calling a 3x3 linear part a rotation.
 RIGID_TOLERANCE = 1e-5
 
@@ -204,6 +212,29 @@ def anatomical_frame(left, right, superior, inferior):
         "vertical_mm": vertical_length,
         "convention": AXIS_DESCRIPTION,
     }
+
+
+def quality(residual_degrees):
+    """A plain-language reading of the residual. UI GUIDANCE ONLY.
+
+    Returns (verdict, advice, severity). `severity` is 0 good, 1 worth a look,
+    2 worth repicking - meant for choosing an icon, nothing else.
+
+    The bands are a usability aid, not a research threshold: they have not
+    been validated against any anthropometric standard, and BSMT never refuses
+    or adjusts a measurement because of them. Whatever the residual, the
+    reported frame is exactly orthonormal and the residual itself is always
+    shown, so the researcher decides.
+    """
+    value = float(residual_degrees)
+    if value <= RESIDUAL_GOOD_DEGREES:
+        return ("Good",
+                "the reference points are close to perpendicular", 0)
+    if value <= RESIDUAL_CHECK_DEGREES:
+        return ("Check references",
+                "left/right may not be at the same height", 1)
+    return ("Repick recommended",
+            "the two reference axes are far from perpendicular", 2)
 
 
 def rotation_to_world(frame):

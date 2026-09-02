@@ -2378,6 +2378,185 @@ with and without pygeodesic staged, 0 failures.
 
 ---
 
+## 11k. Milestone 3.7 — UI wording, measurement drafts and readiness (v0.15.0, 2026-09-02)
+
+The pipeline works end to end. This milestone made it *readable*: one vocabulary throughout the
+UI, a measurement that cannot exist in an unfinished state, and one line that answers "can I
+measure yet". No analytical behaviour was added.
+
+### 11k.1 One word per concept
+
+The UI now commits to a vocabulary, stated at the top of `panels.py` so it cannot drift:
+
+| Concept | Term | Not |
+|---|---|---|
+| a named point the researcher places | **Landmark** | point, marker |
+| one of the four anatomical references | **Reference Point** | landmark, anchor |
+| the two ad-hoc points of the quick tool | **Point A / Point B** | landmark |
+| the imported scan | **Source Mesh** | original, source scan |
+| the lighter textured copy | **Measurement Mesh** | measurement copy, duplicate |
+| straight line between two landmarks | **Straight Distance** | Euclidean, chord |
+| exact geodesic distance | **Surface Distance** | geodesic distance |
+| the polyline it follows | **Surface Path** | path, geodesic |
+
+**Calculate** produces a distance; **Compute** produces a surface path. That distinction is
+deliberate and is the researcher's own preference — the two operations differ in cost by an order
+of magnitude, and a label that says which one you are about to trigger is worth the extra word.
+
+UI spelling is US English (*Analyze*, *Color*, *Visualization*) even where the surrounding code is
+written in British English. Mixing the two in a single panel was the actual defect: *"Analyse
+Mesh"* sat two panels away from *"Measurement Visualization"*.
+
+Panel titles: `Body Measurement` became **Quick Measure (A to B)** — it is a different tool from
+the Landmark Manager and had been reading like the main one. `Diagnostics` became **Mesh
+Diagnostics**. The rest were already clear and were left alone.
+
+**Every operator gained a `bl_description`.** There were none: Blender falls back to the whole
+docstring, so the tooltip for Repair Local Defects was a 411-character wall of text. The
+docstrings stay for developers; the tooltips are one sentence each. `tests/test_import.py` now
+fails if any operator lacks one.
+
+### 11k.2 A measurement cannot exist half-written
+
+Pressing Add used to append a row pre-filled with landmarks 1 and 2. Pressing it twice left a
+duplicate the researcher had to hunt down and delete, and the auto-namer had already produced
+something like `"? to ?"`.
+
+A row is now a **draft** (`measurements.is_draft`) until it has a From landmark, a To landmark,
+**and they are different**. A draft:
+
+- has **no name at all** — an incomplete definition is never given a meaningless one;
+- reports `STATUS_DRAFT`, saying which end is still missing;
+- is skipped by Calculate All and refused by Calculate Selected;
+- never appears in Measurement Results, and is not counted as defined;
+- can be discarded with **Cancel New Measurement**.
+
+**Add reuses a trailing draft** rather than stacking another (`state.trailing_draft_index`) — only
+the *last* row, because a draft in the middle is one the researcher is still filling in, and
+recycling it would move their selection somewhere they did not ask for. Five presses of Add
+produce exactly one row.
+
+Two consequences worth stating plainly:
+
+**A → A is no longer a measurement.** It was previously reported READY on the reasoning that its
+answer is exactly zero. The researcher asked for `From != To`, so it is now a draft: never
+calculated, never named, never listed.
+
+**"Never chosen" and "chosen, and now missing" are different answers.** This is the subtle part.
+A measurement loaded from a template whose landmark is absent has an unresolved id of 0 — the same
+value an untouched draft has. Treating it as a draft would have silently dropped a real definition
+from the batch and from the results, which is exactly the quiet substitution §6 forbids.
+`is_draft` therefore also reads the **cached** protocol id and name that every chosen endpoint
+carries: an end with a remembered name was chosen once, so the row stays a real measurement
+reporting `INVALID_REFERENCE`. Verified in Blender: deleting a landmark leaves its measurement
+listed, named, and explicitly broken.
+
+The empty state is a message — *"No measurements defined."* plus **Add Measurement** — never a
+blank row created to give the panel something to draw.
+
+### 11k.3 Displaying more than one measurement
+
+`viz_selected_only` (a boolean) became `viz_scope` with three values: **Selected Measurement**,
+**Selected Measurements** (those ticked), **All Enabled Measurements**.
+
+Widening the scope **cannot compute anything**. `viz.visible_measurements` decides what *should*
+be drawn and `viz.display_report` names the ones with no cached path, so showing ten measurements
+lists two as *"Path not computed"* rather than starting two solves. Measurements that do have a
+cached path are still drawn. A test asserts `viz.py` never reaches the solver at all.
+
+### 11k.4 Which mesh is being measured
+
+A measurement mesh sits exactly on top of the scan it was copied from, so the viewport cannot tell
+them apart — the object-identity bug of §11i came from precisely that. The Measurement Manager now
+shows, at the top:
+
+```
+Measurement Mesh: A_BSMT          Triangles:  349,999
+Source Mesh:      A               Topology:   Ready
+```
+
+The target comes from `state.measurement_target()`, and **the landmarks decide**: a measurement is
+computed on the mesh its landmarks were picked on, never on whatever happens to be selected. The
+active object stands in only when no landmark has been picked, and is labelled as a guess.
+
+### 11k.5 One readiness line
+
+`readiness.py` (pure python — it imports nothing at all, asserted by a test) turns numbers the
+add-on already holds into one line at the top of the first panel:
+
+```
+READY FOR MEASUREMENT
+NOT READY: 7 non-manifold edges - the exact solver is refused
+```
+
+It names the **first** blocker and the panel that explains it, and deliberately restates no
+diagnostics. Blocking: no mesh, non-manifold topology, over the density threshold, non-uniform
+scale, stale landmarks. Non-blocking, but still worth saying: unpicked landmarks, no landmarks, no
+measurements. **"Not analyzed yet" is its own state** — the canonical mesh is consulted with
+`peek()`, which never builds one, so opening a panel cannot trigger a rebuild, and when nothing is
+cached the line says so rather than inventing an answer.
+
+### 11k.6 Alignment residual, in plain language
+
+`alignment.quality()` reads the residual as **Good** (≤5°), **Check references** (≤15°) or
+**Repick recommended**, and the panel prints *"(UI guidance, not a validated threshold)"*
+underneath. The bands are labelled `UI GUIDANCE ONLY` in the source as well. Nothing is refused or
+adjusted because of them: the frame is exactly orthonormal at any residual, and the residual
+itself is always shown.
+
+The reference-point help text was cut to three lines that say what to click:
+
+> LEFT / RIGHT: matching points on each side, at about the same height.
+> SUPERIOR / INFERIOR: an upper and a lower point, near the body midline.
+> Left and right are the SUBJECT'S, not the viewer's.
+
+### 11k.7 A blocking repair bug, found by re-running an old acceptance script
+
+Re-running the Milestone 3.4 acceptance surfaced a real regression introduced in **v0.13.0**:
+
+> `BSMT: repair reverted - non-manifold edges did not decrease (0 -> 0)`
+
+`accept_repair` required a **strict** decrease in non-manifold edges, and every manual repair
+shared it. So on a mesh with 0 non-manifold edges — which is the state the automatic repair works
+hard to reach — **Fill Loop, Delete Component and Remove Duplicate Faces were all refused**. The
+researcher reaches for those tools precisely when the topology has become good.
+
+The rule is now scoped to the repairs whose *purpose* is removing non-manifold edges (the local
+weld and duplicate-face removal). For everything else the criterion is the honest one: **do not
+make it worse**. `tests/test_repair.py` asserts the scoping at both the rule and the call sites,
+so it cannot quietly widen again. With the fix the 3.4 acceptance runs to completion for the first
+time since v0.12.0: 91 checks, 0 failures.
+
+This is why the old scripts are re-run rather than archived.
+
+### 11k.8 Verified in Blender 4.5.13
+
+A textured body proxy with four landmarks and three measurements. 96 checks, 0 failures.
+
+| Case | Result |
+|---|---|
+| Add once | one draft, no name, status DRAFT |
+| Add four more times | **still one row** |
+| From only / From == To | still a draft, still unnamed |
+| Both ends set and different | becomes real, named `Shoulder_L to Shoulder_R`, READY |
+| Calculate All with a draft present | 3 calculated, draft skipped, no result on it |
+| Measurement Results | 3 rows, none blank |
+| Cancel New Measurement | removes the draft, leaves the real ones |
+| Landmark deleted under a measurement | still a real measurement, `INVALID_REFERENCE`, names `Hip_R`, keeps its name |
+| Display scope SELECTED / TICKED / ENABLED | 1 / 2 / all, never a draft |
+| One path computed, scope widened | 1 with a path, the rest reported "path not computed" — **nothing recomputed** |
+| Measurement target | resolves to the landmarks' mesh, and says why |
+| Readiness | READY; NOT READY on a stale landmark; NOT READY on non-uniform scale |
+| Residual guidance | 1° Good, 10° Check references, 25° Repick recommended |
+| Every panel drawn | 9 of 9, no error |
+| Wording audit over 149 emitted strings | no banned term, no `? -> ?` row |
+
+Milestones 3.2, 3.3, 3.4, 3.5, 3.5a and 3.6 acceptance scripts all re-run: 0 failures, 0
+tracebacks. Offline: 1,514 checks across eleven suites without pygeodesic, 1,624 with it staged,
+0 failures.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

@@ -11,7 +11,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 14, 0),
+    "version": (0, 15, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (
@@ -24,7 +24,8 @@ bl_info = {
         "Milestone 3.3: scan preprocessing and solver safety gate. "
         "Milestone 3.4: controlled mesh repair. "
         "Milestone 3.5: automatic local non-manifold repair. "
-        "Milestone 3.6: rigid anatomical alignment"
+        "Milestone 3.6: rigid anatomical alignment. "
+        "Milestone 3.7: UI wording, measurement drafts, readiness"
     ),
     "category": "3D View",
 }
@@ -35,8 +36,8 @@ if "bpy" in locals():
 
     from . import (
         alignment, attach, geodesic, landmarks, measurement, measurements,
-        meshrepair, panels, picking, preprocess, protocol, repair, scancopy,
-        state, visualization, viz, operators,
+        meshrepair, panels, picking, preprocess, protocol, readiness, repair,
+        scancopy, state, visualization, viz, operators,
     )
 
     importlib.reload(geodesic)
@@ -44,6 +45,7 @@ if "bpy" in locals():
     importlib.reload(landmarks)
     importlib.reload(alignment)
     importlib.reload(measurements)
+    importlib.reload(readiness)
     importlib.reload(preprocess)
     importlib.reload(repair)
     importlib.reload(protocol)
@@ -60,8 +62,8 @@ if "bpy" in locals():
 else:
     from . import (
         alignment, attach, geodesic, landmarks, measurement, measurements,
-        meshrepair, operators, panels, picking, preprocess, protocol, repair,
-        scancopy, state, visualization, viz,
+        meshrepair, operators, panels, picking, preprocess, protocol,
+        readiness, repair, scancopy, state, visualization, viz,
     )
 
 import bpy  # noqa: E402  (kept after the reload guard on purpose)

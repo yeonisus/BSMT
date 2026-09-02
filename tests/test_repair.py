@@ -9,6 +9,7 @@ bmesh editing is exercised by the in-Blender acceptance script.
 
 import importlib.util
 import os
+import re
 import sys
 import types
 
@@ -332,8 +333,8 @@ def test_no_global_cleanup_anywhere():
               os.path.join(PACKAGE, "repair.py")).read())
 
     operators = open(os.path.join(PACKAGE, "operators.py")).read()
-    check("repairs refuse anything but a measurement copy",
-          "is not a measurement copy" in operators)
+    check("repairs refuse anything but a measurement mesh",
+          "is not a measurement mesh" in operators)
     check("and every repair backs up first",
           "meshrepair.make_backup(obj)" in operators)
 
@@ -585,14 +586,41 @@ def test_acceptance_criteria():
     ok, why = repair.accept_repair(before, good, True)
     check("a good repair is accepted", ok, str(why))
 
+    # A repair whose PURPOSE is removing non-manifold edges must prove it.
     ok, why = repair.accept_repair(before, dict(good,
-                                                nonmanifold_edge_count=7), True)
-    check("no improvement is rejected", not ok)
+                                                nonmanifold_edge_count=7), True,
+                                   require_nonmanifold_decrease=True)
+    check("no improvement is rejected for a non-manifold repair", not ok)
     check("  and says so", "did not decrease" in why[0])
 
     ok, why = repair.accept_repair(before, dict(good,
                                                 nonmanifold_edge_count=9), True)
     check("getting worse is rejected", not ok)
+    check("  and counts the new edges", "created 2 new" in why[0], why[0])
+
+    # ...but a hole fill, a component removal or a small-boundary fill is not
+    # about non-manifold edges at all. Requiring a strict decrease made every
+    # one of them impossible on a clean mesh - which is exactly when a
+    # researcher reaches for them. The rule there is "do not make it worse".
+    clean = report(triangle_count=350000, nonmanifold_edge_count=0,
+                   boundary_edge_count=14, component_count=1)
+    filled = report(triangle_count=350012, nonmanifold_edge_count=0,
+                    boundary_edge_count=0, component_count=1)
+    ok, why = repair.accept_repair(clean, filled, True)
+    check("filling a hole on an ALREADY CLEAN mesh is accepted", ok, str(why))
+    check("and it stays refused if it introduces a non-manifold edge",
+          not repair.accept_repair(
+              clean, dict(filled, nonmanifold_edge_count=1), True)[0])
+    trimmed = report(triangle_count=349000, nonmanifold_edge_count=0,
+                     boundary_edge_count=14, component_count=1)
+    check("removing a stray component on a clean mesh is accepted",
+          repair.accept_repair(
+              report(triangle_count=350000, nonmanifold_edge_count=0,
+                     boundary_edge_count=14, component_count=2),
+              trimmed, True)[0])
+    check("the strict rule would have refused both",
+          not repair.accept_repair(clean, filled, True,
+                                   require_nonmanifold_decrease=True)[0])
 
     ok, why = repair.accept_repair(before, dict(good,
                                                 boundary_edge_count=400), True)
@@ -611,6 +639,25 @@ def test_acceptance_criteria():
 
     ok, why = repair.accept_repair(before, dict(good, component_count=1), True)
     check("FEWER components is fine", ok, str(why))
+
+
+def test_the_strict_rule_is_scoped_to_non_manifold_repairs():
+    print("\n[auto] only the non-manifold repairs demand a strict decrease")
+    operators = open(os.path.join(PACKAGE, "operators.py")).read()
+    strict = re.findall(
+        r'_guarded\(context, "([^"]+)", work,\s*\n\s*'
+        r'require_nonmanifold_decrease=True\)', operators)
+    check("exactly two repairs require a decrease", len(strict) == 2, strict)
+    check("and they are the two that target non-manifold edges",
+          set(strict) == {"Remove duplicate faces",
+                          "Weld non-manifold region"}, strict)
+    relaxed = re.findall(r'_guarded\(context, "([^"]+)", work\)', operators)
+    check("the hole fill is not among them", "Fill boundary loop" in relaxed,
+          relaxed)
+    check("nor is component removal", "Remove component" in relaxed, relaxed)
+    check("the default is the permissive rule",
+          "require_nonmanifold_decrease=False" in
+          open(os.path.join(PACKAGE, "repair.py")).read())
 
 
 def test_change_summary():
@@ -770,6 +817,7 @@ def main():
         test_patch_prediction,
         test_tiny_boundary_limits,
         test_acceptance_criteria,
+        test_the_strict_rule_is_scoped_to_non_manifold_repairs,
         test_change_summary,
         test_signatures_survive_reindexing,
         test_step_rule_refuses_moving_the_defect,

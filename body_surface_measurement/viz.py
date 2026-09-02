@@ -194,14 +194,55 @@ def measurements_of(context, props):
 
 
 def visible_measurements(context, props):
-    """Definitions whose visualisation should currently be drawn."""
+    """Definitions whose visualisation should currently be drawn (sect. 10).
+
+    Three scopes, and no fourth hidden one: the selected measurement, the
+    ones ticked for display, or every enabled measurement. Drafts are never
+    drawn - there is nothing to draw between two landmarks that have not been
+    chosen.
+
+    This function decides what SHOULD be visible. It never computes anything,
+    so widening the scope cannot trigger a surface-path solve; a measurement
+    with no cached path simply gets no path helper.
+    """
     collection = state.get_measurements(context)
     if not collection:
         return []
-    if props.viz_selected_only:
+    scope = getattr(props, "viz_scope", 'SELECTED')
+    if scope == 'SELECTED':
         item = state.active_measurement(context, props)
-        return [item] if item is not None else []
-    return [item for item in collection if item.show_visualization]
+        if item is None or state.measurement_is_draft(item):
+            return []
+        return [item]
+    if scope == 'ENABLED':
+        candidates = [item for item in collection if item.enabled]
+    elif scope == 'TICKED':
+        candidates = [item for item in collection if item.show_visualization]
+    else:
+        # An unknown scope shows nothing rather than guessing at one.
+        return []
+    return [item for item in candidates
+            if not state.measurement_is_draft(item)]
+
+
+def display_report(context, props):
+    """What the visualisation panel should say about the current scope.
+
+    Separates "drawn" from "has no cached path yet", so a researcher showing
+    ten measurements can see at a glance which ones are missing a path
+    without any of them being recomputed to find out.
+    """
+    wanted = visible_measurements(context, props)
+    mode = getattr(props, "viz_mode", 'BOTH')
+    want_path = mode in ('SURFACE', 'BOTH')
+    with_path = [item for item in wanted if item.path_valid]
+    without_path = [item for item in wanted if not item.path_valid]
+    return {
+        "count": len(wanted),
+        "with_path": [item.label for item in with_path],
+        "without_path": [item.label for item in without_path],
+        "path_wanted": want_path,
+    }
 
 
 def refresh(context, props=None):

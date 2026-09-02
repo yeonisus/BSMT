@@ -42,6 +42,8 @@ class BSMT_OT_pick_point(bpy.types.Operator):
 
     bl_idname = "bsmt.pick_point"
     bl_label = "Pick Point"
+    bl_description = ("Click a point on the mesh surface to store it as Point"
+                      " A or Point B")
     bl_options = {'REGISTER'}
 
     point: EnumProperty(
@@ -302,9 +304,9 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         copy = scancopy.find_measurement_copy(obj)
         if copy is None:
             return ""
-        message = ("picked on the ORIGINAL scan '%s'; its measurement copy "
-                   "'%s' exists. Select the copy if you meant to measure on it."
-                   % (obj.name, copy.name))
+        message = ("picked on the SOURCE MESH '%s'; its measurement mesh "
+                   "'%s' exists. Select the measurement mesh if you meant to "
+                   "measure on it." % (obj.name, copy.name))
         print("[BSMT] " + message)
         operator.report({'WARNING'}, "BSMT: " + message)
         return message
@@ -415,7 +417,9 @@ class BSMT_OT_calculate_distance(bpy.types.Operator):
     """Calculate the straight-line distance between Point A and Point B"""
 
     bl_idname = "bsmt.calculate_distance"
-    bl_label = "Calculate Distance"
+    bl_label = "Calculate Straight Distance"
+    bl_description = ("Calculate the straight-line distance between Point A"
+                      " and Point B")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -453,6 +457,9 @@ class BSMT_OT_calculate_surface_distance(bpy.types.Operator):
 
     bl_idname = "bsmt.calculate_surface_distance"
     bl_label = "Calculate Surface Distance"
+    bl_description = ("Calculate the exact geodesic distance across the"
+                      " surface between Point A and Point B. This may block"
+                      " Blender for several seconds on a dense mesh")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -743,6 +750,8 @@ class BSMT_OT_clear_surface_distance(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_surface_distance"
     bl_label = "Clear Surface Distance"
+    bl_description = ("Forget the stored surface distance. The points and the"
+                      " straight distance are kept")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -761,7 +770,9 @@ class BSMT_OT_validate_surface_points(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.validate_surface_points"
-    bl_label = "Validate / Refresh"
+    bl_label = "Validate Points"
+    bl_description = ("Re-check Point A and Point B against the current mesh,"
+                      " and move their markers to match")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -858,6 +869,8 @@ class BSMT_OT_transform_handler_status(bpy.types.Operator):
 
     bl_idname = "bsmt.transform_handler_status"
     bl_label = "Transform Handler Status"
+    bl_description = ("Report whether the handlers that make markers follow"
+                      " the mesh are registered (developer tool)")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -939,7 +952,9 @@ class BSMT_OT_refresh_helpers(bpy.types.Operator):
     """Re-derive helper positions from the stored surface locations"""
 
     bl_idname = "bsmt.refresh_helpers"
-    bl_label = "Refresh Helpers"
+    bl_label = "Refresh Markers"
+    bl_description = ("Move the markers and the straight line back onto their"
+                      " stored surface positions")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -956,6 +971,8 @@ class BSMT_OT_clear_points(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_points"
     bl_label = "Clear Points"
+    bl_description = ("Forget Point A and Point B and remove their markers."
+                      " The mesh is not touched")
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -971,7 +988,9 @@ class BSMT_OT_diagnose_topology(bpy.types.Operator):
     """Report the topology of the active mesh. Read-only: never modifies it"""
 
     bl_idname = "bsmt.diagnose_topology"
-    bl_label = "Diagnose Topology"
+    bl_label = "Analyze Topology"
+    bl_description = ("Report the topology of the active mesh. Read-only: the"
+                      " mesh is never modified")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -1075,7 +1094,9 @@ class BSMT_OT_visualize_components(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.visualize_components"
-    bl_label = "Visualize Components"
+    bl_label = "Show Components"
+    bl_description = ("Color each connected component with temporary helper"
+                      " objects. The mesh is not touched")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -1223,6 +1244,8 @@ class BSMT_OT_verify_components(bpy.types.Operator):
 
     bl_idname = "bsmt.verify_components"
     bl_label = "Verify Components"
+    bl_description = ("Independently re-check the component labelling"
+                      " (developer tool)")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -1302,7 +1325,9 @@ class BSMT_OT_clear_component_preview(bpy.types.Operator):
     """Remove the component preview helper objects. The scan is untouched"""
 
     bl_idname = "bsmt.clear_component_preview"
-    bl_label = "Clear Component Preview"
+    bl_label = "Clear Components"
+    bl_description = ("Remove the component helper objects. The mesh is not"
+                      " touched")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -1322,6 +1347,7 @@ class BSMT_OT_isolate_component(bpy.types.Operator):
 
     bl_idname = "bsmt.isolate_component"
     bl_label = "Isolate Component"
+    bl_description = "Show only this component, or show all of them again"
     bl_options = {'REGISTER'}
 
     index: IntProperty(
@@ -1350,6 +1376,9 @@ class BSMT_OT_check_geodesic_env(bpy.types.Operator):
 
     bl_idname = "bsmt.check_geodesic_env"
     bl_label = "Check Environment"
+    bl_description = ("Report the Python environment Blender is running and"
+                      " whether the exact geodesic backend can be imported"
+                      " (developer tool)")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -1415,7 +1444,9 @@ class BSMT_OT_run_backend_selftest(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.run_backend_selftest"
-    bl_label = "Run Synthetic Backend Tests"
+    bl_label = "Run Backend Self-Test"
+    bl_description = ("Run the synthetic proof of the exact geodesic backend"
+                      " against known analytic distances (developer tool)")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -1509,6 +1540,7 @@ class BSMT_OT_clear_backend_reports(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_backend_reports"
     bl_label = "Clear Backend Reports"
+    bl_description = "Clear the environment and self-test reports"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -1558,6 +1590,8 @@ class BSMT_OT_add_landmark(bpy.types.Operator):
 
     bl_idname = "bsmt.add_landmark"
     bl_label = "Add Landmark"
+    bl_description = ("Add a named landmark. It starts unpicked - pick it on"
+                      " the surface to give it a position")
     bl_options = {'REGISTER', 'UNDO'}
 
     landmark_name: StringProperty(
@@ -1605,6 +1639,7 @@ class BSMT_OT_remove_landmark(bpy.types.Operator):
 
     bl_idname = "bsmt.remove_landmark"
     bl_label = "Delete Landmark"
+    bl_description = "Delete the selected landmark and its marker"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1629,6 +1664,8 @@ class BSMT_OT_clear_landmark_position(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_landmark_position"
     bl_label = "Clear Position"
+    bl_description = ("Forget the selected landmark's surface position,"
+                      " keeping its name")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1652,7 +1689,9 @@ class BSMT_OT_clear_landmarks(bpy.types.Operator):
     are not affected"""
 
     bl_idname = "bsmt.clear_landmarks"
-    bl_label = "Clear Landmark Data"
+    bl_label = "Delete All Landmarks"
+    bl_description = ("Delete every landmark. Point A/B, the measurements and"
+                      " the mesh are not affected")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1693,7 +1732,9 @@ class BSMT_OT_validate_landmarks(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.validate_landmarks"
-    bl_label = "Validate All Landmarks"
+    bl_label = "Validate Landmarks"
+    bl_description = ("Re-check every landmark against the current mesh and"
+                      " update its status")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -1785,7 +1826,9 @@ class BSMT_OT_pick_landmark(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.pick_landmark"
-    bl_label = "Pick Selected"
+    bl_label = "Pick Landmark"
+    bl_description = ("Click a point on the mesh surface to position the"
+                      " selected landmark")
     bl_options = {'REGISTER'}
 
     index: IntProperty(default=-1, options={'SKIP_SAVE'})
@@ -1815,6 +1858,7 @@ class BSMT_OT_guided_picking(bpy.types.Operator):
 
     bl_idname = "bsmt.guided_picking"
     bl_label = "Guided Picking"
+    bl_description = "Step through the landmark list, picking each one in turn"
     bl_options = {'REGISTER'}
 
     action: EnumProperty(
@@ -1876,6 +1920,8 @@ class BSMT_OT_save_protocol(bpy.types.Operator):
 
     bl_idname = "bsmt.save_protocol"
     bl_label = "Save Landmark Protocol"
+    bl_description = ("Save the landmark names and their order to a JSON"
+                      " file. Positions are not saved")
     bl_options = {'REGISTER'}
 
     filepath: StringProperty(subtype='FILE_PATH')
@@ -1927,6 +1973,8 @@ class BSMT_OT_load_protocol(bpy.types.Operator):
 
     bl_idname = "bsmt.load_protocol"
     bl_label = "Load Landmark Protocol"
+    bl_description = ("Load landmark names and order from a JSON file. No"
+                      " positions are loaded")
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: StringProperty(subtype='FILE_PATH')
@@ -2212,11 +2260,13 @@ class BSMT_OT_add_measurement(bpy.types.Operator):
 
     bl_idname = "bsmt.add_measurement"
     bl_label = "Add Measurement"
+    bl_description = ("Start a new measurement. Choose its From and To"
+                      " landmarks to complete it")
     bl_options = {'REGISTER', 'UNDO'}
 
     use_selected: BoolProperty(
-        name="Use Selected Landmark As Source",
-        description="Start the definition from the landmark selected in the "
+        name="Start From Selected Landmark",
+        description="Fill in From with the landmark selected in the "
                     "Landmark Manager",
         default=False,
         options={'SKIP_SAVE'},
@@ -2228,38 +2278,79 @@ class BSMT_OT_add_measurement(bpy.types.Operator):
 
     def execute(self, context):
         props = state.get_props(context)
-        collection = state.get_landmarks(context)
-        if props is None:
+        landmarks_collection = state.get_landmarks(context)
+        measurements_collection = state.get_measurements(context)
+        if props is None or measurements_collection is None:
             self.report({'ERROR'}, "BSMT: add-on properties are not registered")
             return {'CANCELLED'}
-        if not collection:
+        if not landmarks_collection:
             self.report({'ERROR'},
-                        "BSMT: define some landmarks before defining a "
-                        "measurement between them")
+                        "BSMT: add some landmarks first - a measurement "
+                        "connects two of them")
             return {'CANCELLED'}
 
-        source = target = None
+        # Sect. 6: pressing Add twice must never leave two unfinished rows
+        # behind. If the last row is still a draft, that draft IS the new
+        # measurement - select it and say so, rather than stacking another
+        # empty row the researcher then has to delete.
+        existing = state.trailing_draft_index(measurements_collection)
+        if existing >= 0:
+            props.measurement_index = existing
+            props.show_measurement_detail = True
+            item = measurements_collection[existing]
+            state.refresh_measurement_status(context, item)
+            self.report({'INFO'},
+                        "BSMT: %s is still unfinished - choose its From and "
+                        "To landmarks" % item.protocol_id)
+            return {'FINISHED'}
+
+        source = None
         if self.use_selected:
             source = state.active_landmark(context, props)
-        if source is None:
-            source = collection[0]
-        if len(collection) > 1:
-            target = collection[1] if collection[1] is not source else collection[0]
-        else:
-            target = source
 
         try:
             item = state.add_measurement(
-                context, props, source=source, target=target,
+                context, props, source=source,
                 measurement_type=measurements.TYPE_BOTH,
             )
         except measurements.MeasurementError as exc:
             self.report({'ERROR'}, "BSMT: %s" % exc)
             return {'CANCELLED'}
 
+        props.show_measurement_detail = True
         state.refresh_measurement_status(context, item)
-        self.report({'INFO'}, "BSMT: added measurement %s '%s'"
-                    % (item.protocol_id, item.label))
+        self.report({'INFO'}, "BSMT: %s added - choose its From and To "
+                              "landmarks" % item.protocol_id)
+        return {'FINISHED'}
+
+
+class BSMT_OT_cancel_measurement_draft(bpy.types.Operator):
+    """Discard the unfinished measurement.
+
+    Only ever removes a DRAFT - a row with no complete From/To pair - so it
+    can never delete a real measurement or a stored result
+    """
+
+    bl_idname = "bsmt.cancel_measurement_draft"
+    bl_label = "Cancel New Measurement"
+    bl_description = "Discard this unfinished measurement"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        item = state.active_measurement(context)
+        return item is not None and state.measurement_is_draft(item)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        item = state.active_measurement(context, props)
+        if item is None or not state.measurement_is_draft(item):
+            self.report({'WARNING'},
+                        "BSMT: the selected measurement is not a draft")
+            return {'CANCELLED'}
+        protocol_id = item.protocol_id
+        state.remove_measurement(context, props, props.measurement_index)
+        self.report({'INFO'}, "BSMT: discarded draft %s" % protocol_id)
         return {'FINISHED'}
 
 
@@ -2268,6 +2359,7 @@ class BSMT_OT_remove_measurement(bpy.types.Operator):
 
     bl_idname = "bsmt.remove_measurement"
     bl_label = "Delete Measurement"
+    bl_description = "Delete the selected measurement and its result"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -2290,7 +2382,9 @@ class BSMT_OT_clear_measurements(bpy.types.Operator):
     not affected"""
 
     bl_idname = "bsmt.clear_measurements"
-    bl_label = "Clear Measurements"
+    bl_label = "Delete All Measurements"
+    bl_description = ("Delete every measurement. Landmarks, Point A/B and the"
+                      " mesh are not affected")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -2315,7 +2409,9 @@ class BSMT_OT_remove_invalid_measurements(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.remove_invalid_measurements"
-    bl_label = "Remove Invalid Measurements"
+    bl_label = "Delete Unresolved"
+    bl_description = ("Delete only the measurements whose landmarks no longer"
+                      " exist")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -2355,6 +2451,8 @@ class BSMT_OT_calculate_measurement(bpy.types.Operator):
 
     bl_idname = "bsmt.calculate_measurement"
     bl_label = "Calculate Selected"
+    bl_description = ("Calculate the selected measurement. A surface distance"
+                      " may block Blender for several seconds")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -2362,12 +2460,18 @@ class BSMT_OT_calculate_measurement(bpy.types.Operator):
         props = state.get_props(context)
         if props is None or props.measurement_running:
             return False
-        return state.active_measurement(context) is not None
+        item = state.active_measurement(context)
+        return item is not None and not state.measurement_is_draft(item)
 
     def execute(self, context):
         props = state.get_props(context)
         item = state.active_measurement(context, props)
         if item is None:
+            return {'CANCELLED'}
+        if state.measurement_is_draft(item):
+            self.report({'WARNING'},
+                        "BSMT: choose a From and a To landmark first - they "
+                        "must be two different landmarks")
             return {'CANCELLED'}
         if props.measurement_running:
             self.report({'WARNING'}, "BSMT: a calculation is already running")
@@ -2395,7 +2499,9 @@ class BSMT_OT_calculate_all_measurements(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.calculate_all_measurements"
-    bl_label = "Calculate All Defined"
+    bl_label = "Calculate All"
+    bl_description = ("Calculate every enabled measurement, in order. Drafts"
+                      " and disabled rows are skipped")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -2403,7 +2509,10 @@ class BSMT_OT_calculate_all_measurements(bpy.types.Operator):
         props = state.get_props(context)
         if props is None or props.measurement_running:
             return False
-        return bool(state.get_measurements(context))
+        collection = state.get_measurements(context)
+        if not collection:
+            return False
+        return any(item.enabled for item in measurements.defined(collection))
 
     def execute(self, context):
         props = state.get_props(context)
@@ -2415,15 +2524,21 @@ class BSMT_OT_calculate_all_measurements(bpy.types.Operator):
             return {'CANCELLED'}
 
         plan = measurements.batch_plan(collection)
-        print("\n[BSMT] Calculate All Defined: %s" % plan["summary"])
+        print("\n[BSMT] Calculate All: %s" % plan["summary"])
         if plan["disabled"]:
-            print("[BSMT] skipping %d disabled definition(s)" % plan["disabled"])
+            print("[BSMT] skipping %d disabled measurement(s)" % plan["disabled"])
+        if plan["drafts"]:
+            # A draft is not a measurement (sect. 6), so it is skipped in
+            # silence-free fashion: said out loud, never calculated.
+            print("[BSMT] skipping %d unfinished draft(s)" % plan["drafts"])
         if plan["enabled"] == 0:
             self.report({'WARNING'},
-                        "BSMT: no enabled measurement definitions to calculate")
+                        "BSMT: nothing to calculate - no enabled measurement "
+                        "has both landmarks chosen")
             return {'CANCELLED'}
 
-        enabled = [item for item in collection if item.enabled]
+        enabled = [item for item in measurements.defined(collection)
+                   if item.enabled]
         props.measurement_running = True
         started = time.perf_counter()
         lines = []
@@ -2489,6 +2604,8 @@ class BSMT_OT_clear_measurement_results(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_measurement_results"
     bl_label = "Clear Results"
+    bl_description = ("Forget every calculated result. The measurements"
+                      " themselves are kept")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -2512,7 +2629,9 @@ class BSMT_OT_refresh_measurements(bpy.types.Operator):
     geometry and metric"""
 
     bl_idname = "bsmt.refresh_measurements"
-    bl_label = "Refresh Status"
+    bl_label = "Refresh"
+    bl_description = ("Re-check every measurement against the current"
+                      " landmarks, geometry and scale")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -2552,6 +2671,8 @@ class BSMT_OT_save_measurement_template(bpy.types.Operator):
 
     bl_idname = "bsmt.save_measurement_template"
     bl_label = "Save Measurement Template"
+    bl_description = ("Save the measurement definitions to a JSON file."
+                      " Results are not saved")
     bl_options = {'REGISTER'}
 
     filepath: StringProperty(subtype='FILE_PATH')
@@ -2622,6 +2743,8 @@ class BSMT_OT_load_measurement_template(bpy.types.Operator):
 
     bl_idname = "bsmt.load_measurement_template"
     bl_label = "Load Measurement Template"
+    bl_description = ("Load measurement definitions from a JSON file. No"
+                      " results are loaded")
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: StringProperty(subtype='FILE_PATH')
@@ -2721,7 +2844,7 @@ class BSMT_OT_load_measurement_template(bpy.types.Operator):
 # ---------------------------------------------------------------------------
 #
 # A surface PATH is never computed as a side effect. Not by Calculate
-# Selected, not by Calculate All Defined, not by creating a measurement, not
+# Selected, not by Calculate All, not by creating a measurement, not
 # by picking a landmark, and not by switching a display mode on. It happens
 # only when the operator below is pressed, because it needs the unbounded
 # geodesicDistance() query - tens of seconds at scan scale (sect. 5.1b).
@@ -2737,6 +2860,9 @@ class BSMT_OT_compute_surface_path(bpy.types.Operator):
 
     bl_idname = "bsmt.compute_surface_path"
     bl_label = "Compute Surface Path"
+    bl_description = ("Compute the exact geodesic path for the selected"
+                      " measurement. This runs the unbounded solve and may"
+                      " block Blender for tens of seconds")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -2916,7 +3042,9 @@ class BSMT_OT_refresh_visualization(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.refresh_visualization"
-    bl_label = "Refresh Visualization"
+    bl_label = "Refresh Display"
+    bl_description = ("Redraw the measurements from what is already computed."
+                      " Nothing is recalculated")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -2935,7 +3063,9 @@ class BSMT_OT_clear_visualization(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.clear_visualization"
-    bl_label = "Clear Selected Visualization"
+    bl_label = "Clear Selected"
+    bl_description = ("Remove the selected measurement's lines from the"
+                      " viewport. The cached path is kept")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -2965,7 +3095,9 @@ class BSMT_OT_clear_all_visualizations(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.clear_all_visualizations"
-    bl_label = "Clear All Measurement Visualizations"
+    bl_label = "Clear All"
+    bl_description = ("Remove every measurement line from the viewport."
+                      " Cached paths are kept")
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -3008,7 +3140,7 @@ def log_solver_target(label, obj, canonical):
         # Informational ONLY. Provenance never redirects a measurement back
         # to the source scan; the authoritative object is the one the
         # SurfacePoints were picked on.
-        print("[BSMT]   note      : measurement copy of '%s' (informational)"
+        print("[BSMT]   note      : measurement mesh of '%s' (informational)"
               % provenance.source_name)
 
 
@@ -3053,7 +3185,9 @@ class BSMT_OT_create_measurement_copy(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.create_measurement_copy"
-    bl_label = "Create Measurement Copy"
+    bl_label = "Create Measurement Mesh"
+    bl_description = ("Create a lighter textured copy of the active scan to"
+                      " measure on. The source scan is never modified")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -3080,7 +3214,7 @@ class BSMT_OT_create_measurement_copy(bpy.types.Operator):
         if getattr(source, "bsmt_scan", None) is not None \
                 and source.bsmt_scan.is_measurement_copy:
             self.report({'ERROR'},
-                        "BSMT: '%s' is already a measurement copy. Select the "
+                        "BSMT: '%s' is already a measurement mesh. Select the "
                         "original scan." % source.name)
             return {'CANCELLED'}
 
@@ -3123,7 +3257,7 @@ class BSMT_OT_create_measurement_copy(bpy.types.Operator):
             return {'CANCELLED'}
 
         lines.append("Plan: %s" % step["summary"])
-        print("[BSMT] measurement copy of '%s': %s"
+        print("[BSMT] measurement mesh of '%s': %s"
               % (source.name, step["summary"]))
 
         # --- duplicate, then decimate the COPY ----------------------------
@@ -3265,7 +3399,9 @@ class BSMT_OT_toggle_measurement_copy(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.toggle_measurement_copy"
-    bl_label = "Toggle Original / Measurement Copy"
+    bl_label = "Toggle Source / Measurement Mesh"
+    bl_description = ("Show the source scan or its measurement mesh, one at a"
+                      " time")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -3301,6 +3437,7 @@ class BSMT_OT_clear_preprocess_report(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_preprocess_report"
     bl_label = "Clear Report"
+    bl_description = "Clear the preprocessing report. No object is touched"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -3336,8 +3473,8 @@ def _repair_target(context):
         return None, "'%s' is a BSMT helper, not a scan" % obj.name
     provenance = getattr(obj, "bsmt_scan", None)
     if provenance is None or not provenance.is_measurement_copy:
-        return None, ("'%s' is not a measurement copy. Repairs run only on a "
-                      "copy created by Scan Preprocessing, so the source scan "
+        return None, ("'%s' is not a measurement mesh. Repairs run only on a "
+                      "mesh created by Scan Preprocessing, so the source scan "
                       "is never modified." % obj.name)
     return obj, ""
 
@@ -3465,7 +3602,9 @@ class BSMT_OT_analyse_repair(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.analyse_repair"
-    bl_label = "Analyse Mesh"
+    bl_label = "Analyze Mesh"
+    bl_description = ("Diagnose the selected measurement mesh: non-manifold"
+                      " edges, boundary loops and components. Read-only")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -3504,7 +3643,9 @@ class BSMT_OT_show_non_manifold(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.show_non_manifold"
-    bl_label = "Show Non-Manifold"
+    bl_label = "Show Non-Manifold Edges"
+    bl_description = ("Highlight the non-manifold edges in the viewport."
+                      " Overlay only - the mesh is not modified")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -3547,7 +3688,9 @@ class BSMT_OT_show_boundary_loop(bpy.types.Operator):
     """Highlight the selected boundary loop. Overlay only"""
 
     bl_idname = "bsmt.show_boundary_loop"
-    bl_label = "Show Selected Boundary"
+    bl_label = "Show Boundary"
+    bl_description = ("Highlight the selected boundary loop. Overlay only -"
+                      " the mesh is not modified")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -3596,6 +3739,7 @@ class BSMT_OT_clear_repair_highlight(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_repair_highlight"
     bl_label = "Clear Highlight"
+    bl_description = "Remove the repair highlights. Nothing else is affected"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -3609,7 +3753,8 @@ class _RepairBase(bpy.types.Operator):
 
     bl_options = {'REGISTER', 'UNDO'}
 
-    def _guarded(self, context, action, work, detail=""):
+    def _guarded(self, context, action, work, detail="",
+                 require_nonmanifold_decrease=False):
         props = state.get_props(context)
         obj, reason = _repair_target(context)
         if obj is None:
@@ -3654,8 +3799,9 @@ class _RepairBase(bpy.types.Operator):
         texture_ok, _problems, _facts = meshrepair.verify_texture(
             obj, before_texture)
         after_probe = dict(_canonical_arrays(context, props, obj).topology or {})
-        accepted, why = repair.accept_repair(before_report, after_probe,
-                                             texture_ok)
+        accepted, why = repair.accept_repair(
+            before_report, after_probe, texture_ok,
+            require_nonmanifold_decrease=require_nonmanifold_decrease)
         if not accepted:
             meshrepair.restore_backup(obj, backup)
             _analyse_repair(context, props, obj)
@@ -3695,7 +3841,9 @@ class BSMT_OT_fill_boundary_loop(_RepairBase):
     """
 
     bl_idname = "bsmt.fill_boundary_loop"
-    bl_label = "Fill Selected Boundary"
+    bl_label = "Fill Selected Hole"
+    bl_description = ("Fill the selected boundary loop with triangles."
+                      " Accepted only if it does not make the topology worse")
 
     @classmethod
     def poll(cls, context):
@@ -3734,7 +3882,9 @@ class BSMT_OT_remove_small_component(_RepairBase):
     """
 
     bl_idname = "bsmt.remove_small_component"
-    bl_label = "Remove Selected Component"
+    bl_label = "Delete Component"
+    bl_description = ("Delete the selected connected component. Only ever"
+                      " removes what is listed")
 
     @classmethod
     def poll(cls, context):
@@ -3783,6 +3933,7 @@ class BSMT_OT_remove_duplicate_faces(_RepairBase):
 
     bl_idname = "bsmt.remove_duplicate_faces"
     bl_label = "Remove Duplicate Faces"
+    bl_description = "Delete faces that exactly repeat another face"
 
     @classmethod
     def poll(cls, context):
@@ -3798,7 +3949,8 @@ class BSMT_OT_remove_duplicate_faces(_RepairBase):
             removed = meshrepair.remove_duplicate_faces(obj, duplicates)
             return "%d duplicate face(s) removed" % removed
 
-        return self._guarded(context, "Remove duplicate faces", work)
+        return self._guarded(context, "Remove duplicate faces", work,
+                             require_nonmanifold_decrease=True)
 
 
 class BSMT_OT_weld_non_manifold(_RepairBase):
@@ -3811,6 +3963,8 @@ class BSMT_OT_weld_non_manifold(_RepairBase):
 
     bl_idname = "bsmt.weld_non_manifold"
     bl_label = "Weld Non-Manifold Region"
+    bl_description = ("Merge coincident vertices at the non-manifold edges"
+                      " only. The rest of the mesh is untouched")
 
     @classmethod
     def poll(cls, context):
@@ -3838,7 +3992,8 @@ class BSMT_OT_weld_non_manifold(_RepairBase):
             return ("%d vertex/vertices merged at %d non-manifold edge(s), "
                     "tolerance %.4f mm" % (merged, edges.shape[0], distance_mm))
 
-        return self._guarded(context, "Weld non-manifold region", work)
+        return self._guarded(context, "Weld non-manifold region", work,
+                             require_nonmanifold_decrease=True)
 
 
 class BSMT_OT_auto_repair_local(_RepairBase):
@@ -3852,7 +4007,10 @@ class BSMT_OT_auto_repair_local(_RepairBase):
     """
 
     bl_idname = "bsmt.auto_repair_local"
-    bl_label = "Auto Repair Local Defects"
+    bl_label = "Repair Local Defects"
+    bl_description = ("Repair small, local non-manifold artefacts one at a"
+                      " time, reverting any step that does not improve the"
+                      " topology")
 
     #: Hard stop on iterations. Each accepted step must strictly reduce the
     #: non-manifold count, so the loop is bounded anyway; this is a guard
@@ -4105,7 +4263,9 @@ class BSMT_OT_auto_repair_boundaries(_RepairBase):
     """
 
     bl_idname = "bsmt.auto_repair_boundaries"
-    bl_label = "Auto Repair Tiny Boundaries"
+    bl_label = "Fill Small Holes"
+    bl_description = ("Fill only the small boundary loops. Large openings,"
+                      " such as a cropped bottom, are left alone")
 
     @classmethod
     def poll(cls, context):
@@ -4178,7 +4338,9 @@ class BSMT_OT_restore_repair_backup(bpy.types.Operator):
     """Restore the mesh as it was before the last repair"""
 
     bl_idname = "bsmt.restore_repair_backup"
-    bl_label = "Restore Backup"
+    bl_label = "Undo Repair"
+    bl_description = ("Restore the mesh exactly as it was before the last"
+                      " repair")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -4209,6 +4371,7 @@ class BSMT_OT_clear_repair_report(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_repair_report"
     bl_label = "Clear Repair Report"
+    bl_description = "Clear the repair analysis and log. No mesh is touched"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -4283,7 +4446,9 @@ class BSMT_OT_pick_alignment_reference(bpy.types.Operator):
     """Pick one anatomical alignment reference on the surface"""
 
     bl_idname = "bsmt.pick_alignment_reference"
-    bl_label = "Pick Alignment Reference"
+    bl_label = "Pick Reference Point"
+    bl_description = ("Click a point on the mesh surface to set this"
+                      " anatomical reference")
     bl_options = {'REGISTER'}
 
     slot: EnumProperty(
@@ -4311,7 +4476,8 @@ class BSMT_OT_clear_alignment_references(bpy.types.Operator):
     """Forget the four alignment references. No object is moved"""
 
     bl_idname = "bsmt.clear_alignment_references"
-    bl_label = "Clear References"
+    bl_label = "Clear Reference Points"
+    bl_description = "Forget the four reference points. No object is moved"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -4332,6 +4498,8 @@ class BSMT_OT_manual_align(bpy.types.Operator):
 
     bl_idname = "bsmt.manual_align"
     bl_label = "Manual Align"
+    bl_description = ("Rotate the object about a world axis, or move it to"
+                      " the world origin. The mesh is not modified")
     bl_options = {'REGISTER', 'UNDO'}
 
     axis: EnumProperty(
@@ -4392,7 +4560,9 @@ class BSMT_OT_preview_alignment(bpy.types.Operator):
     """
 
     bl_idname = "bsmt.preview_alignment"
-    bl_label = "Preview Alignment"
+    bl_label = "Preview"
+    bl_description = ("Draw the anatomical axes the current reference points"
+                      " would produce. Nothing is moved")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -4439,6 +4609,7 @@ class BSMT_OT_clear_alignment_preview(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_alignment_preview"
     bl_label = "Clear Preview"
+    bl_description = "Remove the preview axes"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -4474,6 +4645,9 @@ class BSMT_OT_apply_alignment(bpy.types.Operator):
 
     bl_idname = "bsmt.apply_alignment"
     bl_label = "Apply Alignment"
+    bl_description = ("Rotate the object so its anatomical axes match the"
+                      " world axes. Object transform only - the mesh is never"
+                      " modified")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -4558,6 +4732,8 @@ class BSMT_OT_flip_front_back(bpy.types.Operator):
 
     bl_idname = "bsmt.flip_front_back"
     bl_label = "Flip Front / Back"
+    bl_description = ("Turn the object 180 degrees about Z. Use this if the"
+                      " subject's left and right ended up swapped")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -4599,6 +4775,7 @@ class BSMT_OT_reset_alignment(bpy.types.Operator):
 
     bl_idname = "bsmt.reset_alignment"
     bl_label = "Reset Alignment"
+    bl_description = "Restore the object transform recorded before alignment"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -4632,6 +4809,7 @@ class BSMT_OT_clear_topology(bpy.types.Operator):
 
     bl_idname = "bsmt.clear_topology"
     bl_label = "Clear Report"
+    bl_description = "Clear the topology report. No mesh is touched"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
@@ -4669,6 +4847,7 @@ classes = (
     BSMT_OT_save_protocol,
     BSMT_OT_load_protocol,
     BSMT_OT_add_measurement,
+    BSMT_OT_cancel_measurement_draft,
     BSMT_OT_remove_measurement,
     BSMT_OT_clear_measurements,
     BSMT_OT_remove_invalid_measurements,

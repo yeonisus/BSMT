@@ -51,7 +51,7 @@ METHOD_COPY = 'COPY_ONLY'
 #: are not identical to the original's. Never described as "the same exact
 #: surface"; the sensitivity of surface distance to mesh density is a separate
 #: question that has to be measured, not assumed.
-REPRESENTATION = "decimated measurement representation"
+REPRESENTATION = "Decimated copy, made for measurement"
 
 COPY_SUFFIX = "_BSMT"
 
@@ -83,7 +83,7 @@ def decimation_ratio(target_triangles, current_triangles):
 
 
 def plan(target_triangles, current_triangles):
-    """What Create Measurement Copy is about to do."""
+    """What Create Measurement Mesh is about to do."""
     ratio = decimation_ratio(target_triangles, current_triangles)
     target = int(target_triangles)
     current = int(current_triangles)
@@ -95,8 +95,9 @@ def plan(target_triangles, current_triangles):
             "current_triangles": current,
             "expected_triangles": current,
             "reduction_percent": 0.0,
-            "summary": ("target %d is not below the current %d - copying "
-                        "without decimation" % (target, current)),
+            "summary": ("The target of {:,} is not below the current {:,}, "
+                        "so the mesh will be copied without "
+                        "decimation.".format(target, current)),
         }
     return {
         "method": METHOD_DECIMATE,
@@ -105,9 +106,9 @@ def plan(target_triangles, current_triangles):
         "current_triangles": current,
         "expected_triangles": target,
         "reduction_percent": 100.0 * (1.0 - ratio),
-        "summary": ("decimate %d -> about %d triangles (ratio %.5f, %.1f%% "
-                    "reduction)" % (current, target, ratio,
-                                    100.0 * (1.0 - ratio))),
+        "summary": ("Decimate {:,} to about {:,} triangles "
+                    "({:.1f}% reduction).".format(
+                        current, target, 100.0 * (1.0 - ratio))),
     }
 
 
@@ -119,8 +120,8 @@ def accuracy_note(actual_triangles, target_triangles, tolerance=0.05):
         return "", True
     error = abs(actual - target) / float(target)
     within = error <= tolerance
-    return ("%d triangles, %.1f%% from the %d requested"
-            % (actual, 100.0 * error, target)), within
+    return ("{:,} triangles, {:.1f}% from the {:,} requested".format(
+        actual, 100.0 * error, target)), within
 
 
 # ---------------------------------------------------------------------------
@@ -187,16 +188,16 @@ def compare_texture(before, after):
 
 REFUSE_NON_MANIFOLD = (
     "Surface calculation refused: mesh contains %d non-manifold edge(s). "
-    "Run Scan Preprocessing / repair before exact geodesic measurement."
+    "Use the Mesh Repair panel before measuring on this mesh."
 )
 REFUSE_DENSE = (
     "Surface calculation refused: %s triangles exceeds the %s safety "
-    "threshold. Create a measurement copy first, or untick the density guard "
+    "threshold. Create a measurement mesh first, or untick the density guard "
     "to proceed anyway."
 )
 WARN_DENSE = (
     "High-density mesh: exact geodesic computation may be slow or unstable. "
-    "Create a measurement copy first. (%s triangles, threshold %s.)"
+    "Create a measurement mesh first. (%s triangles, threshold %s.)"
 )
 WARN_COMPONENTS = (
     "This mesh has %d connected components. Measurement is still allowed; a "
@@ -283,7 +284,7 @@ _COMPARISON_ROWS = (
 
 
 def format_comparison(before, after, before_label="Original",
-                      after_label="Measurement Copy"):
+                      after_label="Measurement Mesh"):
     """Before / after diagnostics as aligned lines."""
     lines = ["%-22s %14s %14s" % ("", before_label, after_label)]
     for label, key in _COMPARISON_ROWS:

@@ -748,18 +748,36 @@ def is_tiny_boundary(loop):
 # acceptance (sect. 6)
 # ---------------------------------------------------------------------------
 
-def accept_repair(before, after, texture_ok, new_boundary_limit=MAX_PATCH_EDGES):
+def accept_repair(before, after, texture_ok, new_boundary_limit=MAX_PATCH_EDGES,
+                  require_nonmanifold_decrease=False):
     """Should a completed repair be kept? Returns (accept, reasons).
 
     Every criterion must hold. A repair that fails any of them is reverted, so
-    a failed attempt can never be left behind in the measurement copy.
+    a failed attempt can never be left behind in the measurement mesh.
+
+    `require_nonmanifold_decrease` belongs only to the repairs whose PURPOSE
+    is to remove non-manifold edges - the local weld and duplicate-face
+    removal. For those, leaving the count unchanged means the repair did not
+    do what it was asked to, and the edit is not worth keeping.
+
+    It is off by default, and that default matters. Filling a hole, deleting a
+    stray component and filling small boundaries are not about non-manifold
+    edges at all: on a mesh that is already clean they leave the count at 0,
+    which is the correct outcome, not a failure. Requiring a strict decrease
+    everywhere made every one of those operations impossible the moment the
+    topology became good - which is exactly when a researcher reaches for
+    them. The rule for them is the honest one: do not make it worse.
     """
     reasons = []
     nm_before = int(before.get("nonmanifold_edge_count", 0) or 0)
     nm_after = int(after.get("nonmanifold_edge_count", 0) or 0)
-    if nm_after >= nm_before:
-        reasons.append("non-manifold edges did not decrease (%d -> %d)"
-                       % (nm_before, nm_after))
+    if require_nonmanifold_decrease:
+        if nm_after >= nm_before:
+            reasons.append("non-manifold edges did not decrease (%d -> %d)"
+                           % (nm_before, nm_after))
+    elif nm_after > nm_before:
+        reasons.append("it created %d new non-manifold edge(s) (%d -> %d)"
+                       % (nm_after - nm_before, nm_before, nm_after))
 
     boundary_before = int(before.get("boundary_edge_count", 0) or 0)
     boundary_after = int(after.get("boundary_edge_count", 0) or 0)

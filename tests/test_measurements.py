@@ -71,9 +71,25 @@ class FakeLandmark(object):
 
 
 class FakeDefinition(object):
-    def __init__(self, measurement_type, enabled=True):
+    """A COMPLETE definition unless told otherwise.
+
+    Milestone 3.7: a row with unset or identical endpoints is a draft, not a
+    measurement, so the default here has to be two different landmarks - the
+    batch counts are about real measurements.
+    """
+
+    _next = [100]
+
+    def __init__(self, measurement_type, enabled=True, source=None,
+                 target=None):
         self.measurement_type = measurement_type
         self.enabled = enabled
+        if source is None and target is None:
+            source = FakeDefinition._next[0]
+            target = source + 1
+            FakeDefinition._next[0] += 2
+        self.source_stable_id = source or 0
+        self.target_stable_id = target or 0
 
 
 def registry(*landmarks_in):
@@ -145,7 +161,7 @@ def test_reference_resolution():
     )
     check("a deleted target gives INVALID_REFERENCE",
           status == measurements.STATUS_INVALID_REFERENCE, status)
-    check("the detail names the missing end", "target" in detail, detail)
+    check("the detail names the missing end", "To" in detail, detail)
     check("the detail does not name a substitute", "Neck_F" not in detail, detail)
 
 
@@ -168,8 +184,9 @@ def test_readiness():
 
     check("both valid -> READY",
           status_of(valid_a, valid_b) == measurements.STATUS_READY)
+    unpicked_two = FakeLandmark(7, "G", landmarks.STATUS_NOT_PICKED)
     check("both not picked -> NOT_READY",
-          status_of(unpicked, unpicked) == measurements.STATUS_NOT_READY)
+          status_of(unpicked, unpicked_two) == measurements.STATUS_NOT_READY)
     check("one not picked -> NOT_READY",
           status_of(valid_a, unpicked) == measurements.STATUS_NOT_READY)
     check("a stale landmark -> STALE",
@@ -180,27 +197,48 @@ def test_readiness():
           status_of(valid_a, needs) == measurements.STATUS_NOT_READY)
     check("an INVALID landmark -> STALE",
           status_of(valid_a, invalid) == measurements.STATUS_STALE)
-    check("missing source -> INVALID_REFERENCE",
-          status_of(None, valid_b) == measurements.STATUS_INVALID_REFERENCE)
-    check("missing target -> INVALID_REFERENCE",
-          status_of(valid_a, None) == measurements.STATUS_INVALID_REFERENCE)
-    check("both missing -> INVALID_REFERENCE",
-          status_of(None, None) == measurements.STATUS_INVALID_REFERENCE)
+    # Milestone 3.7 separates "never chosen" from "chosen but gone". A stable
+    # id of 0 means the researcher has not picked that end yet, which is a
+    # DRAFT; a non-zero id that no longer resolves is a broken reference.
+    check("an unresolvable source -> INVALID_REFERENCE",
+          measurements.readiness(None, valid_b, 99, 2)
+          == (measurements.STATUS_INVALID_REFERENCE,
+              "missing From (landmark id 99)"))
+    check("an unresolvable target -> INVALID_REFERENCE",
+          measurements.readiness(valid_a, None, 1, 99)[0]
+          == measurements.STATUS_INVALID_REFERENCE)
+    check("both unresolvable -> INVALID_REFERENCE",
+          measurements.readiness(None, None, 98, 99)[0]
+          == measurements.STATUS_INVALID_REFERENCE)
+    check("an UNSET source -> DRAFT, not a broken reference",
+          status_of(None, valid_b) == measurements.STATUS_DRAFT)
+    check("an UNSET target -> DRAFT",
+          status_of(valid_a, None) == measurements.STATUS_DRAFT)
+    check("neither chosen -> DRAFT",
+          status_of(None, None) == measurements.STATUS_DRAFT)
 
-    check("A -> A is READY, not an error",
-          status_of(valid_a, valid_a) == measurements.STATUS_READY)
+    # Milestone 3.7 (sect. 7): a measurement needs two DIFFERENT landmarks.
+    # A -> A used to be reported READY on the reasoning that its answer is
+    # exactly zero; the researcher asked for it to be treated as an
+    # unfinished definition instead, so it is now a DRAFT and is never
+    # calculated, never named and never listed as a result.
+    status, detail = measurements.readiness(valid_a, valid_a, 1, 1)
+    check("A -> A is a DRAFT, not a measurement",
+          status == measurements.STATUS_DRAFT, status)
+    check("and it says why", "same landmark" in detail, detail)
 
     _s, detail = measurements.readiness(valid_a, unpicked, 1, 3)
     check("the detail names the landmark", "'C'" in detail, detail)
-    check("the detail says which end", "target" in detail, detail)
+    check("the detail says which end", "To" in detail, detail)
     _s, detail = measurements.readiness(needs, valid_b, 5, 2)
     check("needs-refresh tells the user what to do",
-          "Validate All" in detail, detail)
+          "Validate Landmarks" in detail, detail)
 
 
 def test_status_tables():
     print("\n[status] the status tables are complete and consistent")
-    check("seven statuses", len(measurements.STATUS_ORDER) == 7)
+    check("eight statuses", len(measurements.STATUS_ORDER) == 8,
+          len(measurements.STATUS_ORDER))
     check("enum items cover every status",
           {item[0] for item in measurements.STATUS_ITEMS}
           == set(measurements.STATUS_ORDER))
@@ -208,8 +246,8 @@ def test_status_tables():
           all(s in measurements.STATUS_ICONS for s in measurements.STATUS_ORDER))
     check("every status has a short label",
           all(s in measurements.STATUS_SHORT for s in measurements.STATUS_ORDER))
-    for name in ("NOT_READY", "READY", "CALCULATING", "VALID", "STALE",
-                 "INVALID_REFERENCE", "FAILED"):
+    for name in ("DRAFT", "NOT_READY", "READY", "CALCULATING", "VALID",
+                 "STALE", "INVALID_REFERENCE", "FAILED"):
         check("status %s exists" % name,
               getattr(measurements, "STATUS_" + name, None) == name)
 
@@ -250,12 +288,29 @@ def test_batch_plan_counts_only_enabled_definitions():
     )
     plan = measurements.batch_plan(definitions)
     check("total is 12", plan["total"] == 12)
+    check("all 12 are real measurements", plan["defined"] == 12)
+    check("none is a draft", plan["drafts"] == 0)
     check("enabled is 12", plan["enabled"] == 12)
     check("8 require surface", plan["surface"] == 8, str(plan["surface"]))
     check("4 straight-only", plan["straight_only"] == 4)
-    check("summary matches the brief's wording",
-          plan["summary"] == "12 enabled measurements, 8 require surface "
-                             "distance, 4 straight-only", plan["summary"])
+    check("the summary says what will actually run",
+          plan["summary"] == "12 measurements will be calculated: 8 with "
+                             "surface distance, 4 straight only",
+          plan["summary"])
+
+    # Sect. 6: an unfinished row is counted as a draft and never as work.
+    with_draft = definitions + [FakeDefinition("BOTH", source=0, target=0),
+                                FakeDefinition("BOTH", source=5, target=5)]
+    plan_draft = measurements.batch_plan(with_draft)
+    check("drafts are counted separately", plan_draft["drafts"] == 2,
+          plan_draft["drafts"])
+    check("and add nothing to the work", plan_draft["enabled"] == 12,
+          plan_draft["enabled"])
+    check("nor to the surface count", plan_draft["surface"] == 8)
+    check("only drafts means nothing to calculate",
+          measurements.batch_plan(
+              [FakeDefinition("BOTH", source=0, target=0)])["summary"]
+          == "Nothing to calculate")
 
     definitions[0].enabled = False
     definitions[8].enabled = False
@@ -491,6 +546,7 @@ def test_unresolved_reference_stays_explicit():
             source, target,
             source.stable_id if source else 0,
             target.stable_id if target else 0,
+            entry["from_landmark_id"], entry["to_landmark_id"],
         )
         resolved.append(status)
     check("definitions with a missing end are INVALID_REFERENCE",
@@ -623,9 +679,13 @@ def test_auto_name_generation():
     check("works for arbitrary researcher names",
           measurements.default_name("Shoulder_L", "Waist_F")
           == "Shoulder_L to Waist_F")
-    check("a missing end is marked, not invented",
-          measurements.default_name("", "P02") == "? to P02")
-    check("both missing", measurements.default_name("", "") == "? to ?")
+    # Milestone 3.7 (sect. 7): an incomplete definition gets NO name at all.
+    # "? to P02" would put a meaningless label in the list and, eventually,
+    # in an exported record.
+    check("a missing end gives no name at all",
+          measurements.default_name("", "P02") == "",
+          repr(measurements.default_name("", "P02")))
+    check("both missing gives no name", measurements.default_name("", "") == "")
     check("non-ascii names survive",
           measurements.default_name("\ubaa9_\uc55e", "\ud5c8\ub9ac")
           == "\ubaa9_\uc55e to \ud5c8\ub9ac")

@@ -995,6 +995,104 @@ def test_landmark_modules_are_pure(bsmt):
           "fill_surface_point(" in state_source)
 
 
+def test_ui_wording_is_consistent(bsmt):
+    """Milestone 3.7: one word per concept, everywhere the user can see it.
+
+    Static, because it has to hold for strings no acceptance run happens to
+    display - an error path, a rarely reached warning. Every check here is
+    about USER-VISIBLE text only; comments and docstrings are left alone.
+    """
+    import os as _os
+    import re as _re
+
+    print("\nUI wording and terminology (Milestone 3.7)")
+    panels_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                     "panels.py")).read()
+    ops_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                  "operators.py")).read()
+
+    # Every operator carries a concise tooltip of its own. Without one Blender
+    # falls back to the whole docstring, which for the repair operators is
+    # several paragraphs long and unreadable in a tooltip.
+    labels = _re.findall(r'bl_label = "([^"]*)"', ops_text)
+    descriptions = _re.findall(r'bl_description = ', ops_text)
+    check("every operator has a bl_description",
+          len(descriptions) == len(labels),
+          "%d labels, %d descriptions" % (len(labels), len(descriptions)))
+
+    for text, source in (("Calculate All Defined", "old batch label"),
+                         ("Pick Selected", "context-dependent label"),
+                         ("Re-pick", "hyphenated repick")):
+        check("no operator label says %r (%s)" % (text, source),
+              text not in labels, [l for l in labels if text in l])
+
+    # One vocabulary. These are checked against user-visible strings only, so
+    # the surrounding code may still say whatever reads best in context.
+    def visible_strings(source):
+        found = []
+        for pattern in (r'text="([^"]*)"', r'bl_label = "([^"]*)"',
+                        r'bl_description = \("?([^"]*)"?',
+                        r'name="([^"]*)"'):
+            found.extend(_re.findall(pattern, source))
+        return found
+
+    strings = visible_strings(panels_text) + visible_strings(ops_text)
+    banned = {
+        "measurement copy": "use 'measurement mesh'",
+        "Measurement Copy": "use 'Measurement Mesh'",
+        "Analyse": "US spelling in the UI",
+        "Visualise": "US spelling in the UI",
+        "Colour": "US spelling in the UI",
+        "None to None": "a draft is never named",
+    }
+    for token, why in banned.items():
+        offenders = [text for text in strings if token in text]
+        check("no visible string says %r (%s)" % (token, why),
+              not offenders, offenders[:3])
+
+    # Sect. 3: the action buttons in the two managers name what they act on.
+    for expected in ('text="Add Landmark"', 'text="Add Measurement"',
+                     'text="Clear Reference Points"'):
+        check("the panel uses %s" % expected, expected in panels_text)
+
+    # Sect. 6/9: a draft is never treated as a measurement.
+    check("the results list draws only defined measurements",
+          "state.defined_measurements(collection)" in panels_text)
+    check("the empty state is a message, not a blank row",
+          "No measurements defined." in panels_text)
+    check("Add reuses a trailing draft rather than stacking another",
+          "trailing_draft_index" in ops_text)
+    check("Calculate All filters drafts out",
+          "measurements.defined(collection)" in ops_text)
+
+    # Sect. 12: the residual bands are labelled as guidance.
+    align_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                    "alignment.py")).read()
+    check("the residual bands are marked UI-guidance-only",
+          "UI GUIDANCE ONLY" in align_text)
+    check("and the panel says so to the user",
+          "not a validated threshold" in panels_text)
+
+    # Sect. 10: widening the display scope must not be able to solve anything.
+    viz_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                  "viz.py")).read()
+    for forbidden in ("registry.bounded_distance", "surface_path(",
+                      "solve."):
+        check("viz.py never calls %s" % forbidden, forbidden not in viz_text)
+    check("the scope is a three-way choice",
+          all(scope in viz_text
+              for scope in ("'SELECTED'", "'ENABLED'", "'TICKED'")))
+    check("and drafts are never drawn",
+          "measurement_is_draft" in viz_text)
+
+    readiness_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                        "readiness.py")).read()
+    check("the readiness module imports nothing at all",
+          not _re.search(r"^\s*(import|from)\s", readiness_text, _re.M),
+          _re.findall(r"^\s*(?:import|from)\s.*", readiness_text, _re.M))
+    check("readiness is loaded", hasattr(bsmt, "readiness"))
+
+
 def main():
     print("BSMT import regression tests (stubbed bpy, no Blender)")
     install_stubs()
@@ -1010,6 +1108,7 @@ def main():
     test_extract_binds_submodules_directly(bsmt)
     test_landmark_modules_are_pure(bsmt)
     test_register_smoke(bsmt)
+    test_ui_wording_is_consistent(bsmt)
     test_broken_extract_module()
 
     print("\n%d checks, %d failure(s)" % (CHECKS[0], len(FAILURES)))

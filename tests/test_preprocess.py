@@ -103,7 +103,9 @@ def test_plan_never_reduces_when_not_asked():
           abs(step["reduction_percent"] - 87.42) < 0.1,
           "%.2f" % step["reduction_percent"])
     check("the summary names both counts",
-          "2783068" in step["summary"] and "350000" in step["summary"],
+          "2,783,068" in step["summary"] and "350,000" in step["summary"],
+          step["summary"])
+    check("and reads as a sentence", step["summary"].endswith("."),
           step["summary"])
 
     for target in (314086, 400000, 10 ** 7):
@@ -134,7 +136,8 @@ def test_accuracy_note():
     note, within = preprocess.accuracy_note(347912, 350000)
     check("a near miss is within tolerance", within, note)
     check("the note gives both numbers",
-          "347912" in note.replace(",", "") and "350000" in note, note)
+          "347912" in note.replace(",", "")
+          and "350000" in note.replace(",", ""), note)
     _note, within = preprocess.accuracy_note(200000, 350000)
     check("a large miss is flagged", not within)
 
@@ -216,8 +219,8 @@ def test_gate_refuses_non_manifold():
     check("non-manifold is refused", not bad["allowed"])
     check("the count is in the message", "7 non-manifold" in bad["refusals"][0],
           bad["refusals"][0])
-    check("the message says what to do",
-          "Scan Preprocessing" in bad["refusals"][0])
+    check("the message names the panel that fixes it",
+          "Mesh Repair" in bad["refusals"][0], bad["refusals"][0])
     check("it is a refusal, not a warning", bad["refusals"] and bad["message"])
 
     # It cannot be overridden by the density switch: that guard is a
@@ -246,8 +249,9 @@ def test_gate_density_threshold():
     check("the warning is the brief's wording",
           "may be slow or unstable" in unguarded["warnings"][0],
           unguarded["warnings"][0])
-    check("and suggests a measurement copy",
-          "measurement copy" in unguarded["warnings"][0])
+    check("and suggests a measurement mesh",
+          "measurement mesh" in unguarded["warnings"][0],
+          unguarded["warnings"][0])
 
     # The validated 314k scan must pass cleanly at the default threshold.
     ok = preprocess.preflight(report(triangle_count=314086))
@@ -294,8 +298,12 @@ def test_gate_warns_without_refusing():
 
 def test_representation_is_honest():
     print("\n[report] the copy is a representation, not the same surface")
-    check("the wording is 'decimated measurement representation'",
-          preprocess.REPRESENTATION == "decimated measurement representation")
+    check("the wording says it is a decimated copy",
+          "Decimated copy" in preprocess.REPRESENTATION,
+          preprocess.REPRESENTATION)
+    check("and says what it is for",
+          "measurement" in preprocess.REPRESENTATION.lower(),
+          preprocess.REPRESENTATION)
     check("it never claims the same exact surface",
           "same exact surface" not in preprocess.REPRESENTATION)
     record = {
@@ -323,7 +331,7 @@ def test_comparison_table():
     lines = preprocess.format_comparison(before, after)
     text = "\n".join(lines)
     check("both labels appear",
-          "Original" in text and "Measurement Copy" in text)
+          "Original" in text and "Measurement Mesh" in text, text[:120])
     for needed in ("1,391,542", "2,783,068", "347,912", "174,000"):
         check("the table shows %r" % needed, needed in text)
     check("every diagnostic row is present",

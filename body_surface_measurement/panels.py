@@ -1,15 +1,33 @@
-"""Sidebar UI: View3D > Sidebar (N) > BSMT > Body Measurement."""
+"""Sidebar UI: View3D > Sidebar (N) > BSMT.
+
+User-visible wording follows one vocabulary throughout (Milestone 3.7):
+
+    Landmark            a named point the researcher places on the surface
+    Reference Point     one of the four anatomical references used to align
+    Point A / Point B   the two ad-hoc points of Quick Measure, which is a
+                        separate tool from the Landmark Manager
+    Source Mesh         the imported scan, which BSMT never modifies
+    Measurement Mesh    the lighter textured copy measurements run on
+    Straight Distance   the straight line between two landmarks
+    Surface Distance    the exact geodesic distance across the surface
+    Surface Path        the polyline that distance follows
+    Calculate           produce a distance
+    Compute             produce a surface path
+
+Spelling is US English in the UI ("Analyze", "Color", "Visualization") even
+where the code around it is written in British English.
+"""
 
 import math
 
 import bpy
 
 from . import (alignment, geodesic, landmarks, measurement, measurements,
-               preprocess, repair, scancopy, state, visualization)
+               preprocess, repair, scancopy, state, visualization, viz)
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
-    bl_label = "Body Measurement"
+    bl_label = "Quick Measure (A to B)"
     bl_idname = "BSMT_PT_body_measurement"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -19,8 +37,10 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
         layout = self.layout
         props = state.get_props(context)
         if props is None:
-            layout.label(text="Add-on state unavailable", icon='ERROR')
+            layout.label(text="BSMT is not registered", icon='ERROR')
             return
+
+        _draw_readiness(context, layout, props)
 
         layout.prop(props, "unit")
 
@@ -62,10 +82,10 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
         box = layout.box()
         if props.distance_valid:
             box.label(
-                text="Straight Distance: %s" % measurement.format_mm(props.distance_mm)
+                text="Straight Distance:  %s" % measurement.format_mm(props.distance_mm)
             )
         else:
-            box.label(text="Straight Distance: --")
+            box.label(text="Straight Distance:  not calculated")
 
         problem = ""
         if props.surface_valid:
@@ -102,7 +122,8 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
         elif props.surface_valid and problem:
             column = box.column(align=True)
             column.scale_y = 0.7
-            column.label(text="Surface Distance:  recompute required", icon='ERROR')
+            column.label(text="Surface Distance:   recalculate needed",
+                         icon='ERROR')
             for line in _wrap(problem, 44):
                 column.label(text="   " + line)
         elif props.surface_status:
@@ -111,7 +132,7 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
             for line in _wrap(props.surface_status, 44):
                 column.label(text=line)
         else:
-            box.label(text="Surface Distance:  --")
+            box.label(text="Surface Distance:   not calculated")
 
         if props.surface_valid or props.surface_status:
             box.operator("bsmt.clear_surface_distance", text="", icon='X')
@@ -148,8 +169,10 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
 
         box = layout.box()
         row = box.row(align=True)
-        row.operator("bsmt.validate_surface_points", text="Validate", icon='FILE_REFRESH')
-        row.operator("bsmt.refresh_helpers", text="Refresh", icon='CON_LOCLIKE')
+        row.operator("bsmt.validate_surface_points", text="Validate Points",
+                     icon='FILE_REFRESH')
+        row.operator("bsmt.refresh_helpers", text="Refresh Markers",
+                     icon='CON_LOCLIKE')
         box.prop(props, "transform_debug")
         box.operator("bsmt.transform_handler_status", icon='INFO')
 
@@ -187,7 +210,7 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
         location = props.point_a if slot == 'A' else props.point_b
         row = layout.row()
         row.label(
-            text="Point %s: %s" % (slot, "Selected" if valid else "Not Selected"),
+            text="Point %s: %s" % (slot, "picked" if valid else "not picked"),
             icon='CHECKMARK' if valid else 'BLANK1',
         )
         if valid:
@@ -197,6 +220,79 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
                 text="   (%.3f, %.3f, %.3f)"
                 % (location[0], location[1], location[2])
             )
+
+
+def _draw_readiness(context, layout, props):
+    """One compact line: can this scan be measured, and if not, why (sect. 13).
+
+    Deliberately a pointer, not a second diagnostics report. It names the
+    first blocker and the panel that explains it; the detail stays where it
+    already lives.
+    """
+    result = state.readiness_snapshot(context, props)
+    row = layout.row(align=True)
+    row.alert = result["blocked"]
+    row.prop(
+        props, "show_readiness",
+        icon='TRIA_DOWN' if props.show_readiness else 'TRIA_RIGHT',
+        emboss=False, text="",
+    )
+    row.label(text=result["headline"], icon=result["icon"])
+    if not props.show_readiness:
+        return result
+    detail = layout.box().column(align=True)
+    detail.scale_y = 0.75
+    if not result["reasons"]:
+        detail.label(text="Topology, landmarks and measurements are all in "
+                          "order.")
+    for entry in result["reasons"]:
+        line = detail.row()
+        line.alert = entry["blocking"]
+        line.label(text="%s%s" % (entry["text"],
+                                  (" - see %s" % entry["panel"])
+                                  if entry["panel"] else ""),
+                   icon='ERROR' if entry["blocking"] else 'DOT')
+    return result
+
+
+def _draw_measurement_target(context, layout, props):
+    """Which mesh measurements actually run on (sect. 11).
+
+    A measurement mesh sits exactly on top of the scan it was copied from, so
+    the two are visually indistinguishable in the viewport. Naming the target
+    here is the only way a researcher can tell which one a result belongs to.
+    """
+    obj, reason = state.measurement_target(context, props)
+    box = layout.box()
+    column = box.column(align=True)
+    column.scale_y = 0.75
+    if obj is None:
+        column.label(text="Measurement Mesh: %s" % reason, icon='ERROR')
+        return
+
+    provenance = getattr(obj, "bsmt_scan", None)
+    is_copy = bool(provenance is not None and provenance.is_measurement_copy)
+    column.label(text="Measurement Mesh: %s" % obj.name,
+                 icon='DUPLICATE' if is_copy else 'MESH_DATA')
+    if is_copy and provenance.source_name:
+        column.label(text="Source Mesh:      %s" % provenance.source_name)
+
+    cached = (geodesic.meshcache.peek(obj.name)
+              if geodesic.MESHCACHE_AVAILABLE else None)
+    if cached is None:
+        column.label(text="Topology:         not analyzed yet")
+        return
+    report = cached.topology or {}
+    column.label(text="Triangles:        {:,}".format(
+        int(report.get("triangle_count", 0) or 0)))
+    non_manifold = int(report.get("nonmanifold_edge_count", 0) or 0)
+    status = column.row()
+    status.alert = non_manifold > 0
+    status.label(
+        text="Topology:         %s"
+             % ("Ready" if non_manifold == 0
+                else "%d non-manifold edge(s)" % non_manifold)
+    )
 
 
 def _wrap(text, width):
@@ -218,7 +314,7 @@ def _wrap(text, width):
 class BSMT_PT_diagnostics(bpy.types.Panel):
     """Read-only mesh topology diagnostics (Phase 2, Milestone 2.0)."""
 
-    bl_label = "Diagnostics"
+    bl_label = "Mesh Diagnostics"
     bl_idname = "BSMT_PT_diagnostics"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -230,12 +326,12 @@ class BSMT_PT_diagnostics(bpy.types.Panel):
         layout = self.layout
         props = state.get_props(context)
         if props is None:
-            layout.label(text="Add-on state unavailable", icon='ERROR')
+            layout.label(text="BSMT is not registered", icon='ERROR')
             return
 
         obj = context.active_object
         name = obj.name if obj is not None else "-"
-        layout.label(text="Active: %s" % name)
+        layout.label(text="Selected: %s" % name)
 
         unavailable = geodesic.diagnostics_error()
         if unavailable:
@@ -252,7 +348,7 @@ class BSMT_PT_diagnostics(bpy.types.Panel):
         layout.operator("bsmt.diagnose_topology", icon='VIEWZOOM')
 
         if not props.topology_valid:
-            layout.label(text="No report yet")
+            layout.label(text="No topology report yet")
             return
 
         row = layout.row()
@@ -273,7 +369,7 @@ class BSMT_PT_diagnostics(bpy.types.Panel):
     @staticmethod
     def _draw_component_preview(layout, props):
         layout.separator()
-        layout.label(text="Component Preview")
+        layout.label(text="Connected Components")
 
         preview_problem = geodesic.preview_error()
         if preview_problem:
@@ -285,7 +381,8 @@ class BSMT_PT_diagnostics(bpy.types.Panel):
             return
 
         row = layout.row(align=True)
-        row.operator("bsmt.visualize_components", text="Visualize", icon='COLOR')
+        row.operator("bsmt.visualize_components", text="Show Components",
+                     icon='COLOR')
         row.operator("bsmt.clear_component_preview", text="Clear", icon='X')
         layout.operator("bsmt.verify_components", icon='CHECKMARK')
 
@@ -302,7 +399,7 @@ class BSMT_PT_diagnostics(bpy.types.Panel):
             return
 
         box = layout.box()
-        box.label(text="Preview of: %s" % props.component_preview_object)
+        box.label(text="Showing: %s" % props.component_preview_object)
 
         row = box.row(align=True)
         show_all = row.operator("bsmt.isolate_component", text="Show All")
@@ -332,7 +429,7 @@ class BSMT_PT_geodesic_backend(bpy.types.Panel):
     Milestone 2.3.
     """
 
-    bl_label = "Geodesic Backend (dev)"
+    bl_label = "Geodesic Backend (Developer)"
     bl_idname = "BSMT_PT_geodesic_backend"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -373,7 +470,7 @@ class BSMT_PT_geodesic_backend(bpy.types.Panel):
                     column.label(text="  " + line)
                 column.label(text="Full traceback: system console")
             column.separator()
-            column.label(text="BSMT and Phase 1 measurement are unaffected.")
+            column.label(text="Straight-line measurement still works.")
             column.label(text="Run Check Environment for the install command.")
 
         layout.operator("bsmt.check_geodesic_env", icon='CONSOLE')
@@ -390,7 +487,7 @@ class BSMT_PT_geodesic_backend(bpy.types.Panel):
             if props.backend_test_dense:
                 warn = layout.column(align=True)
                 warn.scale_y = 0.7
-                warn.label(text="Dense benchmark blocks the UI while it runs.",
+                warn.label(text="The dense benchmark freezes Blender while it runs.",
                            icon='INFO')
 
         if props is None:
@@ -453,10 +550,13 @@ class BSMT_UL_landmarks(bpy.types.UIList):
             )
 
 
+#: Short status text for the landmark list. Kept to one word wherever the
+#: list column allows it, and matched to the vocabulary in the module
+#: docstring: Ready, Stale, Invalid.
 _STATUS_SHORT = {
     landmarks.STATUS_NOT_PICKED: "NOT PICKED",
     landmarks.STATUS_VALID: "VALID",
-    landmarks.STATUS_NEEDS_REFRESH: "REFRESH",
+    landmarks.STATUS_NEEDS_REFRESH: "NEEDS REFRESH",
     landmarks.STATUS_STALE: "STALE",
     landmarks.STATUS_INVALID: "INVALID",
 }
@@ -481,7 +581,7 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         props = state.get_props(context)
         collection = state.get_landmarks(context)
         if props is None or collection is None:
-            layout.label(text="Add-on state unavailable", icon='ERROR')
+            layout.label(text="BSMT is not registered", icon='ERROR')
             return
 
         if props.protocol_name:
@@ -497,8 +597,16 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         )
 
         row = layout.row(align=True)
-        row.operator("bsmt.add_landmark", text="Add", icon='ADD')
-        row.operator("bsmt.remove_landmark", text="Delete", icon='REMOVE')
+        row.operator("bsmt.add_landmark", text="Add Landmark", icon='ADD')
+        delete = row.row(align=True)
+        delete.scale_x = 0.35
+        delete.operator("bsmt.remove_landmark", text="", icon='REMOVE')
+
+        if not len(collection):
+            empty = layout.box().column(align=True)
+            empty.scale_y = 0.8
+            empty.label(text="No landmarks defined.", icon='INFO')
+            empty.label(text="Add a landmark, then pick it on the surface.")
 
         self._draw_selected(layout, props, collection)
         self._draw_guided(layout, props, collection)
@@ -515,7 +623,7 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         self._draw_protocol(layout, props)
 
         layout.separator()
-        layout.operator("bsmt.clear_landmarks", text="Clear Landmark Data",
+        layout.operator("bsmt.clear_landmarks", text="Delete All Landmarks",
                         icon='TRASH')
 
     @staticmethod
@@ -534,7 +642,8 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         row = box.row(align=True)
         row.operator(
             "bsmt.pick_landmark",
-            text="Re-pick" if item.surface_point.valid else "Pick Selected",
+            text="Repick Landmark" if item.surface_point.valid
+                 else "Pick Landmark",
             icon='EYEDROPPER',
         ).index = index
         row.operator("bsmt.clear_landmark_position", text="Clear Position",
@@ -551,7 +660,7 @@ class BSMT_PT_landmarks(bpy.types.Panel):
                 column.label(text="   " + line)
         point = item.surface_point
         if point.valid:
-            column.label(text="   Object:    %s" % point.source_object)
+            column.label(text="   Mesh:      %s" % point.source_object)
             column.label(text="   Triangle:  %d" % point.triangle_index)
             column.label(text="   Component: %d" % point.component_id)
             column.label(
@@ -575,7 +684,8 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         )
         index = props.landmark_index
         label = collection[index].label if 0 <= index < len(collection) else "-"
-        box.label(text="Pick %d/%d: %s" % (props.guided_index + 1, total, label),
+        box.label(text="Picking %d of %d: %s"
+                       % (props.guided_index + 1, total, label),
                   icon='EYEDROPPER')
 
         row = box.row(align=True)
@@ -597,14 +707,14 @@ class BSMT_PT_landmarks(bpy.types.Panel):
     @staticmethod
     def _draw_protocol(layout, props):
         layout.separator()
-        layout.label(text="Protocol (names and order only)")
+        layout.label(text="Landmark Protocol (names and order only)")
         row = layout.row(align=True)
         row.operator("bsmt.load_protocol", text="Load", icon='IMPORT')
         row.operator("bsmt.save_protocol", text="Save", icon='EXPORT')
         note = layout.column(align=True)
         note.scale_y = 0.7
         note.enabled = False
-        note.label(text="Protocols carry names, not scan positions.")
+        note.label(text="A protocol carries names, not positions.")
 
 
 class BSMT_UL_measurements(bpy.types.UIList):
@@ -638,12 +748,13 @@ class BSMT_UL_measurements(bpy.types.UIList):
         identifier.label(text=item.protocol_id or "-")
         label = top.row()
         label.enabled = bool(item.enabled)
-        label.label(text=item.label)
+        label.label(text=item.name or "(new measurement)")
         kind = top.row()
         kind.alignment = 'RIGHT'
         kind.scale_x = 0.55
         kind.enabled = False
-        kind.label(text=item.measurement_type)
+        kind.label(text=measurements.TYPE_LABELS.get(
+            item.measurement_type, item.measurement_type))
         mark = top.row()
         mark.alignment = 'RIGHT'
         mark.scale_x = 0.2
@@ -657,10 +768,15 @@ class BSMT_UL_measurements(bpy.types.UIList):
         bottom.scale_y = 0.75
         pair = bottom.row()
         pair.enabled = False
-        pair.label(text="   %s \u2192 %s" % (
-            item.source_name or item.source_protocol_id or "?",
-            item.target_name or item.target_protocol_id or "?",
-        ))
+        if item.status == measurements.STATUS_DRAFT:
+            # A draft has no pair to name yet. "? -> ?" would read like a
+            # broken measurement rather than an unfinished one.
+            pair.label(text="   not defined yet")
+        else:
+            pair.label(text="   %s \u2192 %s" % (
+                item.source_name or item.source_protocol_id or "?",
+                item.target_name or item.target_protocol_id or "?",
+            ))
         result = bottom.row()
         result.alignment = 'RIGHT'
         if not item.enabled:
@@ -705,7 +821,7 @@ class BSMT_PT_measurements(bpy.types.Panel):
         props = state.get_props(context)
         collection = state.get_measurements(context)
         if props is None or collection is None:
-            layout.label(text="Add-on state unavailable", icon='ERROR')
+            layout.label(text="BSMT is not registered", icon='ERROR')
             return
 
         if props.measurement_protocol_name:
@@ -717,6 +833,8 @@ class BSMT_PT_measurements(bpy.types.Panel):
             box = layout.box()
             box.label(text=props.measurement_progress, icon='TIME')
 
+        _draw_measurement_target(context, layout, props)
+
         layout.template_list(
             "BSMT_UL_measurements", "",
             context.scene, "bsmt_measurements",
@@ -725,8 +843,21 @@ class BSMT_PT_measurements(bpy.types.Panel):
         )
 
         row = layout.row(align=True)
-        row.operator("bsmt.add_measurement", text="Add", icon='ADD')
-        row.operator("bsmt.remove_measurement", text="Delete", icon='REMOVE')
+        row.operator("bsmt.add_measurement", text="Add Measurement",
+                     icon='ADD')
+        delete = row.row(align=True)
+        delete.scale_x = 0.35
+        delete.operator("bsmt.remove_measurement", text="", icon='REMOVE')
+
+        if not len(collection):
+            # Sect. 9: an empty list says so. A blank row is never created
+            # just to give the panel something to draw.
+            empty = layout.box().column(align=True)
+            empty.scale_y = 0.8
+            empty.label(text="No measurements defined.", icon='INFO')
+            empty.label(text="Add one, then choose its From and To landmarks.")
+            self._draw_template(layout)
+            return
 
         self._draw_selected(context, layout, props, collection)
 
@@ -740,6 +871,8 @@ class BSMT_PT_measurements(bpy.types.Panel):
         info.label(text=plan["summary"])
         if plan["disabled"]:
             info.label(text="%d disabled, will be skipped" % plan["disabled"])
+        if plan["drafts"]:
+            info.label(text="%d unfinished, will be skipped" % plan["drafts"])
 
         if props.measurement_summary:
             box = layout.box()
@@ -762,8 +895,9 @@ class BSMT_PT_measurements(bpy.types.Panel):
         layout.separator()
         row = layout.row(align=True)
         row.operator("bsmt.remove_invalid_measurements",
-                     text="Remove Invalid", icon='CANCEL')
-        row.operator("bsmt.clear_measurements", text="Clear All", icon='TRASH')
+                     text="Delete Unresolved", icon='CANCEL')
+        row.operator("bsmt.clear_measurements", text="Delete All",
+                     icon='TRASH')
 
     @staticmethod
     def _draw_selected(context, layout, props, collection):
@@ -772,16 +906,29 @@ class BSMT_PT_measurements(bpy.types.Panel):
             layout.box().label(text="No measurement selected")
             return
         item = collection[index]
+        draft = state.measurement_is_draft(item)
         box = layout.box()
 
         header = box.row(align=True)
         header.prop(
             props, "show_measurement_detail",
             icon='TRIA_DOWN' if props.show_measurement_detail else 'TRIA_RIGHT',
-            emboss=False, text="Selected: %s" % item.label,
+            emboss=False,
+            text="%s: %s" % ("New measurement" if draft else "Selected",
+                             item.protocol_id if draft else item.label),
         )
         if not props.show_measurement_detail:
             return
+
+        if draft:
+            # Sect. 6/7: this row is not a measurement yet, and the panel says
+            # so plainly rather than letting an unfinished entry look real.
+            hint = box.column(align=True)
+            hint.scale_y = 0.8
+            hint.label(text="Not defined yet.", icon='GREASEPENCIL')
+            for line in _wrap(item.status_detail
+                              or "Choose a From and a To landmark.", 42):
+                hint.label(text=line)
 
         row = box.row(align=True)
         sub = row.row()
@@ -793,7 +940,7 @@ class BSMT_PT_measurements(bpy.types.Panel):
             hint = box.row()
             hint.enabled = False
             hint.scale_y = 0.7
-            hint.label(text="   Auto Name follows From / To")
+            hint.label(text="   Auto Name follows From and To")
 
         # From / To. These pickers WRITE the authoritative stable id through
         # their update callbacks and are never read back for identity: a
@@ -822,7 +969,12 @@ class BSMT_PT_measurements(bpy.types.Panel):
         box.prop(item, "enabled")
         box.prop(item, "notes", text="Notes")
 
-        box.operator("bsmt.calculate_measurement", icon='PLAY')
+        if draft:
+            # Sect. 8: an unfinished row can be discarded in one click, so
+            # nothing has to be hunted down in the list and deleted.
+            box.operator("bsmt.cancel_measurement_draft", icon='X')
+        else:
+            box.operator("bsmt.calculate_measurement", icon='PLAY')
 
         detail = box.column(align=True)
         detail.scale_y = 0.7
@@ -839,10 +991,10 @@ class BSMT_PT_measurements(bpy.types.Panel):
             return
         detail.separator()
         if item.straight_valid:
-            detail.label(text="Straight: %s"
+            detail.label(text="Straight Distance: %s"
                               % measurement.format_mm(item.straight_mm))
         if item.surface_valid:
-            detail.label(text="Surface:  %s"
+            detail.label(text="Surface Distance:  %s"
                               % measurement.format_mm(item.surface_mm))
             if item.straight_valid and item.ratio:
                 detail.label(text="Surface / Straight: %.4f" % item.ratio)
@@ -871,12 +1023,22 @@ class BSMT_PT_measurements(bpy.types.Panel):
         )
         if not props.show_measurement_results:
             return
-        if not len(collection):
-            layout.box().label(text="No measurements defined")
+        rows = state.defined_measurements(collection)
+        if not rows:
+            # Sect. 6/9: a draft is not a measurement, so it has no result to
+            # show. An empty results list says exactly that.
+            note = layout.box().column(align=True)
+            note.scale_y = 0.8
+            note.label(text="No measurements defined.", icon='INFO')
+            drafts = len(collection) - len(rows)
+            if drafts:
+                note.label(text="%d unfinished - choose From and To to "
+                                "complete %s"
+                                % (drafts, "it" if drafts == 1 else "them"))
             return
 
         box = layout.box()
-        for item in collection:
+        for item in rows:
             entry = box.column(align=True)
             entry.scale_y = 0.75
 
@@ -892,7 +1054,8 @@ class BSMT_PT_measurements(bpy.types.Panel):
             kind = title.row()
             kind.alignment = 'RIGHT'
             kind.enabled = False
-            kind.label(text=item.measurement_type)
+            kind.label(text=measurements.TYPE_LABELS.get(
+                item.measurement_type, item.measurement_type))
 
             if item.name and item.name != state.auto_name_for(context, item):
                 named = entry.row()
@@ -906,14 +1069,14 @@ class BSMT_PT_measurements(bpy.types.Panel):
 
             if state.result_is_displayable(item):
                 if item.straight_valid:
-                    entry.label(text="   Straight %s"
+                    entry.label(text="   Straight  %s"
                                      % measurement.format_mm(item.straight_mm))
                 if item.surface_valid:
-                    entry.label(text="   Surface  %s"
+                    entry.label(text="   Surface   %s"
                                      % measurement.format_mm(item.surface_mm))
                 if (item.straight_valid and item.surface_valid
                         and item.ratio):
-                    entry.label(text="   Ratio    %.4f" % item.ratio)
+                    entry.label(text="   Ratio     %.4f" % item.ratio)
             else:
                 # Deliberately no numbers: a value that is not current must
                 # never be readable as though it were.
@@ -943,7 +1106,7 @@ class BSMT_PT_measurements(bpy.types.Panel):
         note = layout.column(align=True)
         note.scale_y = 0.7
         note.enabled = False
-        note.label(text="Templates carry definitions, not results.")
+        note.label(text="A template carries definitions, not results.")
 
 
 class BSMT_PT_measurement_visualization(bpy.types.Panel):
@@ -966,7 +1129,7 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
         props = state.get_props(context)
         collection = state.get_measurements(context)
         if props is None or collection is None:
-            layout.label(text="Add-on state unavailable", icon='ERROR')
+            layout.label(text="BSMT is not registered", icon='ERROR')
             return
 
         item = state.active_measurement(context, props)
@@ -976,32 +1139,27 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
             return
         # The Measurement Manager's selection IS the visualisation target.
         # There is deliberately no second selection system.
-        box.label(text="Selected: %s  %s \u2192 %s" % (
-            item.protocol_id,
-            item.source_name or item.source_protocol_id or "?",
-            item.target_name or item.target_protocol_id or "?",
-        ))
-        drawn = []
-        if visualization.measurement_helper_exists(item.stable_id, 'STRAIGHT'):
-            drawn.append("LINE")
-        if visualization.measurement_helper_exists(item.stable_id, 'PATH'):
-            drawn.append("PATH")
-        if drawn:
-            state_row = box.row()
-            state_row.enabled = False
-            state_row.label(text="Showing: %s" % ("BOTH" if len(drawn) > 1
-                                                  else drawn[0]))
+        if state.measurement_is_draft(item):
+            box.label(text="%s is not defined yet" % item.protocol_id,
+                      icon='GREASEPENCIL')
+        else:
+            box.label(text="Selected: %s  %s \u2192 %s" % (
+                item.protocol_id,
+                item.source_name or item.source_protocol_id or "?",
+                item.target_name or item.target_protocol_id or "?",
+            ))
 
-        layout.prop(props, "viz_mode", text="Mode")
-        row = layout.row(align=True)
-        row.prop(props, "viz_selected_only")
-        if not props.viz_selected_only:
-            layout.prop(item, "show_visualization", text="Show This Measurement")
+        layout.prop(props, "viz_scope")
+        layout.prop(props, "viz_mode")
+        if props.viz_scope == 'TICKED':
+            layout.prop(item, "show_visualization",
+                        text="Show This Measurement")
 
+        self._draw_scope_report(context, layout, props)
         self._draw_path_controls(layout, props, item)
 
         style = layout.box()
-        style.label(text="Straight")
+        style.label(text="Straight Distance")
         style.prop(props, "viz_straight_color", text="Color")
         style.prop(props, "viz_straight_thickness_mm", text="Thickness (mm)")
         style.label(text="Surface Path")
@@ -1018,25 +1176,60 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
                      icon='TRASH')
 
     @staticmethod
+    def _draw_scope_report(context, layout, props):
+        """What is on screen right now, and what has no path yet (sect. 10).
+
+        Nothing here computes anything. A measurement without a cached path is
+        NAMED rather than solved for, so widening the scope to ten
+        measurements can never start ten solves - and the ones that do have a
+        cached path are still drawn.
+        """
+        report = viz.display_report(context, props)
+        box = layout.box().column(align=True)
+        box.scale_y = 0.75
+        if not report["count"]:
+            box.label(text="Nothing to display in this scope.", icon='INFO')
+            return
+        box.label(text="Displaying %d measurement%s"
+                       % (report["count"],
+                          "" if report["count"] == 1 else "s"),
+                  icon='HIDE_OFF')
+        if not report["path_wanted"] or not report["without_path"]:
+            return
+        missing = box.column(align=True)
+        missing.label(text="Path not computed:", icon='INFO')
+        for label in report["without_path"][:6]:
+            missing.label(text="   %s" % label)
+        if len(report["without_path"]) > 6:
+            missing.label(text="   and %d more"
+                               % (len(report["without_path"]) - 6))
+        note = box.column(align=True)
+        note.enabled = False
+        for line in _wrap("Select one and press Compute Surface Path. "
+                          "Nothing is computed automatically.", 42):
+            note.label(text=line)
+
+    @staticmethod
     def _draw_path_controls(layout, props, item):
         box = layout.box()
         if props.viz_running:
-            box.label(text="Computing exact surface path...", icon='TIME')
+            box.label(text="Computing the surface path...", icon='TIME')
             return
 
         if item.path_valid:
             column = box.column(align=True)
             column.scale_y = 0.75
-            column.label(text="Path computed", icon='CHECKMARK')
-            column.label(text="Elapsed: %.2f s" % item.path_elapsed_s)
-            column.label(text="Points:  %d" % item.path_point_count)
-            column.label(text="Path length:   %s"
+            column.label(text="Surface path computed", icon='CHECKMARK')
+            column.label(text="Points:          %d" % item.path_point_count)
+            column.label(text="Path length:     %s"
                               % measurement.format_mm(item.path_length_mm))
-            column.label(text="Solver path:   %s"
+            column.label(text="Solver distance: %s"
                               % measurement.format_mm(item.path_distance_mm))
-            column.label(text="Stored surface: %s"
+            column.label(text="Stored surface:  %s"
                               % measurement.format_mm(item.surface_mm))
-            column.label(text="Agreement: %.3e mm" % item.path_agreement_mm)
+            column.label(text="Agreement:       %.3e mm"
+                              % item.path_agreement_mm)
+            column.label(text="Elapsed:         %.2f s" % item.path_elapsed_s)
             box.operator("bsmt.compute_surface_path", text="Recompute Path",
                          icon='FILE_REFRESH')
             return
@@ -1044,12 +1237,14 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
         if props.viz_mode in ('SURFACE', 'BOTH'):
             note = box.column(align=True)
             note.scale_y = 0.75
-            note.label(text="Surface path not computed", icon='INFO')
+            note.label(text="Path not computed", icon='INFO')
             if not item.surface_valid:
                 note.label(text="Calculate the surface distance first.")
             else:
-                note.label(text="This runs the unbounded exact solve and")
-                note.label(text="may block Blender for tens of seconds.")
+                for line in _wrap("This runs the unbounded exact solve and "
+                                  "may freeze Blender for tens of seconds.",
+                                  42):
+                    note.label(text=line)
         box.operator("bsmt.compute_surface_path", icon='PLAY')
 
         if props.viz_status:
@@ -1079,7 +1274,7 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
         layout = self.layout
         props = state.get_props(context)
         if props is None:
-            layout.label(text="Add-on state unavailable", icon='ERROR')
+            layout.label(text="BSMT is not registered", icon='ERROR')
             return
 
         obj = context.active_object
@@ -1087,11 +1282,11 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
 
         box = layout.box()
         if info is None:
-            box.label(text="Select a mesh scan", icon='INFO')
+            box.label(text="Select a mesh scan to preprocess", icon='INFO')
         else:
             column = box.column(align=True)
             column.scale_y = 0.75
-            column.label(text="Active: %s" % info["name"])
+            column.label(text="Selected: %s" % info["name"])
             column.label(text="Vertices:  {:,}".format(info["vertex_count"]))
             column.label(text="Triangles: {:,}".format(info["triangle_count"]))
             column.label(
@@ -1112,8 +1307,8 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
             provenance = getattr(obj, "bsmt_scan", None)
             if provenance is not None and provenance.is_measurement_copy:
                 column.separator()
-                column.label(text="This IS a measurement copy of '%s'"
-                                  % provenance.source_name, icon='DUPLICATE')
+                column.label(text="This is a measurement mesh", icon='DUPLICATE')
+                column.label(text="Source Mesh: %s" % provenance.source_name)
                 column.label(text=provenance.representation
                                   or preprocess.REPRESENTATION)
 
@@ -1151,13 +1346,13 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
         note = safety.column(align=True)
         note.scale_y = 0.7
         note.enabled = False
-        note.label(text="Non-manifold edges always refuse exact")
-        note.label(text="geodesic computation.")
+        note.label(text="A non-manifold mesh is always refused,")
+        note.label(text="whatever this threshold is set to.")
 
         if props.preprocess_valid and props.preprocess_report:
             layout.separator()
             row = layout.row(align=True)
-            row.label(text="Report")
+            row.label(text="Preprocessing Report")
             row.operator("bsmt.clear_preprocess_report", text="", icon='X')
             column = layout.box().column(align=True)
             column.scale_y = 0.7
@@ -1218,7 +1413,7 @@ class BSMT_PT_repair(bpy.types.Panel):
         layout = self.layout
         props = state.get_props(context)
         if props is None:
-            layout.label(text="Add-on state unavailable", icon='ERROR')
+            layout.label(text="BSMT is not registered", icon='ERROR')
             return
 
         obj = context.active_object
@@ -1227,27 +1422,27 @@ class BSMT_PT_repair(bpy.types.Panel):
 
         box = layout.box()
         if obj is None or obj.type != 'MESH':
-            box.label(text="Select a measurement copy", icon='INFO')
+            box.label(text="Select a measurement mesh", icon='INFO')
             return
         if not is_copy:
             column = box.column(align=True)
             column.scale_y = 0.75
-            column.label(text="'%s' is not a measurement copy" % obj.name,
+            column.label(text="'%s' is not a measurement mesh" % obj.name,
                          icon='ERROR')
-            for line in _wrap("Repairs run only on a copy created by Scan "
-                              "Preprocessing, so the source scan is never "
+            for line in _wrap("Repairs run only on a mesh created by Scan "
+                              "Preprocessing, so the source mesh is never "
                               "modified.", 44):
                 column.label(text=line)
             return
 
-        box.label(text="Repairing: %s" % obj.name, icon='DUPLICATE')
+        box.label(text="Measurement Mesh: %s" % obj.name, icon='DUPLICATE')
         sub = box.row()
         sub.enabled = False
-        sub.label(text="copy of '%s'" % provenance.source_name)
+        sub.label(text="Source Mesh: %s" % provenance.source_name)
 
         layout.operator("bsmt.analyse_repair", icon='VIEWZOOM')
         if not props.repair_valid or props.repair_object != obj.name:
-            layout.label(text="Analyse the mesh to see its diagnostics")
+            layout.label(text="Analyze the mesh to see its diagnostics")
             return
 
         # Automatic repair. Nothing here runs by opening the panel: geometry
@@ -1271,8 +1466,9 @@ class BSMT_PT_repair(bpy.types.Panel):
 
         layout.separator()
         row = layout.row(align=True)
-        row.operator("bsmt.restore_repair_backup", icon='LOOP_BACK')
-        row.operator("bsmt.clear_repair_report", text="Clear", icon='X')
+        row.operator("bsmt.restore_repair_backup", text="Undo Repair",
+                     icon='LOOP_BACK')
+        row.operator("bsmt.clear_repair_report", text="Clear Log", icon='X')
 
         if props.repair_log:
             layout.separator()
@@ -1304,7 +1500,8 @@ class BSMT_PT_repair(bpy.types.Panel):
         box = layout.box()
         box.label(text="Non-Manifold Edges")
         row = box.row(align=True)
-        row.operator("bsmt.show_non_manifold", text="Show", icon='HIDE_OFF')
+        row.operator("bsmt.show_non_manifold", text="Show Edges",
+                     icon='HIDE_OFF')
         row.operator("bsmt.clear_repair_highlight", text="Clear Highlight",
                      icon='X')
         box.operator("bsmt.remove_duplicate_faces", icon='TRASH')
@@ -1333,8 +1530,9 @@ class BSMT_PT_repair(bpy.types.Panel):
             rows=4 if len(props.boundary_loops) > 2 else 2,
         )
         row = box.row(align=True)
-        row.operator("bsmt.show_boundary_loop", text="Show", icon='HIDE_OFF')
-        row.operator("bsmt.fill_boundary_loop", text="Fill Selected",
+        row.operator("bsmt.show_boundary_loop", text="Show Loop",
+                     icon='HIDE_OFF')
+        row.operator("bsmt.fill_boundary_loop", text="Fill Loop",
                      icon='MOD_TRIANGULATE')
         note = box.column(align=True)
         note.scale_y = 0.7
@@ -1352,7 +1550,7 @@ class BSMT_PT_repair(bpy.types.Panel):
         if len(props.repair_components) < 2:
             row = box.row()
             row.enabled = False
-            row.label(text="single component")
+            row.label(text="one component - nothing to remove")
             return
         box.template_list(
             "BSMT_UL_repair_components", "",
@@ -1387,7 +1585,7 @@ class BSMT_PT_alignment(bpy.types.Panel):
         layout = self.layout
         props = state.get_props(context)
         if props is None:
-            layout.label(text="Add-on state unavailable", icon='ERROR')
+            layout.label(text="BSMT is not registered", icon='ERROR')
             return
 
         obj = context.active_object
@@ -1397,7 +1595,7 @@ class BSMT_PT_alignment(bpy.types.Panel):
 
         box = layout.box()
         if obj is None or obj.type != 'MESH':
-            box.label(text="Select a mesh object", icon='INFO')
+            box.label(text="Select a mesh object to align", icon='INFO')
             return
         column = box.column(align=True)
         column.scale_y = 0.75
@@ -1438,7 +1636,7 @@ class BSMT_PT_alignment(bpy.types.Panel):
 
         status = layout.box()
         status.label(text="Status: %s"
-                          % ("Aligned (%s)" % props.align_method
+                          % ("Aligned (%s)" % props.align_method.title()
                              if props.align_applied else "Not aligned"),
                      icon='CHECKMARK' if props.align_applied else 'BLANK1')
         if props.align_report:
@@ -1451,7 +1649,7 @@ class BSMT_PT_alignment(bpy.types.Panel):
     @staticmethod
     def _draw_manual(layout, props):
         box = layout.box()
-        box.label(text="Rotate 90 degrees")
+        box.label(text="Rotate by 90 degrees")
         for axis in ('X', 'Y', 'Z'):
             row = box.row(align=True)
             minus = row.operator("bsmt.manual_align", text="%s -90" % axis)
@@ -1463,10 +1661,11 @@ class BSMT_PT_alignment(bpy.types.Panel):
             plus.degrees = 90.0
             plus.action = 'ROTATE'
 
+        box.separator()
         box.prop(props, "align_fine_degrees")
         row = box.row(align=True)
         for axis in ('X', 'Y', 'Z'):
-            fine = row.operator("bsmt.manual_align", text="%s fine" % axis)
+            fine = row.operator("bsmt.manual_align", text="%s" % axis)
             fine.axis = axis
             fine.degrees = props.align_fine_degrees
             fine.action = 'ROTATE'
@@ -1478,46 +1677,77 @@ class BSMT_PT_alignment(bpy.types.Panel):
     @staticmethod
     def _draw_landmark(layout, props):
         box = layout.box()
-        box.label(text="Anatomical References")
-        for slot, label in (('LEFT', "LEFT      "), ('RIGHT', "RIGHT     "),
-                            ('SUPERIOR', "SUPERIOR  "),
-                            ('INFERIOR', "INFERIOR  ")):
+        box.label(text="Reference Points")
+        for slot, label in (('LEFT', "LEFT"), ('RIGHT', "RIGHT"),
+                            ('SUPERIOR', "SUPERIOR"),
+                            ('INFERIOR', "INFERIOR")):
             point = state.align_point(props, slot)
             row = box.row(align=True)
-            row.label(text=label,
-                      icon='CHECKMARK' if point.valid else 'BLANK1')
+            name = row.row()
+            name.scale_x = 0.9
+            name.label(text=label,
+                       icon='CHECKMARK' if point.valid else 'BLANK1')
             pick = row.operator("bsmt.pick_alignment_reference",
-                                text="Re-pick" if point.valid else "Pick",
+                                text="Repick" if point.valid else "Pick",
                                 icon='EYEDROPPER')
             pick.slot = slot
+
+        # Sect. 5: short enough to fit the sidebar, and it says what to click
+        # rather than restating the theory.
+        help_text = box.column(align=True)
+        help_text.scale_y = 0.7
+        help_text.enabled = False
+        for line in _wrap("LEFT / RIGHT: matching points on each side, at "
+                          "about the same height.", 44):
+            help_text.label(text=line)
+        for line in _wrap("SUPERIOR / INFERIOR: an upper and a lower point, "
+                          "near the body midline.", 44):
+            help_text.label(text=line)
+        for line in _wrap("Left and right are the SUBJECT'S, not the "
+                          "viewer's.", 44):
+            help_text.label(text=line)
+
         ready, missing = state.align_points_ready(props)
         if not ready:
             hint = box.row()
             hint.enabled = False
             hint.label(text="Still to pick: %s" % ", ".join(missing))
-        box.operator("bsmt.clear_alignment_references", text="Clear References",
-                     icon='X')
-
-        note = box.column(align=True)
-        note.scale_y = 0.7
-        note.enabled = False
-        for line in _wrap("LEFT and RIGHT are the SUBJECT'S left and right, "
-                          "not the viewer's. Use Flip Front/Back if they end "
-                          "up swapped.", 44):
-            note.label(text=line)
+        box.operator("bsmt.clear_alignment_references",
+                     text="Clear Reference Points", icon='X')
 
         column = layout.column(align=True)
         row = column.row(align=True)
-        row.operator("bsmt.preview_alignment", icon='HIDE_OFF')
+        row.operator("bsmt.preview_alignment", text="Preview Axes",
+                     icon='HIDE_OFF')
         row.operator("bsmt.clear_alignment_preview", text="Clear Preview",
                      icon='X')
         column.prop(props, "align_move_to_origin")
         column.operator("bsmt.apply_alignment", icon='CON_ROTLIKE')
         if props.align_residual_degrees:
-            residual = column.row()
-            residual.enabled = False
-            residual.label(text="Residual non-orthogonality: %.2f deg"
-                                % props.align_residual_degrees)
+            BSMT_PT_alignment._draw_residual(column,
+                                             props.align_residual_degrees)
+
+    @staticmethod
+    def _draw_residual(layout, degrees):
+        """The residual, with a plain-language reading (sect. 12).
+
+        Labelled as guidance on the face of it. The bands are a usability aid,
+        not a validated anthropometric criterion, and nothing is refused or
+        adjusted because of them - so the panel says so rather than letting
+        three tidy verdicts imply a standard that does not exist.
+        """
+        verdict, advice, severity = alignment.quality(degrees)
+        box = layout.box().column(align=True)
+        box.scale_y = 0.75
+        row = box.row()
+        row.alert = severity >= 2
+        row.label(text="Reference angle: %.1f deg off perpendicular" % degrees,
+                  icon=('CHECKMARK' if severity == 0
+                        else 'INFO' if severity == 1 else 'ERROR'))
+        box.label(text="   %s - %s" % (verdict, advice))
+        note = box.row()
+        note.enabled = False
+        note.label(text="   (UI guidance, not a validated threshold)")
 
 
 classes = (

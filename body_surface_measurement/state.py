@@ -18,7 +18,7 @@ from bpy.props import (
 )
 
 from . import (alignment, geodesic, landmarks, measurement, measurements,
-               preprocess, visualization)
+               preprocess, readiness, visualization)
 
 
 def _on_display_changed(self, context):
@@ -236,17 +236,22 @@ def landmark_enum_items(self, context):
 
 
 def auto_name_for(context, item):
-    """The automatic name for a measurement, from its landmarks' visible names.
+    """The automatic name for a measurement, or "" while it is still a draft.
 
     Resolved through the AUTHORITATIVE stable ids, never through the From/To
     pickers: a dynamic enum remaps by index when the landmark list changes,
     so naming from it could label a measurement after a landmark it does not
     actually reference.
+
+    A draft gets no name (sect. 7). Naming an unfinished row "? to ?" would
+    put a meaningless label in the list and, eventually, in an export.
     """
+    if measurement_is_draft(item):
+        return ""
     source, target = resolve_measurement_landmarks(context, item)
     return measurements.default_name(
-        source.label if source is not None else (item.source_name or "?"),
-        target.label if target is not None else (item.target_name or "?"),
+        source.label if source is not None else item.source_name,
+        target.label if target is not None else item.target_name,
     )
 
 
@@ -260,6 +265,8 @@ def apply_auto_name(context, item):
     if not item.auto_name:
         return False
     wanted = auto_name_for(context, item)
+    if not wanted and not item.name:
+        return False
     if item.name != wanted:
         item.name = wanted
         return True
@@ -373,7 +380,7 @@ class BSMT_Measurement(bpy.types.PropertyGroup):
     notes: StringProperty(name="Notes", default="")
     enabled: BoolProperty(
         name="Enabled",
-        description="Include this measurement in Calculate All Defined",
+        description="Include this measurement in Calculate All",
         default=True,
     )
 
@@ -829,7 +836,7 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         name="Batch Running", default=False, options={'SKIP_SAVE'},
     )
     show_measurement_detail: BoolProperty(
-        name="Details", description="Show the selected measurement's detail",
+        name="Details", description="Show the selected measurement in full",
         default=True,
     )
     # ------------------------------------------------------------------
@@ -863,11 +870,11 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
     align_residual_degrees: FloatProperty(default=0.0)
     align_fine_degrees: FloatProperty(
-        name="Fine Rotation", default=5.0, min=-180.0, max=180.0,
-        description="Degrees applied by the fine rotation buttons",
+        name="Rotate By (deg)", default=5.0, min=-180.0, max=180.0,
+        description="How far the X / Y / Z buttons below rotate the object",
     )
     align_move_to_origin: BoolProperty(
-        name="Move To Origin",
+        name="Move To World Origin",
         description="Also translate the inferior reference to the world "
                     "origin when applying a landmark alignment",
         default=True,
@@ -938,23 +945,31 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         default=True,
     )
     show_preprocessing: BoolProperty(name="Scan Preprocessing", default=False)
+    show_readiness: BoolProperty(
+        name="Readiness Detail",
+        description="Show every reason behind the readiness line",
+        default=False,
+    )
 
     # ------------------------------------------------------------------
     # Milestone 3.2 - measurement visualisation. Display only: nothing here
     # can change a distance, a path or a measurement's validity.
     # ------------------------------------------------------------------
     viz_mode: EnumProperty(
-        name="Display Mode",
+        name="Draw",
         items=(
-            ('STRAIGHT', "Straight", "Draw only the straight chord"),
-            ('SURFACE', "Surface", "Draw only the exact geodesic path"),
-            ('BOTH', "Both", "Draw the chord and the surface path together"),
+            ('STRAIGHT', "Straight Distance",
+             "Draw only the straight line between the two landmarks"),
+            ('SURFACE', "Surface Path",
+             "Draw only the exact geodesic path across the surface"),
+            ('BOTH', "Both",
+             "Draw the straight line and the surface path together"),
         ),
         default='BOTH',
         update=_on_visualization_changed,
     )
     viz_straight_color: FloatVectorProperty(
-        name="Straight Color", subtype='COLOR', size=4,
+        name="Straight Line Color", subtype='COLOR', size=4,
         default=(1.0, 0.85, 0.1, 1.0), min=0.0, max=1.0,
         update=_on_visualization_style_changed,
     )
@@ -964,18 +979,27 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         update=_on_visualization_style_changed,
     )
     viz_straight_thickness_mm: FloatProperty(
-        name="Straight Thickness (mm)", default=3.0, min=0.5, max=20.0,
+        name="Straight Line Thickness (mm)", default=3.0, min=0.5, max=20.0,
         update=_on_visualization_style_changed,
     )
     viz_path_thickness_mm: FloatProperty(
-        name="Path Thickness (mm)", default=3.0, min=0.5, max=20.0,
+        name="Surface Path Thickness (mm)", default=3.0, min=0.5, max=20.0,
         update=_on_visualization_style_changed,
     )
-    viz_selected_only: BoolProperty(
-        name="Show Selected Measurement Only",
-        description="Draw only the selected definition. Turn off to show "
-                    "every measurement whose Show box is ticked",
-        default=True,
+    viz_scope: EnumProperty(
+        name="Show",
+        description="Which measurements to draw in the viewport. Changing "
+                    "this never computes anything: a measurement with no "
+                    "cached surface path simply gets no path drawn",
+        items=(
+            ('SELECTED', "Selected Measurement",
+             "Draw only the measurement selected in the Measurement Manager"),
+            ('TICKED', "Selected Measurements",
+             "Draw every measurement whose Show box is ticked"),
+            ('ENABLED', "All Enabled Measurements",
+             "Draw every enabled measurement that is fully defined"),
+        ),
+        default='SELECTED',
         update=_on_visualization_changed,
     )
     viz_surface_offset: BoolProperty(
@@ -1396,12 +1420,47 @@ def measurement_protocol_ids(collection):
     return [item.protocol_id for item in collection]
 
 
+def measurement_is_draft(item):
+    """True while a row has not yet become a real measurement (sect. 6).
+
+    The cached names are passed on purpose: a measurement loaded from a
+    template whose landmark is missing has an unresolved id but a remembered
+    name, and it must stay a real measurement with a broken reference rather
+    than disappear into the drafts.
+    """
+    return measurements.is_draft(
+        item.source_stable_id, item.target_stable_id,
+        item.source_name or item.source_protocol_id,
+        item.target_name or item.target_protocol_id,
+    )
+
+
+def defined_measurements(collection):
+    """Only the real measurements. Drafts are not measurements."""
+    return measurements.defined(collection or ())
+
+
+def trailing_draft_index(collection):
+    """Index of the draft at the END of the list, or -1.
+
+    Only the last row counts. A draft in the middle was left there on purpose
+    - the researcher is presumably still filling it in - and silently
+    recycling it would move their selection somewhere they did not ask for.
+    """
+    if not collection:
+        return -1
+    last = len(collection) - 1
+    return last if measurement_is_draft(collection[last]) else -1
+
+
 def add_measurement(context, props, name="", source=None, target=None,
                     measurement_type=None, notes="", protocol_id=""):
-    """Append a measurement definition. Returns it.
+    """Append a measurement definition, or a draft. Returns it.
 
-    Landmarks need not be picked yet (sect. 5): a definition is a plan, and
-    its status simply reports that it is not ready.
+    Landmarks need not be PICKED yet (sect. 5): a definition is a plan, and
+    its status simply reports that it is not ready. They need not even be
+    CHOSEN yet - a row with no endpoints is a draft, which is how Add
+    Measurement starts one.
     """
     collection = get_measurements(context)
     if collection is None:
@@ -1430,6 +1489,8 @@ def add_measurement(context, props, name="", source=None, target=None,
         item.name = name
     else:
         item.auto_name = True
+        # Empty while this is a draft; filled in the moment both endpoints
+        # are chosen, by the picker update callbacks.
         item.name = auto_name_for(context, item)
     props.measurement_index = len(collection) - 1
     clear_measurement_result(item)
@@ -1628,7 +1689,9 @@ def refresh_measurement_status(context, item, canonical=None,
     """
     source, target = resolve_measurement_landmarks(context, item)
     status, detail = measurements.readiness(
-        source, target, item.source_stable_id, item.target_stable_id
+        source, target, item.source_stable_id, item.target_stable_id,
+        item.source_name or item.source_protocol_id,
+        item.target_name or item.target_protocol_id,
     )
 
     if not item.has_result:
@@ -1680,6 +1743,91 @@ def invalidate_all_measurement_results(context, reason):
             invalidate_measurement_result(item, reason)
             count += 1
     return count
+
+
+# ---------------------------------------------------------------------------
+# Global readiness (Milestone 3.7, sect. 13)
+# ---------------------------------------------------------------------------
+
+def measurement_target(context, props=None):
+    """The object measurements would actually run on, and why.
+
+    Returns (object-or-None, reason). The landmarks decide: a measurement is
+    computed on the mesh its landmarks were picked on, never on whatever
+    happens to be selected. Only when no landmark has been picked does the
+    active object stand in - and then it is labelled as a guess.
+    """
+    names = set()
+    collection = get_landmarks(context)
+    for item in (collection or ()):
+        point = item.surface_point
+        if point.valid and point.source_object:
+            names.add(point.source_object)
+    if len(names) == 1:
+        name = names.pop()
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            return obj, "the mesh the landmarks were picked on"
+    if len(names) > 1:
+        return None, "landmarks are spread across %d meshes" % len(names)
+
+    obj = getattr(context, "active_object", None)
+    if obj is not None and obj.type == 'MESH' and not visualization.is_helper(obj):
+        return obj, "the active object"
+    return None, "no mesh selected"
+
+
+def readiness_snapshot(context, props=None):
+    """The compact "can I measure yet" answer (sect. 13).
+
+    Safe to call from a panel draw: it reads only cached values. The canonical
+    mesh is consulted with peek(), which never builds one, so opening a panel
+    can never trigger a rebuild - and when nothing is cached the result says
+    "not analyzed yet" rather than inventing an answer.
+    """
+    if props is None:
+        props = get_props(context)
+    if props is None:
+        return readiness.evaluate()
+
+    obj, _reason = measurement_target(context, props)
+    triangle_count = 0
+    non_manifold = 0
+    analysed = False
+    if obj is not None and geodesic.MESHCACHE_AVAILABLE:
+        cached = geodesic.meshcache.peek(obj.name)
+        if cached is not None:
+            report = cached.topology or {}
+            triangle_count = int(report.get("triangle_count", 0) or 0)
+            non_manifold = int(report.get("nonmanifold_edge_count", 0) or 0)
+            analysed = True
+
+    scale_uniform = True
+    if obj is not None:
+        scale_uniform = bool(alignment.scale_report(obj.matrix_world)["uniform"])
+
+    unpicked = stale = 0
+    landmark_collection = get_landmarks(context) or ()
+    for item in landmark_collection:
+        if item.status == landmarks.STATUS_NOT_PICKED:
+            unpicked += 1
+        elif item.status in (landmarks.STATUS_STALE, landmarks.STATUS_INVALID):
+            stale += 1
+
+    measurement_collection = get_measurements(context) or ()
+    return readiness.evaluate(
+        mesh_name=obj.name if obj is not None else "",
+        triangle_count=triangle_count,
+        non_manifold=non_manifold,
+        analysed=analysed,
+        dense_threshold=props.dense_threshold_triangles,
+        guard_dense=props.guard_dense_solve,
+        scale_uniform=scale_uniform,
+        landmark_total=len(landmark_collection),
+        landmarks_unpicked=unpicked,
+        landmarks_stale=stale,
+        measurements_defined=len(defined_measurements(measurement_collection)),
+    )
 
 
 # ---------------------------------------------------------------------------
