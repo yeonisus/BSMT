@@ -261,6 +261,65 @@ def weld_non_manifold_region(obj, non_manifold_edges, distance):
     return merged
 
 
+def remove_faces_by_vertex_sets(obj, wanted_counts):
+    """Delete faces addressed by their VERTEX SET, not by index.
+
+    Index-mapping-free on purpose. The repair plan is computed on the
+    canonical triangle array, and assuming canonical triangle *i* is mesh
+    polygon *i* is exactly the class of silent mis-indexing PROJECT_SPEC
+    sect. 7.7 warns about. A face's sorted vertex tuple identifies it without
+    any mapping at all.
+
+    `wanted_counts` maps a sorted vertex tuple to how many faces with that
+    tuple to remove, so a duplicated face can have one copy removed and the
+    other kept.
+    """
+    remaining = dict(wanted_counts)
+    if not remaining:
+        return 0
+    bm = _open(obj)
+    try:
+        victims = []
+        for face in bm.faces:
+            key = tuple(sorted(vert.index for vert in face.verts))
+            if remaining.get(key, 0) > 0:
+                victims.append(face)
+                remaining[key] -= 1
+        if not victims:
+            raise RepairAborted(
+                "the faces to remove no longer match this mesh - re-analyse"
+            )
+        removed = len(victims)
+        bmesh.ops.delete(bm, geom=victims, context='FACES_ONLY')
+        _commit(obj, bm)
+    except RepairAborted:
+        bm.free()
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        bm.free()
+        raise RepairAborted("face removal failed: %s: %s"
+                            % (type(exc).__name__, exc))
+    return removed
+
+
+def fill_small_loops(obj, loops):
+    """Fill a set of small closed boundary loops. Returns faces created.
+
+    Each loop is filled independently and triangulated; a loop Blender
+    declines is skipped rather than forced, and the rest still proceed.
+    """
+    created_total = 0
+    filled_loops = 0
+    skipped = []
+    for loop in loops:
+        try:
+            created_total += fill_boundary_loop(obj, loop["edges"])
+            filled_loops += 1
+        except RepairAborted as exc:
+            skipped.append("loop %s: %s" % (loop.get("loop_id", "?"), exc))
+    return created_total, filled_loops, skipped
+
+
 def triangulate_all(obj):
     """Ensure the mesh is pure triangles. Returns how many faces were split."""
     bm = _open(obj)

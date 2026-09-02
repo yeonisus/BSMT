@@ -3519,6 +3519,23 @@ class _RepairBase(bpy.types.Operator):
         finally:
             props.repair_running = False
 
+        texture_ok, _problems, _facts = meshrepair.verify_texture(
+            obj, before_texture)
+        after_probe = dict(_canonical_arrays(context, props, obj).topology or {})
+        accepted, why = repair.accept_repair(before_report, after_probe,
+                                             texture_ok)
+        if not accepted:
+            meshrepair.restore_backup(obj, backup)
+            _analyse_repair(context, props, obj)
+            message = "; ".join(why)
+            print("[BSMT] repair REVERTED: %s" % message)
+            props.repair_log = ((props.repair_log + "\n" if props.repair_log
+                                 else "") + "%s REVERTED - %s"
+                                % (action, message))
+            self.report({'ERROR'},
+                        "BSMT: repair reverted - %s" % message)
+            return {'CANCELLED'}
+
         ok, message = _after_repair(self, context, props, obj, action,
                                     before_report, before_texture,
                                     detail or str(outcome))
@@ -3692,6 +3709,222 @@ class BSMT_OT_weld_non_manifold(_RepairBase):
         return self._guarded(context, "Weld non-manifold region", work)
 
 
+class BSMT_OT_auto_repair_local(_RepairBase):
+    """Automatically repair small, localised non-manifold artefacts.
+
+    Each defect region is planned, executed and validated on its own. A
+    region that is not clearly a local artefact is refused rather than
+    guessed at, and any repair whose measured outcome fails validation is
+    reverted
+    """
+
+    bl_idname = "bsmt.auto_repair_local"
+    bl_label = "Auto Repair Local Defects"
+
+    @classmethod
+    def poll(cls, context):
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        if props.repair_running:
+            self.report({'WARNING'}, "BSMT: a repair is already running")
+            return {'CANCELLED'}
+        if geodesic.ensure_loaded():
+            self.report({'ERROR'}, "BSMT: " + geodesic.ensure_loaded())
+            return {'CANCELLED'}
+
+        canonical = _canonical_arrays(context, props, obj)
+        before_report = dict(canonical.topology or {})
+        if int(before_report.get("nonmanifold_edge_count", 0) or 0) == 0:
+            _analyse_repair(context, props, obj)
+            self.report({'INFO'}, "BSMT: no repair required - 0 non-manifold "
+                                  "edges")
+            return {'FINISHED'}
+
+        # The "local artefact" size limit scales with this mesh's own
+        # triangle size; see repair.region_diagonal_limit.
+        mean_edge = float(before_report.get("edge_length_mean", 0.0) or 0.0)
+        regions = repair.non_manifold_regions(canonical.vertices_solver,
+                                              canonical.triangles)
+        plans = []
+        for region in regions:
+            plan = repair.plan_region_repair(canonical.vertices_solver,
+                                             canonical.triangles, region,
+                                             mean_edge_mm=mean_edge)
+            plan["region"] = region
+            plans.append(plan)
+
+        actionable = [plan for plan in plans if plan["remove_faces"]]
+        lines = ["Auto repair of '%s'" % obj.name,
+                 "  %d non-manifold region(s) found" % len(regions),
+                 "  local-artefact size limit %.1f mm (mean edge %.2f mm)"
+                 % (repair.region_diagonal_limit(mean_edge), mean_edge)]
+        for plan in plans:
+            region = plan["region"]
+            lines.append("  " + repair.describe_region(region))
+            lines.append("    %s - %s"
+                         % (repair.DEFECT_LABELS.get(plan["classification"],
+                                                     plan["classification"]),
+                            plan["detail"]))
+            if not plan["remove_faces"]:
+                lines.append("    REFUSED - left untouched")
+
+        if not actionable:
+            props.repair_log = ((props.repair_log + "\n" if props.repair_log
+                                 else "") + "\n".join(lines))
+            _analyse_repair(context, props, obj)
+            self.report({'WARNING'},
+                        "BSMT: no region could be repaired conservatively - "
+                        "manual cleanup is required")
+            return {'CANCELLED'}
+
+        # Face identity by VERTEX SET, never by index: the plan is computed on
+        # the canonical triangle array, and assuming canonical triangle i is
+        # mesh polygon i is exactly the mis-indexing sect. 7.7 warns about.
+        wanted = {}
+        region_bbox = [0.0, 0.0, 0.0]
+        affected_area = 0.0
+        for plan in actionable:
+            for face_index in plan["remove_faces"]:
+                key = tuple(sorted(int(v) for v in
+                                   canonical.triangles[face_index]))
+                wanted[key] = wanted.get(key, 0) + 1
+            region_bbox = [max(a, b) for a, b in
+                           zip(region_bbox, plan["region"]["bbox_mm"])]
+            affected_area += plan["region"]["area_mm2"]
+
+        centres = [plan["region"]["center_mm"] for plan in actionable]
+        diagonals = [plan["region"]["bbox_diagonal_mm"] for plan in actionable]
+
+        def work(target, _canonical, _before):
+            removed = meshrepair.remove_faces_by_vertex_sets(target, wanted)
+            # Only holes the removal actually opened, only closed ones, only
+            # within the patch limits, and only near a repaired region.
+            fresh = geodesic.meshcache.get(context, target, props.unit,
+                                           rebuild=True)
+            loops = repair.boundary_loops(fresh.vertices_solver,
+                                          fresh.triangles)
+            fillable = []
+            for loop in loops:
+                if not loop["closed"] or loop["edge_count"] < 3:
+                    continue
+                if loop["edge_count"] > repair.MAX_PATCH_EDGES:
+                    continue
+                if loop["perimeter_mm"] > repair.MAX_PATCH_PERIMETER_MM:
+                    continue
+                if loop["bbox_diagonal_mm"] > repair.MAX_PATCH_DIAGONAL_MM:
+                    continue
+                centre = np.asarray(loop["center_mm"], dtype=np.float64)
+                near = any(
+                    float(np.linalg.norm(centre - np.asarray(other))) <=
+                    max(3.0 * diagonal, 5.0)
+                    for other, diagonal in zip(centres, diagonals)
+                )
+                if near:
+                    fillable.append(loop)
+            created, filled, skipped = meshrepair.fill_small_loops(
+                target, fillable)
+            for note in skipped:
+                print("[BSMT] auto repair skipped %s" % note)
+            return ("%d face(s) removed, %d local hole(s) filled (%d new "
+                    "face(s))" % (removed, filled, created))
+
+        outcome_lines = lines
+        result = self._guarded(context, "Auto repair local defects", work)
+
+        after = dict((geodesic.meshcache.peek(obj.name) or canonical).topology
+                     or {})
+        summary = repair.change_summary(before_report, after, region_bbox,
+                                        affected_area)
+        outcome_lines.extend(repair.change_lines(summary))
+        props.repair_log = ((props.repair_log + "\n" if props.repair_log
+                             else "") + "\n".join(outcome_lines))
+        print("\n[BSMT] " + "\n".join(outcome_lines) + "\n")
+        return result
+
+
+class BSMT_OT_auto_repair_boundaries(_RepairBase):
+    """Fill only the tiny boundary structures.
+
+    Crop planes, neck cuts and large scan openings are never touched: a loop
+    must be under the tiny-boundary limits to qualify
+    """
+
+    bl_idname = "bsmt.auto_repair_boundaries"
+    bl_label = "Auto Repair Tiny Boundaries"
+
+    @classmethod
+    def poll(cls, context):
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        if geodesic.ensure_loaded():
+            self.report({'ERROR'}, "BSMT: " + geodesic.ensure_loaded())
+            return {'CANCELLED'}
+
+        canonical = _canonical_arrays(context, props, obj)
+        loops = repair.boundary_loops(canonical.vertices_solver,
+                                      canonical.triangles)
+        if not loops:
+            _analyse_repair(context, props, obj)
+            self.report({'INFO'}, "BSMT: no repair required - 0 boundary edges")
+            return {'FINISHED'}
+
+        tiny = []
+        lines = ["Tiny boundary repair of '%s'" % obj.name,
+                 "  %d boundary loop(s)" % len(loops)]
+        for loop in loops:
+            ok, why = repair.is_tiny_boundary(loop)
+            lines.append("  %s -> %s" % (repair.describe_loop(loop),
+                                         "fill" if ok else "LEFT ALONE (%s)" % why))
+            if ok and loop["closed"] and loop["edge_count"] >= 3:
+                tiny.append(loop)
+            elif ok:
+                lines.append("      not a closed loop of 3+ edges - skipped")
+
+        if not tiny:
+            props.repair_log = ((props.repair_log + "\n" if props.repair_log
+                                 else "") + "\n".join(lines))
+            _analyse_repair(context, props, obj)
+            self.report({'INFO'},
+                        "BSMT: no boundary was small enough to fill "
+                        "automatically")
+            return {'FINISHED'}
+
+        keys = [loop["loop_id"] for loop in tiny]
+
+        def work(target, current, _before):
+            fresh_loops = repair.boundary_loops(current.vertices_solver,
+                                                current.triangles)
+            chosen = [loop for loop in fresh_loops if loop["loop_id"] in keys]
+            created, filled, skipped = meshrepair.fill_small_loops(target,
+                                                                   chosen)
+            for note in skipped:
+                print("[BSMT] tiny boundary skipped %s" % note)
+            if filled == 0:
+                raise meshrepair.RepairAborted(
+                    "none of the tiny boundaries could be filled"
+                )
+            return "%d tiny boundary/boundaries filled (%d new face(s))" % (
+                filled, created)
+
+        result = self._guarded(context, "Auto repair tiny boundaries", work)
+        props.repair_log = ((props.repair_log + "\n" if props.repair_log
+                             else "") + "\n".join(lines))
+        print("\n[BSMT] " + "\n".join(lines) + "\n")
+        return result
+
+
 class BSMT_OT_restore_repair_backup(bpy.types.Operator):
     """Restore the mesh as it was before the last repair"""
 
@@ -3803,6 +4036,8 @@ classes = (
     BSMT_OT_remove_small_component,
     BSMT_OT_remove_duplicate_faces,
     BSMT_OT_weld_non_manifold,
+    BSMT_OT_auto_repair_local,
+    BSMT_OT_auto_repair_boundaries,
     BSMT_OT_restore_repair_backup,
     BSMT_OT_clear_repair_report,
 )

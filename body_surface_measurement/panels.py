@@ -1248,6 +1248,20 @@ class BSMT_PT_repair(bpy.types.Panel):
             layout.label(text="Analyse the mesh to see its diagnostics")
             return
 
+        # Automatic repair. Nothing here runs by opening the panel: geometry
+        # changes only on an explicit press.
+        auto = layout.box()
+        auto.label(text="Automatic Repair", icon='SHADERFX')
+        auto.operator("bsmt.auto_repair_local", icon='MODIFIER')
+        auto.operator("bsmt.auto_repair_boundaries", icon='MOD_TRIANGULATE')
+        note = auto.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("Only small localised artefacts. Every attempt is "
+                          "validated and reverted if it does not improve the "
+                          "topology.", 44):
+            note.label(text=line)
+
         self._draw_diagnostics(layout, props)
         self._draw_non_manifold(layout, props)
         self._draw_boundaries(layout, props)

@@ -27,6 +27,72 @@ SMALL_COMPONENT_FRACTION = 0.02
 READY = 'READY'
 NOT_READY = 'NOT_READY'
 
+# --- automatic local repair thresholds (Milestone 3.5) ---------------------
+#
+# These bound what "small localised artefact" means. They exist as named
+# constants rather than magic numbers because they are the entire difference
+# between repairing a scanner spike and quietly deleting anatomy. A region
+# that exceeds any of them is REFUSED, not attempted: on a human scan the
+# safe failure is "we did not touch it", never "we did our best".
+#
+# Sized against the real Design X measurement copy, whose 7 non-manifold
+# edges sit in one star/fan around a single vertex at roughly millimetre
+# scale, and whose 14 boundary edges form ~7 open chains of ~1 mm.
+
+#: A non-manifold region involving more faces than this is not a local
+#: artefact and is refused.
+MAX_REGION_FACES = 64
+#: Nor is one whose bounding box is larger than this across. The limit is
+#: ADAPTIVE: what makes a defect "local" is spanning a handful of triangles,
+#: and how many millimetres that is depends on the mesh's own resolution. A
+#: fan around one vertex on a 4 mm-edge body scan spans ~20 mm; the same fan
+#: on a coarse 13 mm-edge mesh spans ~60 mm and is no less local. The
+#: absolute value below is a floor, raised to REGION_EDGE_FACTOR x the mean
+#: edge length when the mesh is coarser than that.
+MAX_REGION_DIAGONAL_MM = 20.0
+REGION_EDGE_FACTOR = 6.0
+
+
+def region_diagonal_limit(mean_edge_mm=0.0):
+    """The largest a region may be and still count as a local artefact."""
+    try:
+        mean_edge = float(mean_edge_mm or 0.0)
+    except (TypeError, ValueError):
+        mean_edge = 0.0
+    return max(MAX_REGION_DIAGONAL_MM, REGION_EDGE_FACTOR * mean_edge)
+#: Hard cap on faces an automatic repair may remove from one region.
+MAX_FACES_REMOVED = 32
+
+#: A hole left by an automatic repair is filled only if it is this small.
+MAX_PATCH_EDGES = 32
+MAX_PATCH_PERIMETER_MM = 60.0
+MAX_PATCH_DIAGONAL_MM = 20.0
+
+#: "Tiny boundary" for the separate automatic boundary pass. Deliberately
+#: much tighter than the patch limits: this pass runs over boundaries the user
+#: did not point at, so it must never reach a crop plane, a neck cut or any
+#: anatomically meaningful opening.
+TINY_BOUNDARY_EDGES = 12
+TINY_BOUNDARY_PERIMETER_MM = 12.0
+TINY_BOUNDARY_DIAGONAL_MM = 5.0
+
+# defect classifications
+DEFECT_DUPLICATE = 'DUPLICATE_FACES'
+DEFECT_FIN = 'FIN'
+DEFECT_FAN = 'FAN'
+DEFECT_FLAP = 'LOCAL_FLAP'
+DEFECT_AMBIGUOUS = 'AMBIGUOUS'
+DEFECT_TOO_LARGE = 'TOO_LARGE'
+
+DEFECT_LABELS = {
+    DEFECT_DUPLICATE: "duplicate / reversed faces",
+    DEFECT_FIN: "fin - a face hanging off an edge by a dangling vertex",
+    DEFECT_FAN: "fan - excess faces around one central vertex",
+    DEFECT_FLAP: "local flap - a small redundant patch",
+    DEFECT_AMBIGUOUS: "ambiguous - not repaired automatically",
+    DEFECT_TOO_LARGE: "too large to treat as a local artefact",
+}
+
 
 class RepairError(Exception):
     """A repair request cannot be carried out as asked."""
@@ -320,4 +386,413 @@ def repair_lines(record):
                                         record["boundary_after"]),
         "  components      %d -> %d" % (record["components_before"],
                                         record["components_after"]),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# automatic local non-manifold repair (Milestone 3.5)
+# ---------------------------------------------------------------------------
+#
+# Everything below computes a PLAN. It decides which faces an automatic repair
+# would remove and predicts the resulting topology, without touching a mesh.
+# ``meshrepair.py`` executes the plan transactionally and reverts it if the
+# measured outcome does not match.
+
+
+def _edge_key(a, b):
+    return (int(a), int(b)) if a < b else (int(b), int(a))
+
+
+def edge_incidence(faces):
+    """Map every undirected edge to the faces using it. Pure python dict.
+
+    Built once and then decremented as faces are removed, so a repair plan
+    never has to re-scan the whole mesh per step.
+    """
+    incidence = {}
+    faces = np.asarray(faces, dtype=np.int64)
+    for index in range(faces.shape[0]):
+        a, b, c = faces[index]
+        for key in (_edge_key(a, b), _edge_key(b, c), _edge_key(c, a)):
+            incidence.setdefault(key, []).append(index)
+    return incidence
+
+
+def non_manifold_regions(vertices, faces, max_regions=64):
+    """Group non-manifold edges into connected local regions.
+
+    Two non-manifold edges belong to the same region when they share a vertex.
+    Reporting them individually would be misleading: the real scan's seven
+    edges are one artefact around one vertex, not seven separate problems.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    edges = classify_edges(faces, vertices.shape[0])["non_manifold"]
+    if edges.shape[0] == 0:
+        return []
+
+    # Union-find over non-manifold edges, joined through shared vertices.
+    parent = list(range(edges.shape[0]))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[max(rx, ry)] = min(rx, ry)
+
+    by_vertex = {}
+    for index in range(edges.shape[0]):
+        for vertex in (int(edges[index, 0]), int(edges[index, 1])):
+            if vertex in by_vertex:
+                union(index, by_vertex[vertex])
+            else:
+                by_vertex[vertex] = index
+
+    groups = {}
+    for index in range(edges.shape[0]):
+        groups.setdefault(find(index), []).append(index)
+
+    incidence = edge_incidence(faces)
+    regions = []
+    for members in groups.values():
+        member_edges = edges[np.asarray(members, dtype=np.int64)]
+        face_set = set()
+        for a, b in member_edges:
+            face_set.update(incidence.get(_edge_key(a, b), ()))
+        face_indices = np.asarray(sorted(face_set), dtype=np.int64)
+        vertex_indices = np.unique(faces[face_indices]) if face_indices.size \
+            else np.unique(member_edges)
+        points = vertices[vertex_indices]
+        extent = points.max(axis=0) - points.min(axis=0)
+        corners = vertices[faces[face_indices]] if face_indices.size else None
+        area = 0.0
+        if corners is not None and corners.size:
+            area = float(0.5 * np.linalg.norm(
+                np.cross(corners[:, 1] - corners[:, 0],
+                         corners[:, 2] - corners[:, 0]), axis=1).sum())
+        regions.append({
+            "edges": member_edges,
+            "edge_count": int(member_edges.shape[0]),
+            "face_indices": face_indices,
+            "face_count": int(face_indices.shape[0]),
+            "vertex_indices": vertex_indices,
+            "vertex_count": int(vertex_indices.shape[0]),
+            "bbox_mm": [float(v) for v in extent],
+            "bbox_diagonal_mm": float(np.linalg.norm(extent)),
+            "area_mm2": area,
+            "center_mm": [float(v) for v in points.mean(axis=0)],
+        })
+
+    regions.sort(key=lambda entry: entry["edge_count"], reverse=True)
+    for position, region in enumerate(regions[:max_regions]):
+        region["region_id"] = position + 1
+    return regions[:max_regions]
+
+
+def describe_region(region):
+    return ("R%d  %d non-manifold edge(s), %d face(s), %d vertex/vertices, "
+            "%.2f mm across, %.4f mm2"
+            % (region["region_id"], region["edge_count"], region["face_count"],
+               region["vertex_count"], region["bbox_diagonal_mm"],
+               region["area_mm2"]))
+
+
+def classify_region(vertices, faces, region, mean_edge_mm=0.0):
+    """Name the defect, or refuse. Returns (classification, detail).
+
+    Refusing is a real outcome, not a fallback: sect. 3 says do not claim a
+    classification if it is ambiguous, and a wrong guess here removes anatomy.
+    """
+    faces = np.asarray(faces, dtype=np.int64)
+    face_indices = region["face_indices"]
+
+    if region["face_count"] > MAX_REGION_FACES:
+        return DEFECT_TOO_LARGE, ("%d faces exceeds the %d-face limit for a "
+                                  "local artefact"
+                                  % (region["face_count"], MAX_REGION_FACES))
+    limit = region_diagonal_limit(mean_edge_mm)
+    if region["bbox_diagonal_mm"] > limit:
+        return DEFECT_TOO_LARGE, ("%.1f mm across exceeds the %.1f mm limit "
+                                  "for a local artefact on this mesh"
+                                  % (region["bbox_diagonal_mm"], limit))
+
+    # Duplicate or reversed faces inside the region.
+    local = faces[face_indices]
+    keys = [tuple(sorted(int(v) for v in row)) for row in local]
+    if len(set(keys)) < len(keys):
+        return DEFECT_DUPLICATE, "the region contains repeated face(s)"
+
+    # A fin: a region face with a vertex no OTHER face uses. Each face
+    # contributes a vertex exactly once to the flattened array, so this
+    # degree is literally "how many faces use this vertex", and 1 means the
+    # vertex hangs off the surface.
+    degree = np.bincount(faces.ravel(), minlength=int(faces.max()) + 1)
+    for row in local:
+        if any(int(degree[int(v)]) == 1 for v in row):
+            return DEFECT_FIN, "a face hangs off the surface by a dangling vertex"
+
+    # A fan: every non-manifold edge shares one central vertex.
+    shared = set(int(v) for v in region["edges"][0])
+    for pair in region["edges"][1:]:
+        shared &= set(int(v) for v in pair)
+    if shared:
+        return DEFECT_FAN, ("%d non-manifold edge(s) all meet at vertex %d"
+                            % (region["edge_count"], sorted(shared)[0]))
+
+    if region["face_count"] <= 12:
+        return DEFECT_FLAP, "a small redundant patch of %d face(s)" % region["face_count"]
+
+    return DEFECT_AMBIGUOUS, ("the local topology does not match a pattern "
+                              "BSMT repairs automatically")
+
+
+def plan_region_repair(vertices, faces, region,
+                       max_removed=MAX_FACES_REMOVED, mean_edge_mm=0.0):
+    """Choose the minimal redundant faces to remove. Returns a plan dict.
+
+    Greedy and deterministic: at each step it removes the region face that
+    resolves the most non-manifold edges, breaking ties by smallest area then
+    lowest index, and it KEEPS a removal only if the non-manifold count
+    strictly falls. Candidates are restricted to faces incident to a
+    non-manifold edge of this region, so the blast radius cannot spread into
+    surrounding anatomy.
+
+    It never touches a mesh; ``remove_faces`` is a list of face indices for
+    ``meshrepair`` to execute inside a transaction.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    classification, detail = classify_region(vertices, faces, region,
+                                             mean_edge_mm)
+    plan = {
+        "region_id": region.get("region_id", 0),
+        "classification": classification,
+        "detail": detail,
+        "remove_faces": [],
+        "nonmanifold_before": region["edge_count"],
+        "nonmanifold_after": region["edge_count"],
+        "refused": classification in (DEFECT_AMBIGUOUS, DEFECT_TOO_LARGE),
+        "resolved": False,
+        "steps": [],
+    }
+    if plan["refused"]:
+        return plan
+
+    # Local edge bookkeeping: incidence counted across the WHOLE mesh, then
+    # decremented as faces are removed. Exact, and O(1) per step.
+    incidence = edge_incidence(faces)
+    counts = {key: len(value) for key, value in incidence.items()}
+
+    candidate_faces = set(int(v) for v in region["face_indices"])
+    corners = vertices[faces]
+    areas = 0.5 * np.linalg.norm(
+        np.cross(corners[:, 1] - corners[:, 0],
+                 corners[:, 2] - corners[:, 0]), axis=1)
+    # When a face repeats another, remove the LATER copy. Both choices are
+    # topologically identical, but the first occurrence is the one already
+    # woven into the mesh's winding and UV layout, so churning it gains
+    # nothing and risks the texture.
+    redundant = set(int(v) for v in duplicate_faces(faces))
+
+    def face_edges(index):
+        a, b, c = faces[index]
+        return (_edge_key(a, b), _edge_key(b, c), _edge_key(c, a))
+
+    def region_non_manifold():
+        return sum(1 for key in region_edge_keys if counts.get(key, 0) >= 3)
+
+    region_edge_keys = set()
+    for index in candidate_faces:
+        region_edge_keys.update(face_edges(index))
+
+    removed = []
+    alive = set(candidate_faces)
+    current = region_non_manifold()
+    for _step in range(max_removed):
+        if current == 0:
+            break
+        best = None
+        for index in sorted(alive):
+            keys = face_edges(index)
+            resolves = sum(1 for key in keys if counts.get(key, 0) >= 3)
+            if resolves == 0:
+                continue
+            # Deterministic ordering: resolve the most edges, prefer a
+            # redundant copy, then the smallest face, then the lowest index.
+            score = (-resolves, 0 if index in redundant else 1,
+                     float(areas[index]), index)
+            if best is None or score < best[0]:
+                best = (score, index, keys)
+        if best is None:
+            break
+
+        _score, index, keys = best
+        for key in keys:
+            counts[key] = counts.get(key, 0) - 1
+        after = region_non_manifold()
+        if after >= current:
+            # Undo the trial: a removal that does not strictly improve is not
+            # made. Without this the greedy step could keep deleting faces
+            # while achieving nothing.
+            for key in keys:
+                counts[key] = counts.get(key, 0) + 1
+            break
+        alive.discard(index)
+        removed.append(int(index))
+        plan["steps"].append({
+            "face": int(index),
+            "area_mm2": float(areas[index]),
+            "nonmanifold_after": after,
+        })
+        current = after
+
+    plan["remove_faces"] = removed
+    plan["nonmanifold_after"] = current
+    plan["resolved"] = current == 0
+    if not removed:
+        plan["refused"] = True
+        plan["detail"] = (detail + "; no face removal reduced the "
+                                   "non-manifold count")
+    return plan
+
+
+def predict_patch(vertices, faces, remove_faces):
+    """The boundary a removal would leave behind, and whether it is fillable.
+
+    Returned before anything is executed, so the size limits of sect. 5 are
+    checked against the actual hole rather than hoped for afterwards.
+    """
+    faces = np.asarray(faces, dtype=np.int64)
+    keep = np.ones(faces.shape[0], dtype=bool)
+    keep[np.asarray(remove_faces, dtype=np.int64)] = False
+    remaining = faces[keep]
+    loops_before = {tuple(sorted(edge))
+                    for edge in classify_edges(
+                        faces, int(np.asarray(vertices).shape[0]))["boundary"]}
+    after = classify_edges(remaining, int(np.asarray(vertices).shape[0]))
+    new_boundary = [edge for edge in after["boundary"]
+                    if tuple(sorted(edge)) not in loops_before]
+    if not new_boundary:
+        return {"new_boundary_edges": 0, "fillable": True, "loops": [],
+                "reason": "the removal leaves no new boundary"}
+
+    loops = boundary_loops(np.asarray(vertices, dtype=np.float64), remaining)
+    new_keys = {tuple(sorted(edge)) for edge in new_boundary}
+    touched = [loop for loop in loops
+               if any(tuple(sorted(edge)) in new_keys for edge in loop["edges"])]
+
+    fillable = True
+    reasons = []
+    for loop in touched:
+        if loop["edge_count"] > MAX_PATCH_EDGES:
+            fillable = False
+            reasons.append("a new hole has %d edges (limit %d)"
+                           % (loop["edge_count"], MAX_PATCH_EDGES))
+        if loop["perimeter_mm"] > MAX_PATCH_PERIMETER_MM:
+            fillable = False
+            reasons.append("a new hole is %.1f mm around (limit %.1f)"
+                           % (loop["perimeter_mm"], MAX_PATCH_PERIMETER_MM))
+        if loop["bbox_diagonal_mm"] > MAX_PATCH_DIAGONAL_MM:
+            fillable = False
+            reasons.append("a new hole is %.1f mm across (limit %.1f)"
+                           % (loop["bbox_diagonal_mm"], MAX_PATCH_DIAGONAL_MM))
+    return {
+        "new_boundary_edges": len(new_boundary),
+        "loops": touched,
+        "fillable": fillable,
+        "reason": "; ".join(reasons) if reasons else "within the patch limits",
+    }
+
+
+def is_tiny_boundary(loop):
+    """Whether a boundary loop is small enough for the automatic pass.
+
+    Deliberately strict. This pass runs over boundaries the researcher did not
+    point at, so it must never reach a crop plane, a neck cut, or any
+    anatomically meaningful opening.
+    """
+    if loop["edge_count"] > TINY_BOUNDARY_EDGES:
+        return False, ("%d edges exceeds the %d-edge limit"
+                       % (loop["edge_count"], TINY_BOUNDARY_EDGES))
+    if loop["perimeter_mm"] > TINY_BOUNDARY_PERIMETER_MM:
+        return False, ("%.2f mm perimeter exceeds the %.1f mm limit"
+                       % (loop["perimeter_mm"], TINY_BOUNDARY_PERIMETER_MM))
+    if loop["bbox_diagonal_mm"] > TINY_BOUNDARY_DIAGONAL_MM:
+        return False, ("%.2f mm across exceeds the %.1f mm limit"
+                       % (loop["bbox_diagonal_mm"], TINY_BOUNDARY_DIAGONAL_MM))
+    return True, "within the tiny-boundary limits"
+
+
+# ---------------------------------------------------------------------------
+# acceptance (sect. 6)
+# ---------------------------------------------------------------------------
+
+def accept_repair(before, after, texture_ok, new_boundary_limit=MAX_PATCH_EDGES):
+    """Should a completed repair be kept? Returns (accept, reasons).
+
+    Every criterion must hold. A repair that fails any of them is reverted, so
+    a failed attempt can never be left behind in the measurement copy.
+    """
+    reasons = []
+    nm_before = int(before.get("nonmanifold_edge_count", 0) or 0)
+    nm_after = int(after.get("nonmanifold_edge_count", 0) or 0)
+    if nm_after >= nm_before:
+        reasons.append("non-manifold edges did not decrease (%d -> %d)"
+                       % (nm_before, nm_after))
+
+    boundary_before = int(before.get("boundary_edge_count", 0) or 0)
+    boundary_after = int(after.get("boundary_edge_count", 0) or 0)
+    if boundary_after - boundary_before > new_boundary_limit:
+        reasons.append("it opened %d new boundary edge(s), more than the %d "
+                       "allowed" % (boundary_after - boundary_before,
+                                    new_boundary_limit))
+
+    components_before = int(before.get("component_count", 0) or 0)
+    components_after = int(after.get("component_count", 0) or 0)
+    if components_after > components_before:
+        reasons.append("it split the mesh into more components (%d -> %d)"
+                       % (components_before, components_after))
+
+    if int(after.get("triangle_count", 0) or 0) <= 0:
+        reasons.append("the mesh has no triangles left")
+
+    if not texture_ok:
+        reasons.append("the UV map, material or image texture was lost")
+
+    return (not reasons), reasons
+
+
+def change_summary(before, after, region_bbox_mm=None, area_mm2=None):
+    """What a repair changed, in the terms sect. 7 asks for."""
+    return {
+        "vertices_before": int(before.get("vertex_count", 0) or 0),
+        "vertices_after": int(after.get("vertex_count", 0) or 0),
+        "vertex_delta": int(after.get("vertex_count", 0) or 0)
+                        - int(before.get("vertex_count", 0) or 0),
+        "faces_before": int(before.get("triangle_count", 0) or 0),
+        "faces_after": int(after.get("triangle_count", 0) or 0),
+        "face_delta": int(after.get("triangle_count", 0) or 0)
+                      - int(before.get("triangle_count", 0) or 0),
+        "region_bbox_mm": region_bbox_mm or [0.0, 0.0, 0.0],
+        "max_region_dimension_mm": (max(region_bbox_mm)
+                                    if region_bbox_mm else 0.0),
+        "affected_area_mm2": float(area_mm2 or 0.0),
+    }
+
+
+def change_lines(summary):
+    return [
+        "  vertices        %s -> %s (%+d)" % (
+            "{:,}".format(summary["vertices_before"]),
+            "{:,}".format(summary["vertices_after"]), summary["vertex_delta"]),
+        "  faces           %s -> %s (%+d)" % (
+            "{:,}".format(summary["faces_before"]),
+            "{:,}".format(summary["faces_after"]), summary["face_delta"]),
+        "  affected region %.2f mm across, %.4f mm2"
+        % (summary["max_region_dimension_mm"], summary["affected_area_mm2"]),
     ]

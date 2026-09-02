@@ -11,7 +11,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 12, 0),
+    "version": (0, 13, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (
@@ -22,7 +22,8 @@ bl_info = {
         "Milestone 3.1: user-defined measurement manager. "
         "Milestone 3.2: measurement visualization and surface paths. "
         "Milestone 3.3: scan preprocessing and solver safety gate. "
-        "Milestone 3.4: controlled mesh repair"
+        "Milestone 3.4: controlled mesh repair. "
+        "Milestone 3.5: automatic local non-manifold repair"
     ),
     "category": "3D View",
 }

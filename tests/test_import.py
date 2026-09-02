@@ -896,6 +896,17 @@ def test_landmark_modules_are_pure(bsmt):
 
     finder = _CallFinder()
     finder.visit(_ast.parse(ops_gate))
+    # Milestone 3.5: automatic repair must never run without an explicit
+    # press, and must never reach the source scan.
+    for op_name in ("auto_repair_local", "auto_repair_boundaries"):
+        check("bsmt.%s exists" % op_name,
+              'bl_idname = "bsmt.%s"' % op_name in ops_gate)
+    panels_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                     "panels.py")).read()
+    for forbidden in ("auto_repair_local(", "auto_repair_boundaries("):
+        check("panels.py never CALLS %s" % forbidden,
+              forbidden not in panels_text.replace('"bsmt.', '"'),
+              "drawing a panel must not modify geometry")
     check("the gate is applied at exactly three solver entry points",
           len(finder.hits) == 3, str(finder.hits))
     for expected in ("BSMT_OT_calculate_surface_distance",

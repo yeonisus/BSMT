@@ -7,8 +7,9 @@
 bundled Python 3.11.15, numpy 1.26.4 — **all detected at runtime, 2026-09-02** (§5.1a)
 **Status:** Phase 1 complete and validated on a real human-body scan. Milestones 2.0, 2.0a,
 2.1, 2.2, 2.3, 3.0 (Landmark Manager), 3.1 (Measurement Manager) and
-3.2 (Measurement Visualisation), 3.3 (Scan Preprocessing) and **3.4 (Mesh Repair)** implemented
-and validated in Blender. Real-scan acceptance testing of 2.3 and 3.0–3.4 is outstanding.
+3.2 (Measurement Visualisation), 3.3 (Scan Preprocessing), 3.4 (Mesh Repair) and
+**3.5 (Automatic Local Repair)** implemented and validated in Blender. Real-scan acceptance
+testing of 2.3 and 3.0–3.5 is outstanding.
 
 > Note on this document's history: no `PROJECT_SPEC.md` existed in the project before this
 > revision. Phase 1 was specified conversationally and implemented from that specification.
@@ -30,7 +31,8 @@ on textured OBJ human-body scans.
 | 3.2 | Measurement visualisation: straight chords and exact geodesic paths | **Done** (v0.10.0) |
 | 3.3 | Scan preprocessing: textured measurement copy + solver safety gate | **Done** (v0.11.0) |
 | 3.4 | Controlled mesh repair and measurement readiness | **Done** (v0.12.0) |
-| 3.5+ | CSV/XLSX export, alignment, automatic landmark detection | Not designed |
+| 3.5 | Automatic local non-manifold repair | **Done** (v0.13.0) |
+| 3.6+ | CSV/XLSX export, alignment, automatic landmark detection | Not designed |
 | Future | Anatomical scan alignment (§13) | Requirement recorded, not designed |
 
 Non-goals for Phase 2, explicitly: automatic landmark detection, mesh repair as a measurement
@@ -2012,6 +2014,93 @@ boundary loops and one component, and exact surface distance (130.2824 mm) plus 
 **Outstanding: real-scan acceptance on the Design X measurement copy and the full-body PLY** — in
 particular whether decimation leaves the 7 non-manifold edges, and whether they are duplicate
 faces (auto-repairable) or fins (manual).
+
+---
+
+## 11g. Milestone 3.5 — Automatic local non-manifold repair (v0.13.0, 2026-09-02)
+
+Repairs small localised non-manifold artefacts without the researcher entering Edit Mode.
+
+### 11g.1 What the real data told us
+
+The Design X measurement copy carries 7 non-manifold edges **clustered in one star/fan around a
+single vertex**, and a local weld at 0.01 mm and 0.05 mm changes nothing. That rules out
+near-duplicate vertices: it is a genuine topological artefact — extra faces attached to a vertex
+fan — and the fix is to remove the redundant faces, not to move any vertex.
+
+### 11g.2 The algorithm
+
+1. **Cluster.** Non-manifold edges are grouped by shared vertices (union–find) into regions.
+   Seven edges around one vertex are *one* artefact, not seven problems.
+2. **Classify.** `DUPLICATE_FACES` (a repeated vertex set, winding-insensitive), `FIN` (a face
+   held on by a vertex no other face uses), `FAN` (every non-manifold edge meets at one vertex),
+   `LOCAL_FLAP`, or `AMBIGUOUS` / `TOO_LARGE` — both of which **refuse**. §3 says do not claim a
+   classification when it is ambiguous, and a wrong guess removes anatomy.
+3. **Plan.** Greedy and deterministic: repeatedly remove the region face that resolves the most
+   non-manifold edges, tie-broken by *preferring a redundant copy*, then smallest area, then
+   lowest index — and **keep a removal only if the non-manifold count strictly falls**.
+   Candidates are restricted to faces touching a non-manifold edge of that region, so the blast
+   radius cannot spread. Edge incidence is counted across the whole mesh once and then
+   decremented, so each step is O(1) rather than a re-scan.
+4. **Execute, validate, revert.** Transactional, below.
+
+Preferring the redundant copy matters: with two identical faces both choices are topologically
+identical, but the *first* occurrence is the one already woven into the mesh's winding and UV
+layout, so removing the later copy churns nothing.
+
+### 11g.3 The size limit had to be adaptive
+
+A fixed millimetre limit was wrong, and the test fixtures exposed it. What makes a defect "local"
+is spanning a handful of triangles, and how many millimetres that is depends on the mesh's own
+resolution: a fan around one vertex spans ~20 mm on a 4 mm-edge body scan and ~60 mm on a coarse
+13 mm-edge mesh, and is no less local. `region_diagonal_limit()` is therefore
+`max(20 mm, 6 x mean edge length)` — an absolute floor, raised for coarser meshes. Verified both
+ways: the same artefact is refused when the mesh scale is withheld and accepted when it is known.
+
+### 11g.4 Transactional repair (§6)
+
+The mesh datablock is backed up, the plan executed, and the result **measured**. It is kept only
+if every criterion of `accept_repair()` holds: non-manifold edges strictly decreased, no more than
+`MAX_PATCH_EDGES` new boundary edges, component count not worse, triangles remain, and the UV
+map / material / image are intact. Any failure restores the backup, so a failed attempt is never
+left behind.
+
+Faces are addressed by their **sorted vertex set**, never by index. The plan is computed on the
+canonical triangle array, and assuming canonical triangle *i* is mesh polygon *i* is exactly the
+silent mis-indexing §7.7 warns about.
+
+### 11g.5 Patch reconstruction and tiny boundaries
+
+A hole left by a removal is filled only when it is a **closed** loop of ≥3 edges, within the patch
+limits, *and* near a repaired region. That last condition matters: removing a duplicate face can
+*restore* a real boundary edge that the duplicate had been masking, and filling that would be
+wrong.
+
+`Auto Repair Tiny Boundaries` is a separate, deliberately stricter pass (≤12 edges, ≤12 mm
+perimeter, ≤5 mm across) because it runs over boundaries the researcher did not point at. Verified:
+a 521 mm crop opening is reported "LEFT ALONE — 32 edges exceeds the 12-edge limit" and the mesh is
+untouched.
+
+### 11g.6 Component handling
+
+Unchanged from 3.4 and deliberately so. The real Component 2 is ~8,789 triangles (~2.5%), far too
+large to call junk by size alone. It is reported and visualised; removal stays explicit.
+
+### 11g.7 Verified in Blender 4.5.13
+
+Textured sphere with a 4-spoke fan around one vertex: **one** region found holding all 5
+non-manifold edges, classified `FAN — 5 non-manifold edge(s) all meet at vertex 200`, repaired to
+**0 non-manifold** and 0 boundary edges by removing **4 faces**, components unchanged, UV/material/
+image preserved, readiness `READY`. Exact surface distance (62.5433 mm) and the surface path
+(13 points) then both worked — they had been refused by the safety gate beforehand, which is the
+gate doing its job.
+
+Clean-mesh regression: auto repair and tiny-boundary repair both reported "no repair required" and
+left the mesh byte-identical. The source scan was unchanged throughout.
+
+**Outstanding: the real Design X measurement copy.** The synthetic fan is a faithful analogue but
+not the same artefact; whether the real 7 edges classify as `FAN`/`FIN` (repairable) or
+`AMBIGUOUS` (refused) can only be answered on the real data.
 
 ---
 
