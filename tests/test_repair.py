@@ -629,6 +629,127 @@ def test_change_summary():
     check("and the affected region size", "1.20 mm across" in text, text)
 
 
+def test_signatures_survive_reindexing():
+    print("\n[iterate] non-manifold edges are identified by POSITION")
+    V, F = fan_fixture(spokes=3)
+    signature = repair.nonmanifold_signature(V, F)
+    check("a defect has a signature", len(signature) > 0)
+    check("its size matches the edge count",
+          len(signature)
+          == repair.classify_edges(F, V.shape[0])["non_manifold"].shape[0])
+    check("a clean mesh has an empty signature",
+          repair.nonmanifold_signature(*grid(6)) == set())
+
+    # Renumbering every vertex must not change the signature: that is the
+    # whole point, because removing faces renumbers the mesh.
+    order = np.arange(V.shape[0])[::-1]
+    inverse = np.empty_like(order)
+    inverse[order] = np.arange(order.size)
+    check("renumbering the mesh leaves the signature identical",
+          repair.nonmanifold_signature(V[order], inverse[F]) == signature)
+
+    check("a region's own signature is a subset of the whole mesh's",
+          repair.region_signature(V, repair.non_manifold_regions(V, F)[0])
+          <= signature)
+
+
+def test_step_rule_refuses_moving_the_defect():
+    print("\n[iterate] a step may not create a defect elsewhere")
+    report_ok = {"component_count": 1, "triangle_count": 100}
+    before = {(1, 1, 1), (2, 2, 2), (3, 3, 3)}
+
+    ok, why = repair.step_acceptable(before, {(1, 1, 1), (2, 2, 2)},
+                                     report_ok, report_ok, True)
+    check("a genuine reduction is accepted", ok, str(why))
+
+    ok, why = repair.step_acceptable(before, {(1, 1, 1), (9, 9, 9)},
+                                     report_ok, report_ok, True)
+    check("fixing two while creating one is REFUSED", not ok)
+    check("  and says it moved the defect",
+          "elsewhere" in why[0], str(why))
+
+    ok, why = repair.step_acceptable(before, before, report_ok, report_ok, True)
+    check("no change is refused", not ok)
+    ok, why = repair.step_acceptable(before, before | {(9, 9, 9)},
+                                     report_ok, report_ok, True)
+    check("getting worse is refused", not ok)
+    ok, why = repair.step_acceptable(before, set(), report_ok, report_ok, True)
+    check("clearing everything is accepted", ok, str(why))
+
+    ok, why = repair.step_acceptable(
+        before, {(1, 1, 1)}, report_ok, {"component_count": 4,
+                                         "triangle_count": 100}, True)
+    check("splitting the mesh is refused", not ok)
+    ok, why = repair.step_acceptable(before, {(1, 1, 1)}, report_ok, report_ok,
+                                     False)
+    check("losing the texture is refused", not ok)
+    ok, why = repair.step_acceptable(before, {(1, 1, 1)}, report_ok, report_ok,
+                                     True, set(), {(5, 5, 5)})
+    check("creating a degenerate face is refused", not ok)
+    check("  and names it", "degenerate" in why[0], str(why))
+
+
+def test_local_invariants_are_scoped_to_the_region():
+    print("\n[iterate] the local check judges THIS region, not its neighbours")
+    V, F = grid(6)
+    target = {(1, 1, 1)}
+
+    ok, problems = repair.local_invariants(target, set(), V, F, [0, 0, 0], 5.0)
+    check("a resolved region passes", ok, str(problems))
+
+    ok, problems = repair.local_invariants(target, target, V, F, [0, 0, 0], 5.0)
+    check("an unresolved region fails", not ok)
+    check("  and says how many survived", "survived" in problems[0])
+
+    # An unrelated defect nearby must NOT fail this region's check. An earlier
+    # version demanded the whole neighbourhood be clean and reverted good
+    # repairs because a different artefact was still present.
+    neighbour = {(7, 7, 7)}
+    ok, problems = repair.local_invariants(target, neighbour, V, F,
+                                           [0, 0, 0], 1e6)
+    check("an unrelated nearby defect does NOT fail this region", ok,
+          str(problems))
+
+
+def test_fill_guard():
+    print("\n[iterate] filling never adds a third face to an edge")
+    V, F = grid(6)
+    loops = repair.boundary_loops(V, F)
+    good, rejected = repair.fillable_boundary_loops(V, F, loops)
+    check("a real boundary loop is fillable", len(good) == 1, str(len(good)))
+
+    interior = repair.classify_edges(F, V.shape[0])["interior"][:3]
+    fake = [{"closed": True, "edge_count": 3, "edges": interior,
+             "perimeter_mm": 1.0, "bbox_diagonal_mm": 1.0, "loop_id": 1}]
+    good, rejected = repair.fillable_boundary_loops(V, F, fake)
+    check("a loop of INTERIOR edges is refused", len(good) == 0)
+    check("  and says why", "already carry two faces" in rejected[0][1],
+          rejected[0][1])
+
+    open_chain = [{"closed": False, "edge_count": 2,
+                   "edges": loops[0]["edges"][:2], "perimeter_mm": 1.0,
+                   "bbox_diagonal_mm": 1.0, "loop_id": 1}]
+    good, rejected = repair.fillable_boundary_loops(V, F, open_chain)
+    check("an open chain is refused, never force-filled", len(good) == 0)
+    check("  and says why", "closed loop" in rejected[0][1], rejected[0][1])
+
+
+def test_dangling_preference():
+    print("\n[iterate] a face held by a dangling vertex is preferred")
+    V, F = fin_fixture()
+    region = repair.non_manifold_regions(V, F)[0]
+    plan = repair.plan_region_repair(V, F, region,
+                                     mean_edge_mm=mean_edge(V, F))
+    check("the fin is chosen, not a surface face",
+          plan["remove_faces"] == [F.shape[0] - 1], str(plan["remove_faces"]))
+    check("removing it opens no hole",
+          repair.predict_patch(V, F, plan["remove_faces"])["new_boundary_edges"]
+          == 0)
+    # The surface faces on that edge are what a naive "smallest area" rule
+    # could pick instead; removing one would tear the shell.
+    check("only one face is removed", len(plan["remove_faces"]) == 1)
+
+
 def main():
     print("BSMT Milestone 3.4 - mesh repair tests")
     print("  python : %s" % sys.version.split()[0])
@@ -650,6 +771,11 @@ def main():
         test_tiny_boundary_limits,
         test_acceptance_criteria,
         test_change_summary,
+        test_signatures_survive_reindexing,
+        test_step_rule_refuses_moving_the_defect,
+        test_local_invariants_are_scoped_to_the_region,
+        test_fill_guard,
+        test_dangling_preference,
     ):
         test()
     print("\n%d checks, %d failure(s)" % (CHECKS[0], len(FAILURES)))

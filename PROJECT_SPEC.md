@@ -2104,6 +2104,77 @@ not the same artefact; whether the real 7 edges classify as `FAN`/`FIN` (repaira
 
 ---
 
+## 11h. Milestone 3.5a — Iterative local repair (v0.13.1, 2026-09-02)
+
+Real-data validation of 3.5 on the Design X measurement copy reached
+**7 non-manifold edges → 4**, not 0, while adding 4 faces. This revision diagnoses why and fixes
+it. No new features.
+
+### 11h.1 Three defects, all structural
+
+**1. Every region was planned against ONE initial analysis and executed as a batch.** After the
+first local edit the connectivity has changed, so every later plan referred to topology that no
+longer existed. Repair is now **iterative**: analyse → repair one region → re-analyse → continue
+only while the non-manifold count strictly falls, stopping at 0 or when no safe step remains.
+
+**2. Acceptance compared NET counts.** A batch that fixed three defects and created two elsewhere
+still looked like progress. Non-manifold edges are now identified by their **midpoint position**
+(`nonmanifold_signature`), so a step can be judged even though removing faces renumbers vertices,
+and `step_acceptable()` **refuses any step introducing a non-manifold edge that was not there
+before** — not merely one that fails to reduce the total.
+
+**3. Hole filling could manufacture the defect it was repairing.** Filling across an edge that
+already carries two faces adds a third. `fillable_boundary_loops()` now requires every edge of a
+loop to be a genuine boundary, and `meshrepair.fill_boundary_loop` re-checks it in bmesh before
+committing. That is what the "+4 faces while 7 → 4" signature was.
+
+### 11h.2 Two further corrections
+
+**Removal now takes the dangling vertex with it.** `bmesh.ops.delete` used `'FACES_ONLY'`, which
+left a fin's apex behind as a loose vertex with two wire edges — junk that then confused the
+boundary analysis. `'FACES'` removes geometry used *only* by the deleted face and leaves anything
+still referenced untouched. On the seven-fin fixture this took boundary edges 14 → 0 with no fill
+at all, which is the answer to §10: resolving the non-manifold **naturally removes** the open
+chain, so nothing has to be force-filled.
+
+**The greedy now prefers a face held by a dangling vertex.** Such a face is provably safe to
+remove — nothing else references that vertex, so it cannot tear the surrounding shell. Without
+this the tie-break could pick a slightly smaller *surface* face instead, opening a hole that then
+needed patching.
+
+### 11h.3 A wrong invariant, found by testing
+
+The first local invariant asked whether any edge within a ball around the repair still had three
+or more incident faces. On a mesh with several separate artefacts that ball swallowed
+**neighbouring, unrepaired** defects, and good repairs were reverted because a different fin was
+still present — visible in the logs as `REVERTED: 1 edge(s) near the repair still have 3+ incident
+faces` on a step that had just reduced the count. The check is now scoped to the region's **own**
+edges: did *these* non-manifold edges go away, and did the patch create a degenerate face. Whether
+the repair broke something elsewhere is a global question, and the signature rule answers it.
+
+### 11h.4 Verified in Blender 4.5.13
+
+Seven separate fin artefacts on a textured sphere — the shape of the real failure:
+
+| | before | after |
+|---|---|---|
+| non-manifold edges | 7 | **0** |
+| boundary edges | 14 | **0** |
+| components | 1 | 1 |
+| triangles | 3,975 | 3,968 (−7) |
+| degenerate triangles | 0 | 0 |
+| loose vertices | — | 0 |
+
+Seven iterations, one fin removed per iteration, each step accepted only after re-analysis. UV,
+material and image preserved; source scan unchanged; readiness `READY`; exact surface distance
+(148.5434 mm) and the surface path then both worked. Clean-mesh regression unchanged.
+
+**Outstanding: re-run on the real Design X copy.** The fixture reproduces the observed failure
+shape and now resolves completely, but only the real mesh can confirm its four residual edges are
+the same class.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

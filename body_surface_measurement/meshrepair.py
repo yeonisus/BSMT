@@ -129,6 +129,20 @@ def fill_boundary_loop(obj, loop_edge_pairs):
                 "the boundary loop no longer matches this mesh - re-run the "
                 "diagnostics before filling"
             )
+        # Every edge must currently be a real boundary. Filling across an
+        # edge that already carries two faces adds a third and manufactures
+        # the very non-manifold defect this is meant to remove - which is
+        # what an unchecked fill did on the real scan, adding four faces
+        # while the non-manifold count only fell from 7 to 4.
+        occupied = [edge for edge in edges if len(edge.link_faces) != 1]
+        if occupied:
+            raise RepairAborted(
+                "%d edge(s) of that loop already carry %s face(s); filling "
+                "would create non-manifold topology"
+                % (len(occupied),
+                   "/".join(sorted({str(len(edge.link_faces))
+                                    for edge in occupied})))
+            )
         before = set(bm.faces)
         result = bmesh.ops.holes_fill(bm, edges=edges, sides=0)
         created = [face for face in result.get("faces", [])
@@ -290,7 +304,12 @@ def remove_faces_by_vertex_sets(obj, wanted_counts):
                 "the faces to remove no longer match this mesh - re-analyse"
             )
         removed = len(victims)
-        bmesh.ops.delete(bm, geom=victims, context='FACES_ONLY')
+        # 'FACES' - not 'FACES_ONLY' - so a vertex or edge used ONLY by a
+        # removed face goes with it. A fin's apex is exactly that, and
+        # leaving it behind strands a loose vertex and two wire edges that
+        # then confuse the boundary analysis. Anything still referenced by a
+        # surviving face is untouched.
+        bmesh.ops.delete(bm, geom=victims, context='FACES')
         _commit(obj, bm)
     except RepairAborted:
         bm.free()

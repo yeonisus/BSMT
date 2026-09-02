@@ -599,6 +599,18 @@ def plan_region_repair(vertices, faces, region,
     # nothing and risks the texture.
     redundant = set(int(v) for v in duplicate_faces(faces))
 
+    # A face held on by a vertex no other face uses is provably safe to
+    # remove: nothing else references that vertex, so removing the face
+    # cannot open a hole in the surrounding shell. Real Design X artefacts
+    # are exactly this shape, and preferring these faces stops the greedy
+    # from picking a slightly smaller *surface* face instead and tearing a
+    # hole that then has to be patched.
+    vertex_degree = np.bincount(faces.ravel(), minlength=int(faces.max()) + 1)
+    dangling = set()
+    for index in candidate_faces:
+        if any(int(vertex_degree[int(v)]) == 1 for v in faces[index]):
+            dangling.add(int(index))
+
     def face_edges(index):
         a, b, c = faces[index]
         return (_edge_key(a, b), _edge_key(b, c), _edge_key(c, a))
@@ -622,9 +634,13 @@ def plan_region_repair(vertices, faces, region,
             resolves = sum(1 for key in keys if counts.get(key, 0) >= 3)
             if resolves == 0:
                 continue
-            # Deterministic ordering: resolve the most edges, prefer a
-            # redundant copy, then the smallest face, then the lowest index.
-            score = (-resolves, 0 if index in redundant else 1,
+            # Deterministic ordering: resolve the most edges, then prefer a
+            # face whose removal cannot tear the surrounding shell - a
+            # redundant copy, or one hanging by a dangling vertex - then the
+            # smallest face, then the lowest index.
+            score = (-resolves,
+                     0 if index in redundant else 1,
+                     0 if index in dangling else 1,
                      float(areas[index]), index)
             if best is None or score < best[0]:
                 best = (score, index, keys)
@@ -796,3 +812,183 @@ def change_lines(summary):
         "  affected region %.2f mm across, %.4f mm2"
         % (summary["max_region_dimension_mm"], summary["affected_area_mm2"]),
     ]
+
+
+# ---------------------------------------------------------------------------
+# iterative repair support (Milestone 3.5a)
+# ---------------------------------------------------------------------------
+#
+# Real-data lesson. Planning every region against ONE initial analysis and
+# executing them as a batch took the Design X copy from 7 non-manifold edges
+# to 4, not to 0. Two causes, both structural:
+#
+#   * after the first local edit the connectivity has changed, so every later
+#     plan was computed against topology that no longer existed;
+#   * acceptance compared NET counts, so a batch that fixed three defects and
+#     created two elsewhere still looked like progress.
+#
+# The fixes below are the two halves of that: signatures that identify
+# non-manifold edges by POSITION (so a step can be judged even though
+# removing faces renumbers vertices), and a rule that refuses any step
+# introducing a non-manifold edge that was not there before.
+
+#: Positions are rounded to this many millimetres before comparison, so
+#: float noise cannot make an unchanged edge look new.
+SIGNATURE_TOLERANCE_MM = 1e-4
+
+
+def _signature_key(point):
+    quantum = SIGNATURE_TOLERANCE_MM
+    return tuple(int(round(float(value) / quantum)) for value in point)
+
+
+def nonmanifold_signature(vertices, faces):
+    """Identify every non-manifold edge by its MIDPOINT, not by index.
+
+    Face removal renumbers vertices, so an index-based before/after set
+    comparison would report the whole mesh as changed. A midpoint is stable
+    under any renumbering.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    edges = classify_edges(faces, vertices.shape[0])["non_manifold"]
+    if edges.shape[0] == 0:
+        return set()
+    midpoints = 0.5 * (vertices[edges[:, 0]] + vertices[edges[:, 1]])
+    return {_signature_key(point) for point in midpoints}
+
+
+def degenerate_signature(vertices, faces, relative=1e-12):
+    """Zero-area triangles, identified by centroid position."""
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.size == 0:
+        return set()
+    corners = vertices[faces]
+    areas = 0.5 * np.linalg.norm(
+        np.cross(corners[:, 1] - corners[:, 0],
+                 corners[:, 2] - corners[:, 0]), axis=1)
+    scale = float(areas.max()) if areas.size else 0.0
+    threshold = max(relative * scale, 0.0)
+    bad = np.where(areas <= threshold)[0]
+    if bad.size == 0:
+        return set()
+    return {_signature_key(point) for point in corners[bad].mean(axis=1)}
+
+
+def step_acceptable(before_signature, after_signature,
+                    before_report, after_report, texture_ok,
+                    before_degenerate=None, after_degenerate=None):
+    """Judge ONE local repair step. Returns (accept, reasons).
+
+    Stricter than a net count in the way the real data demanded: a step is
+    refused if it introduces a non-manifold edge ANYWHERE that was not there
+    before, even when the total falls. Fixing three defects while creating two
+    is not progress, it is churn that moves the problem.
+    """
+    reasons = []
+
+    introduced = after_signature - before_signature
+    if introduced:
+        reasons.append("it introduced %d new non-manifold edge(s) elsewhere"
+                       % len(introduced))
+
+    if len(after_signature) >= len(before_signature):
+        reasons.append("non-manifold edges did not decrease (%d -> %d)"
+                       % (len(before_signature), len(after_signature)))
+
+    components_before = int(before_report.get("component_count", 0) or 0)
+    components_after = int(after_report.get("component_count", 0) or 0)
+    if components_after > components_before:
+        reasons.append("it split the mesh into more components (%d -> %d)"
+                       % (components_before, components_after))
+
+    if int(after_report.get("triangle_count", 0) or 0) <= 0:
+        reasons.append("the mesh has no triangles left")
+
+    if before_degenerate is not None and after_degenerate is not None:
+        new_degenerate = after_degenerate - before_degenerate
+        if new_degenerate:
+            reasons.append("it created %d degenerate triangle(s)"
+                           % len(new_degenerate))
+
+    if not texture_ok:
+        reasons.append("the UV map, material or image texture was lost")
+
+    return (not reasons), reasons
+
+
+def region_signature(vertices, region):
+    """Midpoint signature of one region's OWN non-manifold edges."""
+    vertices = np.asarray(vertices, dtype=np.float64)
+    edges = np.asarray(region["edges"], dtype=np.int64)
+    if edges.size == 0:
+        return set()
+    midpoints = 0.5 * (vertices[edges[:, 0]] + vertices[edges[:, 1]])
+    return {_signature_key(point) for point in midpoints}
+
+
+def local_invariants(target_signature, after_signature,
+                     vertices, faces, centre_mm, radius_mm):
+    """Did THIS region get fixed, and did the patch stay clean?
+
+    Returns (ok, problems).
+
+    Deliberately scoped to the region's own edges. An earlier version asked
+    whether any edge within a ball of the repair still had three or more
+    incident faces, and on a mesh with several separate artefacts that ball
+    swallowed neighbouring defects the repair had never touched - so a
+    perfectly good repair was reverted because a different, unrelated fin was
+    still there. Whether the repair created a problem ELSEWHERE is a global
+    question, and step_acceptable() answers it with the full signature.
+    """
+    problems = []
+
+    unresolved = target_signature & after_signature
+    if unresolved:
+        problems.append("%d of this region's %d non-manifold edge(s) survived"
+                        % (len(unresolved), len(target_signature)))
+
+    # Degenerate faces created by the patch, checked tightly around it.
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.size:
+        centre = np.asarray(centre_mm, dtype=np.float64)
+        near = np.linalg.norm(vertices - centre, axis=1) <= float(radius_mm)
+        if near.any():
+            local = faces[near[faces].any(axis=1)]
+            if local.size:
+                corners = vertices[local]
+                areas = 0.5 * np.linalg.norm(
+                    np.cross(corners[:, 1] - corners[:, 0],
+                             corners[:, 2] - corners[:, 0]), axis=1)
+                zero = int(np.count_nonzero(areas <= 0.0))
+                if zero:
+                    problems.append("%d degenerate face(s) at the repair"
+                                    % zero)
+
+    return (not problems), problems
+
+
+def fillable_boundary_loops(vertices, faces, loops):
+    """Loops that are genuinely fillable: closed, and every edge a boundary.
+
+    Filling an edge that already has two incident faces adds a third and
+    manufactures the very defect being repaired. The real run reduced
+    non-manifold 7 -> 4 while ADDING four faces, which is what an unchecked
+    fill looks like.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    edges = classify_edges(faces, vertices.shape[0])
+    boundary = {tuple(sorted((int(a), int(b)))) for a, b in edges["boundary"]}
+    good = []
+    rejected = []
+    for loop in loops:
+        if not loop["closed"] or loop["edge_count"] < 3:
+            rejected.append((loop, "not a closed loop of 3+ edges"))
+            continue
+        keys = {tuple(sorted((int(a), int(b)))) for a, b in loop["edges"]}
+        if not keys <= boundary:
+            rejected.append((loop, "some of its edges already carry two faces"))
+            continue
+        good.append(loop)
+    return good, rejected
