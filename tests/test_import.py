@@ -1269,6 +1269,23 @@ def test_ui_wording_is_consistent(bsmt):
     check("drafts never reach an export",
           "measurements.defined(collection" in ops_text)
 
+    # Milestone 3.13: Blender REMOVES bl_info from a module installed as an
+    # extension, so anything reading it at runtime raised NameError the moment
+    # BSMT was installed the modern way.
+    init_source = open(_os.path.join(ROOT, "body_surface_measurement",
+                                     "__init__.py")).read()
+    check("VERSION is the single source of truth", "VERSION = (" in init_source)
+    check("bl_info is built FROM it", '"version": VERSION' in init_source)
+    check("the version string never reads bl_info at runtime",
+          'bl_info["version"]' not in init_source)
+    check("nor does operators.py", 'bl_info["version"]' not in ops_text)
+    check("VERSION matches bsmt.VERSION as imported",
+          hasattr(bsmt, "VERSION") and isinstance(bsmt.VERSION, tuple))
+    check("the About summary exists",
+          "def about_lines" in open(_os.path.join(
+              ROOT, "body_surface_measurement", "geodesic",
+              "envreport.py")).read())
+
     check("the panel section is called Landmark Display",
           '"Landmark Display"' in panels_text)
     for expected in ("show_landmarks", "show_landmark_labels",

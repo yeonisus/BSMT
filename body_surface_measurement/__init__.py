@@ -8,10 +8,20 @@ Deliberately NOT in this phase: geodesic / surface distance, preprocessing,
 automatic landmark detection, mesh repair, cropping, measurement templates.
 """
 
+#: The single source of truth for the version.
+#:
+#: NOT bl_info. Blender REMOVES bl_info from a module installed as an
+#: extension - the manifest is authoritative there - so anything that read
+#: bl_info at runtime raised NameError the moment BSMT was installed the
+#: modern way. This constant is defined by the module itself, survives both
+#: packaging modes, and is what tools/build_release.py reads to stamp the
+#: extension manifest, so the two can never disagree.
+VERSION = (0, 19, 0)
+
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 18, 1),
+    "version": VERSION,
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (
@@ -83,7 +93,7 @@ _MODULES = (state, operators, panels)
 
 
 def _version_string():
-    return ".".join(str(part) for part in bl_info["version"])
+    return ".".join(str(part) for part in VERSION)
 
 
 def _sweep_legacy_landmark_markers():

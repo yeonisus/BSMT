@@ -223,6 +223,19 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
             )
 
 
+def _addon_version():
+    from . import VERSION
+    return ".".join(str(part) for part in VERSION)
+
+
+def _about_lines():
+    """Environment summary, or a one-line reason it could not be read."""
+    try:
+        return geodesic.envreport.about_lines()
+    except Exception as exc:                          # pragma: no cover
+        return ["environment unavailable: %s" % exc]
+
+
 def _draw_readiness(context, layout, props):
     """One compact line: can this scan be measured, and if not, why (sect. 13).
 
@@ -1210,6 +1223,26 @@ class BSMT_PT_session(bpy.types.Panel):
                 if line.strip():
                     for wrapped in _wrap(line, 44):
                         report.label(text=wrapped)
+
+        box = layout.box()
+        header = box.row(align=True)
+        header.prop(
+            props, "show_about",
+            icon='TRIA_DOWN' if props.show_about else 'TRIA_RIGHT',
+            emboss=False, text="About BSMT")
+        if props.show_about:
+            column = box.column(align=True)
+            column.scale_y = 0.75
+            column.label(text="BSMT %s" % _addon_version())
+            for line in _about_lines():
+                column.label(text=line)
+            note = box.column(align=True)
+            note.scale_y = 0.7
+            note.enabled = False
+            for line in _wrap("Copy these lines into a bug report. They say "
+                              "which platform and solver build produced a "
+                              "measurement.", 44):
+                note.label(text=line)
 
         box = layout.box()
         box.label(text="Protocol")

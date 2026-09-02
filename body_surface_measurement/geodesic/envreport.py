@@ -146,6 +146,54 @@ def collect():
     return info
 
 
+def about_lines():
+    """A short, copyable environment summary for a bug report (sect. 5).
+
+    Deliberately compact: BSMT version, Blender, OS and architecture, Python,
+    numpy and whether the exact solver loaded. That is everything needed to
+    tell a Windows problem from a macOS one, and nothing else.
+    """
+    import platform as _platform
+
+    try:
+        import bpy as _bpy
+        blender = _bpy.app.version_string
+    except Exception:                                 # pragma: no cover
+        blender = "not running in Blender"
+
+    try:
+        import numpy as _numpy
+        numpy_version = _numpy.__version__
+    except Exception as exc:                          # pragma: no cover
+        numpy_version = "MISSING (%s)" % exc
+
+    system = _platform.system() or "unknown"
+    machine = _platform.machine() or "unknown"
+    #: The names Blender itself uses for a platform, so a report matches the
+    #: `platforms` field of the extension manifest.
+    label = {
+        ("Darwin", "arm64"): "macOS ARM64",
+        ("Darwin", "x86_64"): "macOS x64",
+        ("Windows", "AMD64"): "Windows x64",
+        ("Linux", "x86_64"): "Linux x64",
+    }.get((system, machine), "%s %s" % (system, machine))
+
+    from . import backends
+    if backends.availability():
+        solver = "Available (pygeodesic %s)" % backends.backend_version()
+    else:
+        solver = "Unavailable - %s" % (backends.unavailable_reason()
+                                       or "reason unknown")
+
+    return [
+        "Blender %s" % blender,
+        label,
+        "Python %s" % _platform.python_version(),
+        "NumPy %s" % numpy_version,
+        "Exact Geodesic: %s" % solver,
+    ]
+
+
 def _install_targets(bpy, info):
     """Candidate install directories, best first.
 

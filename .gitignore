@@ -1,7 +1,10 @@
-.DS_Store
-__pycache__/
-*.pyc
-*.pyo
-*.blend1
-*.blend2
+# Build output. Release packages are attached to a GitHub Release, not
+# committed - they are large and reproducible from the source plus wheels/.
+dist/
+
+# The legacy package name built by the old ad-hoc zip command.
 body_surface_measurement.zip
+
+__pycache__/
+*.py[cod]
+.DS_Store

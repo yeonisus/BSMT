@@ -3152,6 +3152,149 @@ sixteen Blender acceptance scripts re-run clean.
 
 ---
 
+## 11q. Milestone 3.13 — Cross-platform packaging (v0.19.0, 2026-09-02)
+
+BSMT worked on one machine. This milestone makes it installable by a colleague on Windows without
+a terminal. No measurement code changed.
+
+### 11q.1 Dependency audit
+
+| Dependency | Class | Notes |
+|---|---|---|
+| `bpy`, `bmesh`, `mathutils`, `gpu`, `gpu_extras`, `blf`, `bpy_extras` | Blender-provided | portable by definition |
+| `numpy` 1.26.4 | Blender-provided | BSMT never bundles or installs it |
+| `json`, `csv`, `re`, `os`, `sys`, `math`, `datetime`, `importlib`, `time`, `traceback`, `hashlib`, `heapq`, `colorsys`, `platform`, `sysconfig`, `site` | pure stdlib | portable |
+| `resource` | **Unix only** | already inside a `try` in `_max_rss_bytes()`; returns None on Windows, which is the documented meaning of the field |
+| **pygeodesic 0.1.11** | **native** | one compiled module per platform+ABI |
+
+Blender 4.5.13 measured: **CPython 3.11.15**, `SOABI cpython-311`, so the only wheels that can load
+are **cp311**. pygeodesic 0.1.11 publishes `cp311-cp311-win_amd64` and `cp311-cp311-macosx_11_0_arm64`
+— exactly what is needed. Both are vendored under `wheels/` with their SHA-256 verified against PyPI.
+
+### 11q.2 Strategy: one package, declared wheels (option B), because it was tested
+
+Blender 4.2 introduced **extensions**, whose `wheels` field is the supported mechanism for exactly
+this problem. That makes option B possible in principle; it was chosen because it was *verified*,
+not because it is tidier.
+
+Installing `bsmt-0.19.0.zip` into an isolated Blender config:
+
+- the extension installed and enabled — `{'FINISHED'}`, module `bl_ext.user_default.body_surface_measurement`;
+- Blender selected and installed the **matching platform wheel** on its own, into
+  `extensions/.local/lib/python3.11/site-packages/pygeodesic/`;
+- an exact geodesic solve ran through it and returned 1.414214 for a known case.
+
+**And the NumPy question was answered by measurement, not assumption.** The pygeodesic wheel
+declares `Requires-Dist: numpy<3,>=2` while Blender ships 1.26.4. If Blender resolved wheel
+dependencies it would have installed NumPy 2 and broken Blender. It does not: after the install,
+NumPy was still 1.26.4 from Blender's own `site-packages`. Blender installs the listed wheel files;
+it does not run a resolver. That is the single fact option B rests on, and it is now checked.
+
+A second package, `body_surface_measurement-0.19.0.zip`, is still produced: the legacy add-on
+layout, no wheels, for a Blender without extension repositories. It is documented as the fallback.
+
+### 11q.3 A packaging defect this found
+
+**Blender removes `bl_info` from a module installed as an extension** — the manifest is
+authoritative there. BSMT read `bl_info["version"]` at runtime in two places, so the very first
+extension install failed with:
+
+    RuntimeError: Error: name 'bl_info' is not defined
+
+Reproduced, then fixed by making a module-level `VERSION` tuple the single source of truth:
+`bl_info` is built from it, `_version_string()` and `_addon_version()` read it, and
+`tools/build_release.py` parses it with `ast` to stamp the manifest — so the package version and
+the reported version cannot disagree. A test in `test_import.py` asserts nothing reads `bl_info` at
+runtime again.
+
+### 11q.4 Windows audit
+
+Static, exhaustive, and in `tests/test_portability.py`, because the point is what the source
+*assumes* — there is no Windows machine here to fail on:
+
+- **no Unix-only module imported at module level** in any shipped file;
+- **no shell**: no `subprocess`, `os.system` or `os.popen` anywhere;
+- **no hard-coded absolute path**, POSIX or Windows;
+- **no hand-rolled path splitting** — a path arrives from Blender as a string and goes straight to
+  `open()`;
+- **every one of the 13 calls to `open()` declares an encoding**. This is the Windows bug that
+  would have been invisible here: `open()` without `encoding` uses the **locale** encoding, which
+  on a Korean Windows is cp949. A protocol written there would be unreadable anywhere else and
+  Korean landmark names would be silently mangled. The audit found the source already clean.
+
+Unicode is round-tripped through Korean **directory names, file names, subject ids, landmark names
+and notes**, with a byte-level check that the output is UTF-8 and not cp949. Filenames are checked
+against every Windows-reserved character and against the reserved device names.
+
+### 11q.5 GPU overlay
+
+`overlay.py` uses only the builtin `UNIFORM_COLOR` shader, `TRIS` and `LINES` batches, and `blf`
+through a version-tolerant size helper. No hand-written shader source, no `bgl`, nothing
+Metal- or OpenGL-specific, and — as of 3.9 — no `TRI_FAN` or `LINE_LOOP`, which were removed from
+Blender's GPU module in 3.2. Asserted by test. **No Windows GPU has drawn it**, so this is
+inspection, not validation.
+
+### 11q.6 Degradation without the solver
+
+Built a wheel-less package and installed it. Measured:
+
+| | |
+|---|---|
+| Add-on enables | **yes** |
+| Backend status | `Unavailable — ModuleNotFoundError: No module named 'pygeodesic'` |
+| Canonical mesh, topology, picking | work |
+| **Straight Distance** | **works — 999.897 mm** |
+| Surface Distance | refuses with a clear dependency error, **no crash** |
+
+### 11q.7 About summary
+
+`envreport.about_lines()` and an *About BSMT* section under Session and Export:
+
+```
+BSMT 0.19.0
+Blender 4.5.13 LTS
+macOS ARM64
+Python 3.11.15
+NumPy 1.26.4
+Exact Geodesic: Available (pygeodesic 0.1.11)
+```
+
+Enough to tell a Windows problem from a BSMT problem in a bug report, and nothing more.
+
+### 11q.8 Licensing — left open, deliberately
+
+pygeodesic is **MIT** (© 2021 Michael Hogg), and the Kirsanov C++ inside it is MIT too, per its
+README: *"licensed under MIT license similar to the original Kirsanov C++ code, rather than GPL"*.
+MIT is GPL-compatible, so redistributing the wheel is fine under any BSMT licence provided the
+notice travels — it does, inside the wheel's `dist-info`.
+
+The open question is BSMT's own licence. Blender is GPL and the Foundation's position is that an
+add-on importing `bpy` is a derivative work needing a GPL-compatible licence; the extension
+manifest also **requires** a `license` field, so building a package at all forces the issue.
+
+`tools/build_release.py` writes `SPDX:GPL-3.0-or-later` marked **PROVISIONAL** in the manifest and
+prints a warning on every build. **No `LICENSE` file was created**, because writing one asserts
+both a licence and an owner and neither is settled — university ownership in particular is not a
+question that can be answered here. `docs/LICENSING.md` sets out the components, the Blender
+implication and the steps required before distribution.
+
+### 11q.9 What is verified, and what is not
+
+| | |
+|---|---|
+| **A. Cross-platform by inspection** | no Unix-only import, no shell, no hard-coded path, no path splitting, portable GPU API, correct wheel ABI |
+| **B. Cross-platform by automated test** | 87 portability checks; Korean CSV/JSON through Korean paths; Windows filename safety; build-manifest correctness |
+| **C. Verified on macOS** | extension installs, correct wheel selected, **NumPy untouched**, solver available, full workflow through the installed extension with Korean object, landmark, folder and subject names; graceful degradation without the solver |
+| **D. Still needs real Windows** | that any of it runs there. Wheel loading, GPU overlay rendering, OBJ/MTL/texture resolution from a Windows path, Excel opening the CSV, and the whole `docs/windows_acceptance.md` checklist |
+
+**Windows is packaged, not supported.** The README platform table says so, and must keep saying so
+until a Windows machine passes the checklist.
+
+Regression: 2,188 checks across fourteen suites, 2,298 with pygeodesic staged, 0 failures. All
+sixteen Blender acceptance scripts re-run clean.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

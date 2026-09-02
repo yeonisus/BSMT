@@ -1068,6 +1068,12 @@ class BSMT_Properties(bpy.types.PropertyGroup):
                     "only",
         default="",
     )
+    show_about: BoolProperty(
+        name="About BSMT",
+        description="Show the version, platform and solver summary to copy "
+                    "into a bug report",
+        default=False,
+    )
     show_session: BoolProperty(
         name="Session Info",
         description="Show the session metadata, export and protocol controls",

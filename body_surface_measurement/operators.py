@@ -15,8 +15,9 @@ from . import (alignment, attach, export, geodesic, landmarks, measurement,
                protocol, repair, scancopy, state, visualization, viz)
 
 def _addon_version():
-    from . import bl_info
-    return ".".join(str(part) for part in bl_info["version"])
+    # VERSION, not bl_info: Blender strips bl_info from an extension module.
+    from . import VERSION
+    return ".".join(str(part) for part in VERSION)
 
 
 # Events that must keep working while the modal picker is active, so the user
