@@ -488,3 +488,320 @@ def load_measurements(path):
     except OSError as exc:
         raise ProtocolError("could not read '%s': %s" % (path, exc))
     return loads_measurements(text)
+
+
+# ---------------------------------------------------------------------------
+# the unified protocol (Milestone 3.11)
+# ---------------------------------------------------------------------------
+#
+# The two formats above split a study's definitions across two files: names in
+# one, the measurements between them in the other. In practice they are one
+# thing - "what this study measures" - and keeping them apart made it possible
+# to load half of it.
+#
+# This format carries both, keyed by STABLE ID rather than by the "L01"
+# protocol id. Within a scene the stable id is already the authoritative
+# reference (Milestone 3.1: a dynamic enum remaps by index, so nothing else
+# can be trusted). Writing stable ids and RESTORING them on load makes that
+# same guarantee hold across files: a measurement that referenced landmark 7
+# still references landmark 7 after the protocol is loaded onto a new scan.
+#
+#     {
+#       "format": "bsmt-protocol",
+#       "version": 1,
+#       "protocol_name": "Design X posture study",
+#       "landmarks":   [{"stable_id": 1, "id": "L01", "name": "Neck_F",
+#                        "notes": ""}],
+#       "measurements": [{"stable_id": 1, "id": "M01", "name": "Neck to Waist",
+#                         "from_stable_id": 1, "to_stable_id": 2,
+#                         "type": "BOTH", "enabled": true, "notes": ""}]
+#     }
+
+PROTOCOL_FORMAT = "bsmt-protocol"
+PROTOCOL_VERSION = 1
+
+#: Everything a protocol entry may carry. Anything else is refused on read
+#: rather than ignored: a file with a triangle index in it is not a protocol,
+#: and treating it as one would hide the mistake that produced it.
+PROTOCOL_LANDMARK_KEYS = frozenset({"stable_id", "id", "name", "notes"})
+PROTOCOL_MEASUREMENT_KEYS = frozenset({
+    "stable_id", "id", "name", "from_stable_id", "to_stable_id",
+    "from_landmark_name", "to_landmark_name", "type", "enabled", "notes",
+})
+
+#: Keys that would make the file about one subject rather than one study.
+SUBJECT_KEYS = frozenset({
+    "subject_id", "subject", "condition", "scan_id", "scan", "session",
+    "participant", "participant_id",
+})
+
+
+def build_protocol(protocol_name, landmark_entries, measurement_entries):
+    """Assemble a unified protocol. Definitions only.
+
+    `landmark_entries` are (stable_id, protocol_id, name, notes).
+    `measurement_entries` are (stable_id, protocol_id, name, from_stable_id,
+    to_stable_id, type, enabled, notes).
+
+    Every measurement reference must resolve to a landmark IN THIS FILE. A
+    protocol that references a landmark it does not define is not portable,
+    and finding that out at load time on someone else's scan is too late.
+    """
+    landmarks = []
+    seen_stable = set()
+    seen_ids = set()
+    for index, entry in enumerate(landmark_entries):
+        position = index + 1
+        stable_id, protocol_id, name, notes = entry
+        try:
+            stable_id = int(stable_id)
+        except (TypeError, ValueError):
+            raise ProtocolError("landmark %d has a non-numeric stable id"
+                                % position)
+        if stable_id <= 0:
+            raise ProtocolError("landmark %d has stable id %d; stable ids "
+                                "start at 1" % (position, stable_id))
+        if stable_id in seen_stable:
+            raise ProtocolError("duplicate landmark stable id %d at position "
+                                "%d" % (stable_id, position))
+        seen_stable.add(stable_id)
+
+        name = " ".join(str(name or "").split())
+        if not name:
+            raise ProtocolError("landmark %d has an empty name" % position)
+
+        protocol_id = str(protocol_id or "").strip() or "L%02d" % position
+        if protocol_id in seen_ids:
+            raise ProtocolError("duplicate landmark id '%s' at position %d"
+                                % (protocol_id, position))
+        seen_ids.add(protocol_id)
+
+        landmarks.append({
+            "stable_id": stable_id,
+            "id": protocol_id,
+            "name": name,
+            "notes": str(notes or ""),
+        })
+
+    if not landmarks:
+        raise ProtocolError("a protocol must define at least one landmark")
+
+    by_stable = {entry["stable_id"]: entry for entry in landmarks}
+
+    measurements = []
+    seen_stable = set()
+    seen_ids = set()
+    for index, entry in enumerate(measurement_entries):
+        position = index + 1
+        (stable_id, protocol_id, name, from_stable, to_stable,
+         measurement_type, enabled, notes) = entry
+        try:
+            stable_id = int(stable_id)
+            from_stable = int(from_stable)
+            to_stable = int(to_stable)
+        except (TypeError, ValueError):
+            raise ProtocolError("measurement %d has a non-numeric id"
+                                % position)
+        if stable_id in seen_stable:
+            raise ProtocolError("duplicate measurement stable id %d at "
+                                "position %d" % (stable_id, position))
+        seen_stable.add(stable_id)
+
+        name = " ".join(str(name or "").split())
+        if not name:
+            raise ProtocolError("measurement %d has an empty name" % position)
+
+        protocol_id = str(protocol_id or "").strip() or "M%02d" % position
+        if protocol_id in seen_ids:
+            raise ProtocolError("duplicate measurement id '%s' at position %d"
+                                % (protocol_id, position))
+        seen_ids.add(protocol_id)
+
+        measurement_type = str(measurement_type or "").strip().upper()
+        if measurement_type not in VALID_TYPES:
+            raise ProtocolError(
+                "measurement %d has type '%s'; expected one of %s"
+                % (position, measurement_type, ", ".join(VALID_TYPES)))
+
+        for label, reference in (("from", from_stable), ("to", to_stable)):
+            if reference not in by_stable:
+                raise ProtocolError(
+                    "measurement %d ('%s') references landmark stable id %d, "
+                    "which this protocol does not define"
+                    % (position, name, reference))
+        if from_stable == to_stable:
+            raise ProtocolError(
+                "measurement %d ('%s') has the same landmark at both ends"
+                % (position, name))
+
+        measurements.append({
+            "stable_id": stable_id,
+            "id": protocol_id,
+            "name": name,
+            "from_stable_id": from_stable,
+            "to_stable_id": to_stable,
+            # Names travel for diagnosis only; the stable id is authoritative.
+            "from_landmark_name": by_stable[from_stable]["name"],
+            "to_landmark_name": by_stable[to_stable]["name"],
+            "type": measurement_type,
+            "enabled": bool(enabled),
+            "notes": str(notes or ""),
+        })
+
+    document = {
+        "format": PROTOCOL_FORMAT,
+        "version": PROTOCOL_VERSION,
+        "protocol_name": (" ".join(str(protocol_name or "").split())
+                          or "Untitled Protocol"),
+        "landmarks": landmarks,
+        "measurements": measurements,
+    }
+    _assert_protocol_is_portable(document)
+    return document
+
+
+def _assert_protocol_is_portable(document):
+    """Fail loudly if anything scan-, result- or subject-specific got in.
+
+    Checked on the way out as well as on the way in. A protocol that carries
+    one subject's data is the failure this whole format exists to prevent, so
+    it is worth catching at the moment it is created rather than the moment
+    someone else loads it.
+    """
+    for key in sorted(set(document) & (POSITION_KEYS | RESULT_KEYS
+                                       | SUBJECT_KEYS)):
+        raise ProtocolError(
+            "a protocol must not carry '%s'; it describes a study, not a scan"
+            % key)
+    for section, allowed in (("landmarks", PROTOCOL_LANDMARK_KEYS),
+                             ("measurements", PROTOCOL_MEASUREMENT_KEYS)):
+        for entry in document.get(section, []):
+            offending = sorted(set(entry) - allowed)
+            if offending:
+                raise ProtocolError(
+                    "%s entry carries %s, which a protocol must not hold; a "
+                    "protocol describes a study, not a scan"
+                    % (section[:-1], ", ".join(offending)))
+
+
+def dumps_protocol(protocol_name, landmark_entries, measurement_entries,
+                   indent=2):
+    return json.dumps(
+        build_protocol(protocol_name, landmark_entries, measurement_entries),
+        indent=indent, ensure_ascii=False,
+    ) + "\n"
+
+
+def save_protocol(path, protocol_name, landmark_entries, measurement_entries,
+                  indent=2):
+    text = dumps_protocol(protocol_name, landmark_entries,
+                          measurement_entries, indent)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except OSError as exc:
+        raise ProtocolError("could not write '%s': %s" % (path, exc))
+    return path
+
+
+def loads_protocol(text):
+    """Parse a unified protocol. Returns (name, landmarks, measurements).
+
+    Landmarks are (stable_id, protocol_id, name, notes).
+    Measurements are (stable_id, protocol_id, name, from_stable_id,
+    to_stable_id, type, enabled, notes).
+    """
+    try:
+        document = json.loads(text)
+    except ValueError as exc:
+        raise ProtocolError("not valid JSON: %s" % exc)
+    if not isinstance(document, dict):
+        raise ProtocolError("a protocol file must contain a JSON object")
+
+    fmt = document.get("format")
+    if fmt != PROTOCOL_FORMAT:
+        raise ProtocolError(
+            "this is not a BSMT protocol (format is %r, expected %r)"
+            % (fmt, PROTOCOL_FORMAT))
+    version = document.get("version")
+    if not isinstance(version, int) or version > PROTOCOL_VERSION:
+        raise ProtocolError(
+            "protocol version %r is newer than this BSMT understands (%d)"
+            % (version, PROTOCOL_VERSION))
+
+    _assert_protocol_is_portable(document)
+
+    raw_landmarks = document.get("landmarks")
+    if not isinstance(raw_landmarks, list) or not raw_landmarks:
+        raise ProtocolError("the protocol defines no landmarks")
+
+    landmarks = []
+    by_stable = {}
+    for index, entry in enumerate(raw_landmarks):
+        position = index + 1
+        if not isinstance(entry, dict):
+            raise ProtocolError("landmark %d is not an object" % position)
+        stable_id = entry.get("stable_id")
+        if not isinstance(stable_id, int) or stable_id <= 0:
+            raise ProtocolError("landmark %d has no usable stable id"
+                                % position)
+        if stable_id in by_stable:
+            raise ProtocolError("duplicate landmark stable id %d" % stable_id)
+        name = " ".join(str(entry.get("name") or "").split())
+        if not name:
+            raise ProtocolError("landmark %d has an empty name" % position)
+        record = (stable_id,
+                  str(entry.get("id") or "").strip() or "L%02d" % position,
+                  name, str(entry.get("notes") or ""))
+        by_stable[stable_id] = name
+        landmarks.append(record)
+
+    measurements = []
+    seen = set()
+    for index, entry in enumerate(document.get("measurements") or []):
+        position = index + 1
+        if not isinstance(entry, dict):
+            raise ProtocolError("measurement %d is not an object" % position)
+        stable_id = entry.get("stable_id")
+        if not isinstance(stable_id, int) or stable_id <= 0:
+            raise ProtocolError("measurement %d has no usable stable id"
+                                % position)
+        if stable_id in seen:
+            raise ProtocolError("duplicate measurement stable id %d"
+                                % stable_id)
+        seen.add(stable_id)
+        name = " ".join(str(entry.get("name") or "").split())
+        if not name:
+            raise ProtocolError("measurement %d has an empty name" % position)
+        from_stable = entry.get("from_stable_id")
+        to_stable = entry.get("to_stable_id")
+        for label, reference in (("from", from_stable), ("to", to_stable)):
+            if not isinstance(reference, int) or reference not in by_stable:
+                raise ProtocolError(
+                    "measurement %d ('%s') references %s landmark %r, which "
+                    "this protocol does not define"
+                    % (position, name, label, reference))
+        measurement_type = str(entry.get("type") or "").strip().upper()
+        if measurement_type not in VALID_TYPES:
+            raise ProtocolError(
+                "measurement %d ('%s') has type %r; expected one of %s"
+                % (position, name, entry.get("type"), ", ".join(VALID_TYPES)))
+        measurements.append((
+            stable_id,
+            str(entry.get("id") or "").strip() or "M%02d" % position,
+            name, from_stable, to_stable, measurement_type,
+            bool(entry.get("enabled", True)),
+            str(entry.get("notes") or ""),
+        ))
+
+    name = " ".join(str(document.get("protocol_name") or "").split())
+    return name or "Untitled Protocol", landmarks, measurements
+
+
+def load_protocol(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise ProtocolError("could not read '%s': %s" % (path, exc))
+    return loads_protocol(text)

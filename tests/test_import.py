@@ -1235,6 +1235,40 @@ def test_ui_wording_is_consistent(bsmt):
     check("including in a file opened later",
           "load_post" in init_text)
 
+    # Milestone 3.11: session metadata is METADATA. If any of it were read by
+    # a geometry, landmark or measurement path, a typed subject id could
+    # change a number.
+    session_fields = ("session_subject_id", "session_condition",
+                      "session_scan_id", "session_notes")
+    for name in ("attach", "viz", "overlay", "visualization", "preprocess",
+                 "repair", "meshrepair", "scancopy", "alignment",
+                 "measurements", "landmarks", "measurement"):
+        source = open(_os.path.join(ROOT, "body_surface_measurement",
+                                    name + ".py")).read()
+        for field in session_fields:
+            check("%s.py never reads %s" % (name, field),
+                  field not in source)
+    for field in session_fields:
+        check("only the panel and the export collector read %s" % field,
+              ops_text.count(field) <= 1, ops_text.count(field))
+    check("the export module holds no bpy",
+          "import bpy" not in open(_os.path.join(
+              ROOT, "body_surface_measurement", "export.py")).read())
+    export_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                     "export.py")).read()
+    check("and imports nothing outside the standard library",
+          set(_re.findall(r"^import (\w+)", export_text, _re.M))
+          <= {"csv", "datetime", "re"},
+          set(_re.findall(r"^import (\w+)", export_text, _re.M)))
+    check("in particular not pandas",
+          not _re.search(r"^\s*(import|from)\s+pandas", export_text, _re.M))
+    check("a protocol is written by the pure protocol module",
+          "protocol.save_protocol" in ops_text)
+    check("and export by the pure export module",
+          "export.write_csv" in ops_text)
+    check("drafts never reach an export",
+          "measurements.defined(collection" in ops_text)
+
     check("the panel section is called Landmark Display",
           '"Landmark Display"' in panels_text)
     for expected in ("show_landmarks", "show_landmark_labels",

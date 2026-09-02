@@ -11,7 +11,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 17, 1),
+    "version": (0, 18, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (
@@ -28,7 +28,9 @@ bl_info = {
         "Milestone 3.7: UI wording, measurement drafts, readiness. "
         "Milestone 3.8: landmark labels and display controls. "
         "Milestone 3.9: screen-space landmark markers, with an "
-        "optional visible-surface-only mode"
+        "optional visible-surface-only mode. "
+        "Milestone 3.11: CSV export, session metadata and "
+        "reusable protocols"
     ),
     "category": "3D View",
 }
@@ -38,9 +40,10 @@ if "bpy" in locals():
     import importlib
 
     from . import (
-        alignment, attach, geodesic, landmarks, measurement, measurements,
-        meshrepair, overlay, panels, picking, preprocess, protocol, readiness,
-        repair, scancopy, state, visualization, viz, operators,
+        alignment, attach, export, geodesic, landmarks, measurement,
+        measurements, meshrepair, overlay, panels, picking, preprocess,
+        protocol, readiness, repair, scancopy, state, visualization, viz,
+        operators,
     )
 
     importlib.reload(geodesic)
@@ -49,6 +52,7 @@ if "bpy" in locals():
     importlib.reload(alignment)
     importlib.reload(measurements)
     importlib.reload(readiness)
+    importlib.reload(export)
     importlib.reload(preprocess)
     importlib.reload(repair)
     importlib.reload(protocol)
@@ -65,9 +69,10 @@ if "bpy" in locals():
     importlib.reload(attach)
 else:
     from . import (
-        alignment, attach, geodesic, landmarks, measurement, measurements,
-        meshrepair, operators, overlay, panels, picking, preprocess, protocol,
-        readiness, repair, scancopy, state, visualization, viz,
+        alignment, attach, export, geodesic, landmarks, measurement,
+        measurements, meshrepair, operators, overlay, panels, picking,
+        preprocess, protocol, readiness, repair, scancopy, state,
+        visualization, viz,
     )
 
 import bpy  # noqa: E402  (kept after the reload guard on purpose)

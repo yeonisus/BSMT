@@ -10,7 +10,7 @@ from mathutils import Matrix
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        IntProperty, StringProperty)
 
-from . import (alignment, attach, geodesic, landmarks, measurement,
+from . import (alignment, attach, export, geodesic, landmarks, measurement,
                measurements, meshrepair, overlay, picking, preprocess,
                protocol, repair, scancopy, state, visualization, viz)
 
@@ -4804,6 +4804,260 @@ class BSMT_OT_reset_alignment(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Export and protocol reuse (Milestone 3.11)
+# ---------------------------------------------------------------------------
+
+
+def _export_context(context):
+    """(props, session, mesh record, version) for an export, or None."""
+    props = state.get_props(context)
+    if props is None:
+        return None
+    obj = state.export_object(context, props)
+    return (props, state.session_metadata(props),
+            state.mesh_provenance(obj), _addon_version())
+
+
+class _ExportBase(bpy.types.Operator):
+    """Shared file-dialog plumbing for the two CSV exports."""
+
+    bl_options = {'REGISTER'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filename_ext = ".csv"
+    filter_glob: StringProperty(default="*.csv", options={'HIDDEN'})
+    check_existing: BoolProperty(default=True, options={'HIDDEN'})
+
+    #: 'measurements' or 'landmarks'; used for the default file name.
+    kind = "export"
+
+    def invoke(self, context, event):
+        props = state.get_props(context)
+        if props is not None and not self.filepath:
+            obj = state.export_object(context, props)
+            self.filepath = export.default_filename(
+                self.kind,
+                subject_id=props.session_subject_id,
+                condition=props.session_condition,
+                scan_id=props.session_scan_id,
+                fallback=obj.name if obj is not None else "",
+            )
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _finish(self, context, props, path, columns, rows, lines):
+        try:
+            written = export.write_csv(path, columns, rows)
+        except export.ExportError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+        report = [path] + lines
+        props.export_report = "\n".join(report)
+        print("\n[BSMT] export")
+        for line in report:
+            print("[BSMT]   %s" % line)
+        self.report({'INFO'}, "BSMT: %s" % lines[0])
+        return {'FINISHED'}
+
+
+class BSMT_OT_export_measurements(_ExportBase):
+    """Write every DEFINED measurement to a CSV file.
+
+    Drafts are not measurements and are never written. A value that is not
+    current is written as a BLANK field, never as a zero
+    """
+
+    bl_idname = "bsmt.export_measurements"
+    bl_label = "Measurements CSV"
+    bl_description = ("Write the defined measurements to a CSV file. Drafts"
+                      " are skipped and uncalculated values are left blank")
+    kind = "measurements"
+
+    @classmethod
+    def poll(cls, context):
+        collection = state.get_measurements(context)
+        return bool(collection) and bool(measurements.defined(collection))
+
+    def execute(self, context):
+        prepared = _export_context(context)
+        if prepared is None:
+            self.report({'ERROR'}, "BSMT: add-on properties are not registered")
+            return {'CANCELLED'}
+        props, session, mesh, version = prepared
+        collection = state.get_measurements(context)
+        defined = measurements.defined(collection or ())
+        if not defined:
+            self.report({'ERROR'},
+                        "BSMT: there are no defined measurements to export - "
+                        "a draft is not a measurement")
+            return {'CANCELLED'}
+
+        exported = export.timestamp()
+        rows = []
+        statuses = []
+        for item in defined:
+            record = state.measurement_export_record(context, item)
+            rows.append(export.measurement_row(session, record, mesh, version,
+                                               exported))
+            statuses.append(item.status)
+        _counts, lines = export.summarise_measurements(statuses)
+        drafts = len(collection) - len(defined)
+        if drafts:
+            lines.append("%d draft not exported" % drafts if drafts == 1
+                         else "%d drafts not exported" % drafts)
+        return self._finish(context, props, self.filepath,
+                            export.MEASUREMENT_COLUMNS, rows, lines)
+
+
+class BSMT_OT_export_landmarks(_ExportBase):
+    """Write every landmark to a CSV file, positioned or not.
+
+    An unpositioned landmark keeps its definition row with the geometric
+    fields blank, so a landmark that was missed is visible in the data
+    """
+
+    bl_idname = "bsmt.export_landmarks"
+    bl_label = "Landmarks CSV"
+    bl_description = ("Write every landmark to a CSV file. Unpositioned ones"
+                      " keep their row with the coordinates left blank")
+    kind = "landmarks"
+
+    @classmethod
+    def poll(cls, context):
+        return bool(state.get_landmarks(context))
+
+    def execute(self, context):
+        prepared = _export_context(context)
+        if prepared is None:
+            self.report({'ERROR'}, "BSMT: add-on properties are not registered")
+            return {'CANCELLED'}
+        props, session, mesh, version = prepared
+        collection = state.get_landmarks(context)
+        if not collection:
+            self.report({'ERROR'}, "BSMT: there are no landmarks to export")
+            return {'CANCELLED'}
+
+        exported = export.timestamp()
+        rows = []
+        statuses = []
+        for item in collection:
+            record = state.landmark_export_record(item)
+            rows.append(export.landmark_row(session, record, mesh, version,
+                                            exported, unit=props.unit))
+            statuses.append(item.status)
+        _counts, lines = export.summarise_landmarks(statuses)
+        return self._finish(context, props, self.filepath,
+                            export.LANDMARK_COLUMNS, rows, lines)
+
+
+class BSMT_OT_save_study_protocol(bpy.types.Operator):
+    """Save the landmark and measurement DEFINITIONS as a reusable protocol.
+
+    Definitions only: no picked positions, no results, no scan name and no
+    subject data. protocol.py refuses to write anything else
+    """
+
+    bl_idname = "bsmt.save_study_protocol"
+    bl_label = "Save Protocol"
+    bl_description = ("Save the landmark and measurement definitions to a"
+                      " JSON file. No positions, results or subject data")
+    bl_options = {'REGISTER'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+    check_existing: BoolProperty(default=True, options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return bool(state.get_landmarks(context))
+
+    def invoke(self, context, event):
+        props = state.get_props(context)
+        if props is not None and not self.filepath:
+            name = export.sanitize(props.protocol_name) or "bsmt_protocol"
+            self.filepath = name + ".json"
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is None:
+            self.report({'ERROR'}, "BSMT: add-on properties are not registered")
+            return {'CANCELLED'}
+        landmark_entries, measurement_entries = state.protocol_entries(
+            context, props)
+        if not landmark_entries:
+            self.report({'ERROR'}, "BSMT: there are no landmarks to save")
+            return {'CANCELLED'}
+        name = props.protocol_name or "Untitled Protocol"
+        try:
+            protocol.save_protocol(self.filepath, name, landmark_entries,
+                                   measurement_entries)
+        except protocol.ProtocolError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+        message = ("saved protocol '%s': %d landmark(s), %d measurement(s)"
+                   % (name, len(landmark_entries), len(measurement_entries)))
+        print("[BSMT] %s -> %s" % (message, self.filepath))
+        self.report({'INFO'}, "BSMT: " + message)
+        return {'FINISHED'}
+
+
+class BSMT_OT_load_study_protocol(bpy.types.Operator):
+    """Load landmark and measurement definitions from a protocol file.
+
+    REPLACES what is in the scene. Every landmark arrives UNPOSITIONED and
+    every measurement arrives with no result and no cached path, because the
+    protocol says what to measure and this scan has not been measured yet
+    """
+
+    bl_idname = "bsmt.load_study_protocol"
+    bl_label = "Load Protocol"
+    bl_description = ("Replace the landmark and measurement definitions with"
+                      " those from a JSON protocol. Nothing is positioned")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is None:
+            self.report({'ERROR'}, "BSMT: add-on properties are not registered")
+            return {'CANCELLED'}
+        try:
+            name, landmark_entries, measurement_entries = (
+                protocol.load_protocol(self.filepath))
+        except protocol.ProtocolError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        outcome = state.apply_protocol(context, props, name, landmark_entries,
+                                       measurement_entries)
+        print("\n[BSMT] loaded protocol '%s'" % name)
+        for line in outcome["lines"]:
+            print("[BSMT]   %s" % line)
+        overlay.tag_redraw(context)
+
+        if outcome["unresolved"]:
+            # Sect. 7: a reference that cannot be resolved is reported, never
+            # redirected to some other landmark.
+            self.report({'WARNING'},
+                        "BSMT: loaded '%s' with %d unresolved reference(s) - "
+                        "see the system console"
+                        % (name, len(outcome["unresolved"])))
+        else:
+            self.report({'INFO'}, "BSMT: " + outcome["lines"][0])
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_topology(bpy.types.Operator):
     """Clear the topology diagnostics report"""
 
@@ -4846,6 +5100,10 @@ classes = (
     BSMT_OT_guided_picking,
     BSMT_OT_save_protocol,
     BSMT_OT_load_protocol,
+    BSMT_OT_export_measurements,
+    BSMT_OT_export_landmarks,
+    BSMT_OT_save_study_protocol,
+    BSMT_OT_load_study_protocol,
     BSMT_OT_add_measurement,
     BSMT_OT_cancel_measurement_draft,
     BSMT_OT_remove_measurement,

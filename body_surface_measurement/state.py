@@ -17,8 +17,8 @@ from bpy.props import (
     StringProperty,
 )
 
-from . import (alignment, geodesic, landmarks, measurement, measurements,
-               overlay, preprocess, readiness, visualization)
+from . import (alignment, export, geodesic, landmarks, measurement,
+               measurements, overlay, preprocess, readiness, visualization)
 
 
 def _on_display_changed(self, context):
@@ -1039,6 +1039,46 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         default=True,
     )
     show_preprocessing: BoolProperty(name="Scan Preprocessing", default=False)
+    # ------------------------------------------------------------------
+    # Milestone 3.11 - session metadata. METADATA ONLY: nothing here is read
+    # by any geometry, landmark or measurement code path, and a test asserts
+    # it. It rides along in the .blend so an exported file can say which
+    # subject and condition it belongs to.
+    # ------------------------------------------------------------------
+    session_subject_id: StringProperty(
+        name="Subject ID",
+        description="Participant identifier, e.g. S01. Metadata only - it "
+                    "never affects geometry or any calculation",
+        default="",
+    )
+    session_condition: StringProperty(
+        name="Condition",
+        description="Condition or posture, e.g. SV2. Metadata only",
+        default="",
+    )
+    session_scan_id: StringProperty(
+        name="Scan ID",
+        description="Identifier for this particular scan, e.g. S01_SV2_01. "
+                    "Metadata only",
+        default="",
+    )
+    session_notes: StringProperty(
+        name="Notes",
+        description="Anything worth recording about this session. Metadata "
+                    "only",
+        default="",
+    )
+    show_session: BoolProperty(
+        name="Session Info",
+        description="Show the session metadata, export and protocol controls",
+        default=False,
+    )
+    export_report: StringProperty(
+        name="Export Report",
+        description="What the last export wrote",
+        default="",
+    )
+
     show_readiness: BoolProperty(
         name="Readiness Detail",
         description="Show every reason behind the readiness line",
@@ -1837,6 +1877,244 @@ def invalidate_all_measurement_results(context, reason):
             invalidate_measurement_result(item, reason)
             count += 1
     return count
+
+
+# ---------------------------------------------------------------------------
+# Export collectors (Milestone 3.11)
+# ---------------------------------------------------------------------------
+#
+# These read Blender data into PLAIN DICTS. Every decision about what a row
+# contains then happens in export.py, which imports no bpy and can be tested
+# directly - including the decisions that matter most, like whether a number
+# is written at all.
+
+
+def session_metadata(props):
+    """The researcher's session fields. Metadata only, never read elsewhere."""
+    return {
+        "subject_id": props.session_subject_id.strip(),
+        "condition": props.session_condition.strip(),
+        "scan_id": props.session_scan_id.strip(),
+        "notes": props.session_notes.strip(),
+    }
+
+
+def mesh_provenance(obj):
+    """What is reproducible about the mesh a measurement was taken on.
+
+    Reads only fields BSMT itself recorded when the measurement mesh was
+    created. Anything absent stays absent rather than being guessed at.
+    """
+    record = {
+        "measurement_mesh": "",
+        "source_mesh": "",
+        "representation": "",
+        "source_triangles": 0,
+        "measurement_triangles": 0,
+        "preprocessing_method": "",
+    }
+    if obj is None:
+        return record
+    record["measurement_mesh"] = obj.name
+    provenance = getattr(obj, "bsmt_scan", None)
+    if provenance is None or not provenance.is_measurement_copy:
+        # Measuring directly on an imported scan is legitimate; there is
+        # simply no preprocessing provenance to report.
+        return record
+    source = provenance.source
+    record["source_mesh"] = (source.name if source is not None
+                             else provenance.source_name)
+    record["representation"] = provenance.representation
+    record["source_triangles"] = int(provenance.original_triangles or 0)
+    record["measurement_triangles"] = int(provenance.actual_triangles or 0)
+    record["preprocessing_method"] = provenance.method
+    return record
+
+
+def measurement_export_record(context, item):
+    """One measurement as plain values, ready for export.measurement_row.
+
+    `straight_valid` and `surface_valid` are passed through untouched. They
+    are what decides whether a number is written at all, and BSMT already
+    clears them the moment a dependency changes - so a STALE measurement
+    arrives here with no number to write, which is the point.
+    """
+    source, target = resolve_measurement_landmarks(context, item)
+    return {
+        "protocol_id": item.protocol_id,
+        "name": item.name,
+        "notes": item.notes,
+        "from_landmark_id": (source.protocol_id if source is not None
+                             else item.source_protocol_id),
+        "from_landmark_name": (source.label if source is not None
+                               else item.source_name),
+        "to_landmark_id": (target.protocol_id if target is not None
+                           else item.target_protocol_id),
+        "to_landmark_name": (target.label if target is not None
+                             else item.target_name),
+        "measurement_type": item.measurement_type,
+        "enabled": bool(item.enabled),
+        "straight_valid": bool(item.straight_valid),
+        "straight_mm": float(item.straight_mm),
+        "surface_valid": bool(item.surface_valid),
+        "surface_mm": float(item.surface_mm),
+        "ratio": float(item.ratio),
+        "status": item.status,
+        "result_geometry_hash": item.result_geometry_hash,
+        "result_object": item.result_object,
+        "backend_name": item.backend_name,
+        "backend_version": item.backend_version,
+    }
+
+
+def landmark_export_record(item):
+    """One landmark as plain values, ready for export.landmark_row."""
+    point = item.surface_point
+    return {
+        "protocol_id": item.protocol_id,
+        "name": item.label,
+        "status": item.status,
+        "notes": item.notes,
+        "valid": bool(point.valid),
+        "triangle_index": int(point.triangle_index),
+        "barycentric": tuple(float(v) for v in point.barycentric),
+        "component_id": int(point.component_id),
+        "world_xyz": tuple(float(v) for v in point.world_xyz),
+        "physical_mm_xyz": tuple(float(v) for v in point.physical_mm_xyz),
+        "source_object": point.source_object,
+        "geometry_hash": point.geometry_hash,
+    }
+
+
+def export_object(context, props=None):
+    """The mesh an export should report as the measurement mesh.
+
+    The same rule the readiness line uses: the landmarks decide. A result
+    belongs to the mesh it was computed on, not to whatever is selected when
+    the researcher presses Export.
+    """
+    obj, _reason = measurement_target(context, props)
+    return obj
+
+
+def protocol_entries(context, props=None):
+    """(landmark entries, measurement entries) for a unified protocol file.
+
+    Definitions only. Nothing here reads a surface point, a result or a
+    scan name - the shapes are exactly what protocol.build_protocol takes,
+    and protocol.py refuses anything else.
+    """
+    landmark_collection = get_landmarks(context) or ()
+    measurement_collection = get_measurements(context) or ()
+    landmark_entries = [
+        (int(item.stable_id), item.protocol_id, item.label, item.notes)
+        for item in landmark_collection
+    ]
+    measurement_entries = [
+        (int(item.stable_id), item.protocol_id, item.label,
+         int(item.source_stable_id), int(item.target_stable_id),
+         item.measurement_type, bool(item.enabled), item.notes)
+        # A draft has no complete pair of landmarks, so there is no definition
+        # to save. Writing one would produce a protocol that cannot be loaded.
+        for item in measurements.defined(measurement_collection)
+    ]
+    return landmark_entries, measurement_entries
+
+
+def apply_protocol(context, props, name, landmark_entries,
+                   measurement_entries):
+    """Replace the scene's definitions with a protocol's. Returns a report.
+
+    REPLACE, not merge (sect. 8). Merging two protocols means deciding what a
+    collision is - same name, same id, same stable id? - and every answer
+    silently produces duplicates or silently discards a definition. Replacing
+    is one rule the researcher can predict, and the file they loaded from is
+    still on disk if they wanted the other one.
+
+    Stable ids are RESTORED from the file, which is what makes a measurement's
+    reference survive the trip (sect. 7). The next-id counters are advanced
+    past everything loaded, so a landmark added afterwards cannot collide with
+    one the protocol brought in.
+
+    Nothing arrives positioned or calculated. A protocol says what to measure;
+    this scan has not been measured yet.
+    """
+    landmark_collection = get_landmarks(context)
+    measurement_collection = get_measurements(context)
+    if landmark_collection is None or measurement_collection is None:
+        raise landmarks.LandmarkError("BSMT collections are not registered")
+
+    # Cached paths live in helper objects, so they are removed explicitly
+    # rather than left orphaned when the definitions go.
+    for item in measurement_collection:
+        clear_measurement_path(item)
+    clear_measurements(context, props)
+    clear_landmarks(context, props)
+    visualization.clear_landmark_markers()
+
+    highest_landmark = 0
+    for stable_id, protocol_id, landmark_name, notes in landmark_entries:
+        item = landmark_collection.add()
+        item.stable_id = int(stable_id)
+        item.protocol_id = protocol_id
+        item.name = landmark_name
+        item.notes = notes
+        item.status = landmarks.STATUS_NOT_PICKED
+        item.status_detail = "loaded from a protocol; not picked yet"
+        clear_surface_point(item.surface_point)
+        highest_landmark = max(highest_landmark, int(stable_id))
+    props.landmark_next_id = highest_landmark + 1
+    props.landmark_index = 0
+    props.protocol_name = name
+
+    known = {int(item.stable_id) for item in landmark_collection}
+    unresolved = []
+    highest_measurement = 0
+    for entry in measurement_entries:
+        (stable_id, protocol_id, measurement_name, from_stable, to_stable,
+         measurement_type, enabled, notes) = entry
+        item = measurement_collection.add()
+        item.stable_id = int(stable_id)
+        item.protocol_id = protocol_id
+        item.name = measurement_name
+        item.auto_name = False
+        item.notes = notes
+        item.measurement_type = measurement_type
+        item.enabled = bool(enabled)
+        item.source_stable_id = int(from_stable)
+        item.target_stable_id = int(to_stable)
+        highest_measurement = max(highest_measurement, int(stable_id))
+
+        # The cached names travel with the reference so an unresolved one can
+        # SAY which landmark is missing. They are never used to find a
+        # substitute (sect. 7).
+        for slot, reference in (("source", from_stable), ("target", to_stable)):
+            landmark = landmark_by_stable_id(landmark_collection, reference)
+            if landmark is None:
+                unresolved.append((protocol_id, slot, int(reference)))
+                continue
+            setattr(item, slot + "_protocol_id", landmark.protocol_id)
+            setattr(item, slot + "_name", landmark.name)
+        clear_measurement_result(item)
+        refresh_measurement_status(context, item)
+    props.measurement_next_id = highest_measurement + 1
+    props.measurement_index = 0
+    props.measurement_protocol_name = name
+    props.measurement_summary = ""
+
+    lines = ["loaded '%s': %d landmark(s), %d measurement(s)"
+             % (name, len(landmark_entries), len(measurement_entries)),
+             "every landmark is NOT PICKED; no result or path was loaded"]
+    for protocol_id, slot, reference in unresolved:
+        lines.append("UNRESOLVED: measurement %s references %s landmark "
+                     "stable id %d, which the protocol does not define"
+                     % (protocol_id, slot, reference))
+    return {
+        "landmarks": len(landmark_entries),
+        "measurements": len(measurement_entries),
+        "unresolved": unresolved,
+        "lines": lines,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -22,9 +22,9 @@ import math
 
 import bpy
 
-from . import (alignment, geodesic, landmarks, measurement, measurements,
-               overlay, preprocess, repair, scancopy, state, visualization,
-               viz)
+from . import (alignment, export, geodesic, landmarks, measurement,
+               measurements, overlay, preprocess, repair, scancopy, state,
+               visualization, viz)
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
@@ -1152,6 +1152,82 @@ class BSMT_PT_measurements(bpy.types.Panel):
         note.label(text="A template carries definitions, not results.")
 
 
+class BSMT_PT_session(bpy.types.Panel):
+    """Session metadata, CSV export and protocol reuse (Milestone 3.11).
+
+    Everything here is about the RECORD, not the measurement. The session
+    fields are metadata that no geometry or calculation reads; the exports
+    write what has already been computed; the protocol carries definitions
+    between subjects. Nothing in this panel can change a number.
+    """
+
+    bl_label = "Session and Export"
+    bl_idname = "BSMT_PT_session"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "BSMT"
+    bl_parent_id = "BSMT_PT_measurements"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = state.get_props(context)
+        if props is None:
+            layout.label(text="BSMT is not registered", icon='ERROR')
+            return
+
+        box = layout.box()
+        box.label(text="Session Info")
+        column = box.column(align=True)
+        column.prop(props, "session_subject_id")
+        column.prop(props, "session_condition")
+        column.prop(props, "session_scan_id")
+        box.prop(props, "session_notes")
+        note = box.row()
+        note.enabled = False
+        note.scale_y = 0.7
+        note.label(text="Metadata only. Never affects a measurement.")
+
+        box = layout.box()
+        box.label(text="Export")
+        row = box.row(align=True)
+        row.operator("bsmt.export_measurements", icon='EXPORT')
+        row.operator("bsmt.export_landmarks", icon='EXPORT')
+        preview = box.column(align=True)
+        preview.scale_y = 0.7
+        preview.enabled = False
+        obj = state.export_object(context, props)
+        preview.label(text=export.default_filename(
+            "measurements",
+            subject_id=props.session_subject_id,
+            condition=props.session_condition,
+            scan_id=props.session_scan_id,
+            fallback=obj.name if obj is not None else ""))
+        if props.export_report:
+            report = box.column(align=True)
+            report.scale_y = 0.7
+            for line in props.export_report.split("\n"):
+                if line.strip():
+                    for wrapped in _wrap(line, 44):
+                        report.label(text=wrapped)
+
+        box = layout.box()
+        box.label(text="Protocol")
+        if props.protocol_name:
+            current = box.row()
+            current.enabled = False
+            current.label(text=props.protocol_name)
+        row = box.row(align=True)
+        row.operator("bsmt.save_study_protocol", icon='EXPORT')
+        row.operator("bsmt.load_study_protocol", icon='IMPORT')
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("A protocol holds definitions only, and replaces "
+                          "the current ones. Nothing arrives positioned.", 44):
+            note.label(text=line)
+
+
 class BSMT_PT_measurement_visualization(bpy.types.Panel):
     """Draw the selected measurement as a chord, a surface path, or both.
 
@@ -1801,6 +1877,7 @@ classes = (
     BSMT_PT_landmarks,
     BSMT_UL_measurements,
     BSMT_PT_measurements,
+    BSMT_PT_session,
     BSMT_PT_measurement_visualization,
     BSMT_PT_preprocessing,
     BSMT_PT_alignment,

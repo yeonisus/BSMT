@@ -2894,6 +2894,152 @@ clean, and `tools/check_overlay_render.py` still renders on a real GPU.
 
 ---
 
+## 11o. Milestone 3.11 — Export, session metadata and protocol reuse (v0.18.0, 2026-09-02)
+
+The workflow produced numbers a researcher could read but not *keep*. This milestone adds the
+record: session metadata, two CSV exports, and a protocol that carries a study's definitions from
+one subject to the next. No geometry or solver behaviour changed.
+
+### 11o.1 Two rules govern the whole export
+
+**A blank is not a zero.** A measurement that was never calculated, a surface distance never
+solved, a landmark never picked — every one exports as an **empty field**. Writing `0.0` for "not
+calculated" is the single failure mode that turns an export into *wrong* data rather than *missing*
+data, because a zero survives every downstream check a blank would fail. `export.number()` takes
+the validity flag beside the value and returns `""` when it is false; a genuine measured zero still
+writes `0.000000`.
+
+**A number is exported only when it is current.** BSMT already clears a stored result the moment a
+dependency changes, so a STALE row arrives at the export with nothing to write. Verified end to
+end: STALE and FAILED rows carry their status and no distance, a straight-only measurement leaves
+the surface field blank, and the ratio blanks out with whichever half is missing.
+
+### 11o.2 Session metadata is metadata
+
+Subject ID, Condition, Scan ID and Notes live on the scene and travel on every exported row.
+`tests/test_import.py` asserts that **none of the four names appears in any geometry, landmark,
+measurement, alignment, overlay, repair or preprocessing module** — a typed subject id cannot reach
+a number.
+
+### 11o.3 Encoding, and why the BOM
+
+`utf-8-sig`. Without the BOM, Excel on Windows reads a UTF-8 CSV as the system code page and a
+landmark named `목_앞` arrives as mojibake — a silent corruption of the researcher's own labels.
+Python's `csv` handles it with `encoding="utf-8-sig"`, R with `fileEncoding="UTF-8-BOM"`; both are
+one argument, and losing the labels is the worse trade. Numbers are formatted with an explicit
+`%.6f`, so the decimal separator is `.` in every locale. `export.py` imports **csv, datetime and
+re, and nothing else** — asserted, because a pandas dependency is one a researcher will one day not
+have.
+
+Commas and quotes in a name are handled by the `csv` module itself; the acceptance run measures a
+landmark literally named `Waist, "mid"` surviving a round trip.
+
+### 11o.4 What each file carries
+
+**Measurements** (27 columns): session, ids and names for the measurement and both landmarks, type,
+enabled, the three distances, status, the mesh provenance of §11o.5, the geometry hash **the result
+was computed against**, the solver backend and version, the BSMT version and a UTC timestamp.
+Drafts are never written.
+
+**Landmarks** (23 columns): session, id, name, status, notes, triangle index, three barycentric
+coordinates, component, world position with its `coordinate_unit`, **and** the physical millimetre
+position. Both positions on purpose: distances are always millimetres, so exporting a coordinate
+only in scene units would let the two files silently disagree.
+
+An unpositioned landmark **keeps its definition row** with every geometric field blank. A protocol
+of 40 landmarks of which 38 were picked exports 40 rows, so the two that were missed are visible in
+the data rather than absent from it.
+
+### 11o.5 Provenance, and which mesh is reported
+
+`measurement_mesh`, `source_mesh`, `representation`, both triangle counts and the preprocessing
+method — all read from what BSMT recorded when the measurement mesh was created. Measuring directly
+on an imported scan leaves them blank rather than inventing them.
+
+The mesh reported is the one **the landmarks were picked on**, not the selected object — the same
+rule the readiness line uses, and the lesson of §11i.
+
+### 11o.6 The protocol
+
+A third format, `bsmt-protocol`, carrying landmarks **and** measurements in one file. The two
+earlier formats split a study's definitions across two files and made it possible to load half of
+it; they still work and still round-trip.
+
+References are **stable ids**, restored on load. Within a scene the stable id is already the only
+trustworthy reference (§11e: a dynamic enum remaps by index); writing and restoring it makes that
+guarantee hold across files, so a measurement that referenced landmark 7 still references landmark
+7 on the next subject's scan. The next-id counters advance past everything loaded, so a landmark
+added afterwards cannot collide.
+
+`_assert_protocol_is_portable()` runs on write **and** on read. A file carrying a triangle index, a
+barycentric coordinate, a geometry hash, a result or a subject id is **refused**, not quietly
+cleaned — such a file is not a protocol, and treating it as one would hide the mistake that
+produced it. Verified: the saved file contains no occurrence of `A_BSMT`, `S01`, `TEST`,
+`triangle_index`, `barycentric`, `geometry_hash` or any distance.
+
+Load is **Replace**, not merge (§8 of the brief). Merging means deciding what a collision is — same
+name, same id, same stable id? — and every answer silently produces duplicates or silently discards
+a definition. Replace is one rule the researcher can predict, and the file they loaded from is
+still on disk. Everything arrives **unpositioned**, with no result and no cached path. A dangling
+reference is refused with the id that could not be resolved; nothing is ever redirected to another
+landmark.
+
+### 11o.7 Filenames
+
+`S01_SV2_measurements.csv`, falling back to scan id, then mesh name, then `bsmt`. Sanitisation
+keeps Unicode word characters — a first attempt stripped them to ASCII, which would have given
+**every subject in a Korean-labelled study the same fallback filename**. What it removes is
+everything that makes a name dangerous or unportable: path separators, the Windows-reserved
+`: * ? " < > |`, and whitespace.
+
+### 11o.8 A pre-existing picking limit, found while building the fixture
+
+Recorded because it cost an hour to trace and will otherwise be rediscovered as an export bug.
+
+A ray cast along **exactly** `(1, 0, 0)` at the acceptance body hits triangle 271 at a point the
+BVH reports **6.83e-07 off that triangle's plane** — float32 hit-point precision. For that
+particular triangle the barycentric solve amplifies it to a sum deviation of **3.67e-06**, over
+`SUM_TOLERANCE = 1e-6`, so `meshcache.ray_cast_local` returns `None` and the pick reports *no hit
+at all*.
+
+It is rare and it fails safe — no wrong number is produced, and BSMT refusing a point that is not
+on its triangle is the no-silent-approximation rule working. But the user-visible symptom is a
+click that does nothing. Measured for context: over 400 random rays on the full-resolution mesh,
+the decimated 2000/1000/3500-triangle copies and a 39k-triangle mesh, the worst deviation was
+**2.2e-16** with zero rejections, and the decimated meshes contain no degenerate triangles
+(max aspect ratio 11.2). So this is a specific ray/triangle coincidence, not a mesh-quality
+problem. **Not changed here** — a picking-tolerance change belongs in its own milestone with its
+own validation, not in an export milestone.
+
+### 11o.9 Verified in Blender 4.5.13
+
+113 checks, 0 failures, on a decimated textured measurement mesh with Session Info
+`S01 / TEST / S01_TEST_01`, five landmarks (one Korean, one named `Waist, "mid"`, one deliberately
+unpicked) and five measurement rows (one draft, one disabled, one STALE, one FAILED).
+
+| Case | Result |
+|---|---|
+| Measurements CSV | 4 rows; the draft excluded |
+| Values against the UI | straight and surface match to 1e-6, in millimetres |
+| STALE / FAILED | status exported, **no numbers** |
+| Disabled | exported, `enabled=0`, no numbers |
+| Unicode | `목_앞` byte-identical; BOM present |
+| Commas and quotes | `Waist, "mid" to hip` survives as one field |
+| Provenance | `A_BSMT` / `A`, representation, both triangle counts, result hash |
+| Landmarks CSV | 5 rows; the unpicked one keeps its row with 6 blank fields |
+| Protocol saved | 5 landmarks, 4 measurements, no scan or subject data |
+| Loaded onto a **fresh scene and new scan** | landmark and measurement definitions **identical**, stable ids preserved |
+| After load | every landmark NOT_PICKED, no result, no path, all references resolve |
+| Adding after a load | new stable id, no collision |
+| Loading twice | replaces; no duplicates |
+| Dangling reference | refused, naming the unresolved id |
+
+Offline: `tests/test_export.py`, 198 checks. Full regression **1,927 checks across thirteen
+suites**, 2,037 with pygeodesic staged, 0 failures. All fifteen Blender acceptance scripts re-run
+clean with 0 tracebacks.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~
