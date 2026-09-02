@@ -1651,6 +1651,80 @@ Validate All and guided picking all still work; the scan was never modified.
 
 ---
 
+## 11c. Milestone 3.1a — Measurement Manager usability (v0.9.1, 2026-09-02)
+
+UI and usability only, from real-user validation of 3.1. No change to the stable-id reference
+architecture, SurfacePoint, the canonical mesh, the pygeodesic backend, the distance
+mathematics, A/B, the Landmark Manager, or protocol semantics.
+
+### 11c.1 Auto Name
+
+`BSMT_Measurement.auto_name`, default **ON**. The name follows the chosen landmarks —
+`P01` + `P02` → `"P01 to P02"` — and updates the moment From or To changes. It uses the
+landmarks' **user-visible names**, resolved through the authoritative stable ids and never
+through the From/To pickers, because a dynamic enum remaps by index (§11b.3) and could otherwise
+label a measurement after a landmark it does not reference.
+
+Turning Auto Name **off** preserves a custom name — `"Front torso length"` survives any From/To
+change and any landmark rename. Turning it back on adopts the generated name immediately.
+
+Renaming a *landmark* refreshes the auto names of the measurements that reference it, visiting
+only those (one integer compare per definition, ~0.002 ms over 100).
+
+**A correctness fix came with it.** `name` previously carried
+`update=_on_definition_changed`, so renaming a measurement invalidated its result. A label is
+not part of what is measured, and §12's invalidation list does not include it — only From/To and
+type. Renaming no longer invalidates, which is both correct and what makes auto-naming safe.
+
+**Template round-trip.** The file format is unchanged: adding an `auto_name` key would be a
+protocol-semantics change. The flag is *inferred* on load instead — a saved name that is exactly
+what auto-naming would produce keeps following its landmarks, anything else is preserved verbatim
+as a custom name. Verified both ways.
+
+### 11c.2 Result visibility
+
+Three places, in increasing detail:
+
+1. **List row** — two lines: `[x] M01  P01 to P02  BOTH  ✓` over
+   `P01 → P02        104.13 / 109.71 mm  r 1.052`. A disabled definition stays listed and reads
+   `DISABLED`.
+2. **Measurement Results**, a collapsed section (default open) below Calculate All Defined,
+   listing every *defined* measurement in order with From → To, type, straight, surface, ratio
+   and status. Only user-defined measurements appear; nothing enumerates landmark pairs.
+3. **Selected detail** — unchanged, still carrying full provenance (backend, version, bound
+   factor, attempts, elapsed).
+
+### 11c.3 Explicit batch summary
+
+`Calculate All Defined` now reports per outcome rather than one compressed line:
+
+```
+3 enabled
+3 calculated
+3 valid
+0 not ready
+0 failed
+```
+
+`stale`, `invalid reference` and `N disabled, skipped` lines appear when non-zero. The zero lines
+are shown deliberately: "did everything I asked for actually run" is the question, and a missing
+line reads as an omission.
+
+### 11c.4 A stale value can never render as current
+
+`state.result_is_displayable(item)` — `has_result and status == VALID` — is the single gate the
+UI asks before drawing any number. Numbers are already cleared on invalidation, so the status
+check is redundant today; it is there so that a future path which forgets to clear still cannot
+paint a stale value as a live one. Where a result is not displayable the UI shows the status
+(alert-coloured for STALE / FAILED / INVALID_REFERENCE) and never a number.
+
+Verified in Blender: re-picking `P01` left the two dependent measurements showing `NOT READY`
+with `— / —` and the unrelated one still `VALID` with its number; scaling the object put all
+three in `STALE` with no displayable value; and the invariant *a stored number implies VALID*
+held throughout.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

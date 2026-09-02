@@ -625,9 +625,10 @@ class BSMT_UL_measurements(bpy.types.UIList):
 
         column = layout.column(align=True)
 
+        current = state.result_is_displayable(item)
+
         top = column.row(align=True)
-        toggle = top.row(align=True)
-        toggle.prop(item, "enabled", text="")
+        top.prop(item, "enabled", text="")
         identifier = top.row()
         identifier.scale_x = 0.35
         identifier.enabled = False
@@ -637,9 +638,17 @@ class BSMT_UL_measurements(bpy.types.UIList):
         label.label(text=item.label)
         kind = top.row()
         kind.alignment = 'RIGHT'
-        kind.scale_x = 0.6
+        kind.scale_x = 0.55
         kind.enabled = False
         kind.label(text=item.measurement_type)
+        mark = top.row()
+        mark.alignment = 'RIGHT'
+        mark.scale_x = 0.2
+        if item.status in (measurements.STATUS_FAILED,
+                           measurements.STATUS_INVALID_REFERENCE):
+            mark.alert = True
+        mark.label(text="", icon=measurements.STATUS_ICONS.get(
+            item.status, 'BLANK1'))
 
         bottom = column.row(align=True)
         bottom.scale_y = 0.75
@@ -651,7 +660,11 @@ class BSMT_UL_measurements(bpy.types.UIList):
         ))
         result = bottom.row()
         result.alignment = 'RIGHT'
-        if item.has_result:
+        if not item.enabled:
+            # Still listed, but unmistakably not part of a batch run.
+            result.enabled = False
+            result.label(text="DISABLED")
+        elif current:
             text = measurements.format_result(
                 item.straight_mm, item.straight_valid,
                 item.surface_mm, item.surface_valid,
@@ -660,10 +673,14 @@ class BSMT_UL_measurements(bpy.types.UIList):
                 text += "  r %.3f" % item.ratio
             result.label(text=text)
         else:
-            result.label(
-                text=measurements.STATUS_SHORT.get(item.status, item.status),
-                icon=measurements.STATUS_ICONS.get(item.status, 'BLANK1'),
-            )
+            # No number is ever shown next to a status that is not VALID:
+            # a stale value must not be readable as a current one.
+            if item.status in (measurements.STATUS_STALE,
+                               measurements.STATUS_FAILED,
+                               measurements.STATUS_INVALID_REFERENCE):
+                result.alert = True
+            result.label(text=measurements.STATUS_SHORT.get(
+                item.status, item.status))
 
 
 class BSMT_PT_measurements(bpy.types.Panel):
@@ -720,8 +737,15 @@ class BSMT_PT_measurements(bpy.types.Panel):
         info.label(text=plan["summary"])
         if plan["disabled"]:
             info.label(text="%d disabled, will be skipped" % plan["disabled"])
+
         if props.measurement_summary:
-            info.label(text="Last run: %s" % props.measurement_summary)
+            box = layout.box()
+            box.label(text="Last Run", icon='INFO')
+            lines = box.column(align=True)
+            lines.scale_y = 0.7
+            for line in props.measurement_summary.split("\n"):
+                if line.strip():
+                    lines.label(text=line)
 
         row = layout.row(align=True)
         row.operator("bsmt.refresh_measurements", text="Refresh",
@@ -729,6 +753,7 @@ class BSMT_PT_measurements(bpy.types.Panel):
         row.operator("bsmt.clear_measurement_results", text="Clear Results",
                      icon='X')
 
+        self._draw_results(context, layout, props, collection)
         self._draw_template(layout)
 
         layout.separator()
@@ -755,7 +780,17 @@ class BSMT_PT_measurements(bpy.types.Panel):
         if not props.show_measurement_detail:
             return
 
-        box.prop(item, "name", text="Name")
+        row = box.row(align=True)
+        sub = row.row()
+        sub.enabled = not item.auto_name
+        sub.prop(item, "name", text="Name")
+        row.prop(item, "auto_name", text="", icon='SYNTAX_OFF',
+                 toggle=True)
+        if item.auto_name:
+            hint = box.row()
+            hint.enabled = False
+            hint.scale_y = 0.7
+            hint.label(text="   Auto Name follows From / To")
 
         # From / To. These pickers WRITE the authoritative stable id through
         # their update callbacks and are never read back for identity: a
@@ -815,6 +850,83 @@ class BSMT_PT_measurements(bpy.types.Panel):
                 else "%.2fx" % item.bound_factor))
             detail.label(text="Attempts: %d" % item.attempts)
         detail.label(text="Elapsed:  %.3f s" % item.elapsed_s)
+
+    @staticmethod
+    def _draw_results(context, layout, props, collection):
+        """Every DEFINED measurement's result, in order, without selecting
+        each one in turn.
+
+        Only user-defined measurements appear. Nothing here enumerates
+        landmark pairs.
+        """
+        layout.separator()
+        header = layout.row(align=True)
+        header.prop(
+            props, "show_measurement_results",
+            icon='TRIA_DOWN' if props.show_measurement_results else 'TRIA_RIGHT',
+            emboss=False, text="Measurement Results",
+        )
+        if not props.show_measurement_results:
+            return
+        if not len(collection):
+            layout.box().label(text="No measurements defined")
+            return
+
+        box = layout.box()
+        for item in collection:
+            entry = box.column(align=True)
+            entry.scale_y = 0.75
+
+            title = entry.row(align=True)
+            title.label(
+                text="%s  %s \u2192 %s" % (
+                    item.protocol_id,
+                    item.source_name or item.source_protocol_id or "?",
+                    item.target_name or item.target_protocol_id or "?",
+                ),
+                icon=measurements.STATUS_ICONS.get(item.status, 'BLANK1'),
+            )
+            kind = title.row()
+            kind.alignment = 'RIGHT'
+            kind.enabled = False
+            kind.label(text=item.measurement_type)
+
+            if item.name and item.name != state.auto_name_for(context, item):
+                named = entry.row()
+                named.enabled = False
+                named.label(text="   %s" % item.name)
+
+            if not item.enabled:
+                skipped = entry.row()
+                skipped.enabled = False
+                skipped.label(text="   DISABLED - skipped by Calculate All")
+
+            if state.result_is_displayable(item):
+                if item.straight_valid:
+                    entry.label(text="   Straight %s"
+                                     % measurement.format_mm(item.straight_mm))
+                if item.surface_valid:
+                    entry.label(text="   Surface  %s"
+                                     % measurement.format_mm(item.surface_mm))
+                if (item.straight_valid and item.surface_valid
+                        and item.ratio):
+                    entry.label(text="   Ratio    %.4f" % item.ratio)
+            else:
+                # Deliberately no numbers: a value that is not current must
+                # never be readable as though it were.
+                status_row = entry.row()
+                if item.status in (measurements.STATUS_STALE,
+                                   measurements.STATUS_FAILED,
+                                   measurements.STATUS_INVALID_REFERENCE):
+                    status_row.alert = True
+                status_row.label(text="   %s" % measurements.STATUS_SHORT.get(
+                    item.status, item.status))
+                if item.status_detail:
+                    for line in _wrap(item.status_detail, 40):
+                        detail = entry.row()
+                        detail.enabled = False
+                        detail.label(text="      " + line)
+            box.separator()
 
     @staticmethod
     def _draw_template(layout):

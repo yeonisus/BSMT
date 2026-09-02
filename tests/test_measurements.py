@@ -557,6 +557,80 @@ def test_performance_of_dependency_lookup():
           per_plan < 0.002, "%.4f ms" % (per_plan * 1000.0))
 
 
+def test_batch_report_is_explicit():
+    print("\n[batch] the finished-batch report is spelled out")
+    statuses = [measurements.STATUS_VALID] * 3
+    lines = measurements.batch_report(statuses, enabled_count=3,
+                                      disabled_count=0)
+    check("reports enabled", "3 enabled" in lines, str(lines))
+    check("reports calculated", "3 calculated" in lines, str(lines))
+    check("reports valid", "3 valid" in lines, str(lines))
+    check("reports not ready even when zero", "0 not ready" in lines, str(lines))
+    check("reports failed even when zero", "0 failed" in lines, str(lines))
+    check("exactly the brief's five lines when nothing is unusual",
+          lines == ["3 enabled", "3 calculated", "3 valid", "0 not ready",
+                    "0 failed"], str(lines))
+
+    mixed = ([measurements.STATUS_VALID] * 2
+             + [measurements.STATUS_NOT_READY]
+             + [measurements.STATUS_FAILED])
+    lines = measurements.batch_report(mixed, enabled_count=4, disabled_count=2)
+    check("calculated counts only what actually ran",
+          "3 calculated" in lines, str(lines))
+    check("counts not-ready", "1 not ready" in lines, str(lines))
+    check("counts failed", "1 failed" in lines, str(lines))
+    check("disabled are reported as skipped",
+          "2 disabled, skipped" in lines, str(lines))
+    check("disabled are NOT counted as enabled",
+          "4 enabled" in lines, str(lines))
+
+    lines = measurements.batch_report(
+        [measurements.STATUS_STALE, measurements.STATUS_INVALID_REFERENCE],
+        enabled_count=2, disabled_count=0)
+    check("stale appears when present", "1 stale" in lines, str(lines))
+    check("invalid reference appears when present",
+          "1 invalid reference" in lines, str(lines))
+    check("neither appears when absent",
+          not any("stale" in line for line in
+                  measurements.batch_report([measurements.STATUS_VALID], 1, 0)))
+
+
+def test_one_line_result():
+    print("\n[results] compact one-line row")
+    line = measurements.one_line_result(
+        "M01", "P01", "P02", 27.99, True, 28.00, True,
+        measurements.STATUS_VALID)
+    check("matches the brief's shape",
+          line == "M01 P01\u2192P02 | 27.99 / 28.00 | VALID", line)
+    check("straight-only shows a dash for surface",
+          measurements.one_line_result("M03", "P02", "P04", 94.20, True, 0.0,
+                                       False, measurements.STATUS_VALID)
+          == "M03 P02\u2192P04 | 94.20 / — | VALID")
+    check("surface-only shows a dash for straight",
+          measurements.one_line_result("M02", "P01", "P03", 0.0, False, 203.51,
+                                       True, measurements.STATUS_VALID)
+          == "M02 P01\u2192P03 | — / 203.51 | VALID")
+    check("a stale row carries its status, not a number",
+          measurements.one_line_result("M01", "P01", "P02", 0.0, False, 0.0,
+                                       False, measurements.STATUS_STALE)
+          == "M01 P01\u2192P02 | — / — | STALE")
+
+
+def test_auto_name_generation():
+    print("\n[naming] auto names come from the landmarks' visible names")
+    check("uses the visible names, not ids",
+          measurements.default_name("P01", "P02") == "P01 to P02")
+    check("works for arbitrary researcher names",
+          measurements.default_name("Shoulder_L", "Waist_F")
+          == "Shoulder_L to Waist_F")
+    check("a missing end is marked, not invented",
+          measurements.default_name("", "P02") == "? to P02")
+    check("both missing", measurements.default_name("", "") == "? to ?")
+    check("non-ascii names survive",
+          measurements.default_name("\ubaa9_\uc55e", "\ud5c8\ub9ac")
+          == "\ubaa9_\uc55e to \ud5c8\ub9ac")
+
+
 def main():
     print("BSMT Milestone 3.1 - Measurement Manager offline tests")
     print("  python : %s" % sys.version.split()[0])
@@ -569,6 +643,9 @@ def main():
         test_summary,
         test_batch_plan_counts_only_enabled_definitions,
         test_result_formatting,
+        test_batch_report_is_explicit,
+        test_one_line_result,
+        test_auto_name_generation,
         test_template_round_trip,
         test_template_has_no_results_or_coordinates,
         test_template_validation,

@@ -2327,8 +2327,15 @@ class BSMT_OT_calculate_all_measurements(bpy.types.Operator):
 
         elapsed = time.perf_counter() - started
         _counts, summary = measurements.summarise(statuses)
-        props.measurement_summary = summary
-        print("[BSMT] batch finished in %.2f s: %s" % (elapsed, summary))
+        report_lines = measurements.batch_report(
+            statuses, plan["enabled"], plan["disabled"]
+        )
+        # Spelled out rather than compressed, so "did everything I asked for
+        # actually run" is answerable at a glance.
+        props.measurement_summary = "\n".join(report_lines)
+        print("[BSMT] batch finished in %.2f s" % elapsed)
+        for line in report_lines:
+            print("[BSMT]   %s" % line)
 
         failed = sum(1 for status in statuses
                      if status in (measurements.STATUS_FAILED,
@@ -2543,11 +2550,20 @@ class BSMT_OT_load_measurement_template(bpy.types.Operator):
                 # landmark (sect. 16).
                 landmark = by_protocol_id.get(entry[id_key])
                 if landmark is not None:
-                    state.bind_measurement_landmark(item, slot, landmark)
+                    state.bind_measurement_landmark(item, slot, landmark,
+                                                    context)
                 else:
                     setattr(item, slot + "_stable_id", 0)
                     setattr(item, slot + "_protocol_id", entry[id_key])
                     setattr(item, slot + "_name", entry[name_key])
+
+            # A template stores the name the researcher saved, and the file
+            # format is not extended to carry the Auto Name flag - that would
+            # change protocol semantics. Instead it is inferred: a saved name
+            # that is exactly what auto-naming would produce was an auto name,
+            # so it keeps following its landmarks. Anything else is a custom
+            # name and is preserved verbatim.
+            item.auto_name = (item.name == state.auto_name_for(context, item))
 
             state.refresh_measurement_status(context, item)
             if item.status == measurements.STATUS_INVALID_REFERENCE:

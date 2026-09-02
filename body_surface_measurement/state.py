@@ -126,6 +126,19 @@ class BSMT_SurfacePoint(bpy.types.PropertyGroup):
     )
 
 
+def _on_landmark_name_changed(self, context):
+    """Keep auto-named measurements in step when a landmark is renamed.
+
+    Only the measurements that reference this landmark are visited, and only
+    those with Auto Name on are rewritten, so a custom name is never touched.
+    """
+    try:
+        refresh_auto_names(context, self.stable_id)
+    except Exception:                                 # pragma: no cover
+        # A convenience refresh must never break renaming a landmark.
+        pass
+
+
 def _on_landmark_display_changed(self, context):
     """Re-apply landmark marker size and visibility. Cosmetic only."""
     visualization.apply_landmark_display(context, self)
@@ -161,6 +174,7 @@ class BSMT_Landmark(bpy.types.PropertyGroup):
         description="Anatomical landmark name. Chosen entirely by the "
                     "researcher; BSMT never assumes or rewrites one",
         default="",
+        update=_on_landmark_name_changed,
     )
     display_name: StringProperty(
         name="Display Name",
@@ -220,6 +234,54 @@ def landmark_enum_items(self, context):
     return _LANDMARK_ENUM_CACHE
 
 
+def auto_name_for(context, item):
+    """The automatic name for a measurement, from its landmarks' visible names.
+
+    Resolved through the AUTHORITATIVE stable ids, never through the From/To
+    pickers: a dynamic enum remaps by index when the landmark list changes,
+    so naming from it could label a measurement after a landmark it does not
+    actually reference.
+    """
+    source, target = resolve_measurement_landmarks(context, item)
+    return measurements.default_name(
+        source.label if source is not None else (item.source_name or "?"),
+        target.label if target is not None else (item.target_name or "?"),
+    )
+
+
+def apply_auto_name(context, item):
+    """Refresh an auto-named measurement's name. Returns True if it changed.
+
+    A no-op when Auto Name is off, so a custom name is never overwritten.
+    Writing `name` does not invalidate the result - a label is not part of
+    what is measured.
+    """
+    if not item.auto_name:
+        return False
+    wanted = auto_name_for(context, item)
+    if item.name != wanted:
+        item.name = wanted
+        return True
+    return False
+
+
+def refresh_auto_names(context, landmark_stable_id=None):
+    """Re-apply auto names, optionally only where a landmark is referenced."""
+    collection = get_measurements(context)
+    if not collection:
+        return 0
+    if landmark_stable_id is None:
+        candidates = list(collection)
+    else:
+        candidates = measurements_referencing(collection, landmark_stable_id)
+    return sum(1 for item in candidates if apply_auto_name(context, item))
+
+
+def _on_auto_name_toggled(self, context):
+    """Turning Auto Name on adopts the generated name straight away."""
+    apply_auto_name(context, self)
+
+
 def _adopt_landmark(measurement_item, context, slot, raw_value):
     """Copy a picker choice into the authoritative reference fields."""
     try:
@@ -237,6 +299,7 @@ def _adopt_landmark(measurement_item, context, slot, raw_value):
     invalidate_measurement_result(
         measurement_item, "the %s landmark selection changed" % slot
     )
+    apply_auto_name(context, measurement_item)
 
 
 def _on_source_picker(self, context):
@@ -264,8 +327,20 @@ class BSMT_Measurement(bpy.types.PropertyGroup):
 
     stable_id: IntProperty(name="Stable ID", default=0)
     protocol_id: StringProperty(name="ID", default="")
-    name: StringProperty(name="Name", default="",
-                         update=_on_definition_changed)
+    name: StringProperty(
+        name="Name",
+        description="Label for this measurement. Renaming does not change "
+                    "what is measured, so it never invalidates a result",
+        default="",
+    )
+    auto_name: BoolProperty(
+        name="Auto Name",
+        description="Keep the name in step with the chosen landmarks, e.g. "
+                    "\"P01 to P02\". Turn off to write your own name; a "
+                    "custom name then survives any From/To change",
+        default=True,
+        update=_on_auto_name_toggled,
+    )
     notes: StringProperty(name="Notes", default="")
     enabled: BoolProperty(
         name="Enabled",
@@ -642,6 +717,12 @@ class BSMT_Properties(bpy.types.PropertyGroup):
     )
     show_measurement_detail: BoolProperty(
         name="Details", description="Show the selected measurement's detail",
+        default=True,
+    )
+    show_measurement_results: BoolProperty(
+        name="Measurement Results",
+        description="Show every defined measurement's result in order, "
+                    "without selecting each one",
         default=True,
     )
 
@@ -1069,16 +1150,20 @@ def add_measurement(context, props, name="", source=None, target=None,
     if target is not None:
         bind_measurement_landmark(item, "target", target)
 
-    item.name = name or measurements.default_name(
-        source.label if source is not None else "",
-        target.label if target is not None else "",
-    )
+    if name:
+        # An explicit name means the caller chose it - a template load, or a
+        # researcher typing one - so it is theirs to keep.
+        item.auto_name = False
+        item.name = name
+    else:
+        item.auto_name = True
+        item.name = auto_name_for(context, item)
     props.measurement_index = len(collection) - 1
     clear_measurement_result(item)
     return item
 
 
-def bind_measurement_landmark(item, slot, landmark):
+def bind_measurement_landmark(item, slot, landmark, context=None):
     """Point one end of a measurement at a landmark, by stable id."""
     setattr(item, slot + "_stable_id", int(landmark.stable_id))
     setattr(item, slot + "_protocol_id", landmark.protocol_id)
@@ -1089,6 +1174,8 @@ def bind_measurement_landmark(item, slot, landmark):
         setattr(item, slot + "_picker", str(int(landmark.stable_id)))
     except (TypeError, ValueError):
         pass
+    if context is not None:
+        apply_auto_name(context, item)
 
 
 def remove_measurement(context, props, index):
@@ -1144,6 +1231,17 @@ def invalidate_measurement_result(item, reason):
         item.status = measurements.STATUS_NOT_READY
         item.status_detail = "invalidated: %s" % reason
     return item
+
+
+def result_is_displayable(item):
+    """True only when a stored number is genuinely current.
+
+    The one place the UI asks "may I show this number". Numbers are cleared
+    whenever a dependency changes, so has_result already implies currency -
+    but pairing it with the status makes a stale value impossible to render
+    as a live one even if a future path forgets to clear.
+    """
+    return bool(item.has_result and item.status == measurements.STATUS_VALID)
 
 
 def measurements_referencing(collection, landmark_stable_id):

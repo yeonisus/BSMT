@@ -246,6 +246,43 @@ def batch_plan(definitions):
     }
 
 
+def batch_report(statuses, enabled_count, disabled_count):
+    """Explicit per-outcome counts for a finished batch.
+
+    Returns a list of lines. Spelled out rather than compressed, because
+    "3 enabled / 3 calculated / 3 valid / 0 not ready / 0 failed" answers the
+    question a researcher actually has - did everything I asked for run, and
+    did any of it quietly not happen.
+    """
+    counts, _summary = summarise(statuses)
+    calculated = counts.get(STATUS_VALID, 0) + counts.get(STATUS_FAILED, 0)
+    lines = [
+        "%d enabled" % enabled_count,
+        "%d calculated" % calculated,
+        "%d valid" % counts.get(STATUS_VALID, 0),
+        "%d not ready" % counts.get(STATUS_NOT_READY, 0),
+        "%d failed" % counts.get(STATUS_FAILED, 0),
+    ]
+    if counts.get(STATUS_STALE):
+        lines.append("%d stale" % counts[STATUS_STALE])
+    if counts.get(STATUS_INVALID_REFERENCE):
+        lines.append("%d invalid reference" % counts[STATUS_INVALID_REFERENCE])
+    if disabled_count:
+        lines.append("%d disabled, skipped" % disabled_count)
+    return lines
+
+
+def one_line_result(protocol_id, source_label, target_label, straight_mm,
+                    straight_valid, surface_mm, surface_valid, status):
+    """Compact single-line row: "M01 P01>P02 | 27.99 / 28.00 | VALID"."""
+    numbers = format_result(straight_mm, straight_valid, surface_mm,
+                            surface_valid).replace(" mm", "")
+    return "%s %s\u2192%s | %s | %s" % (
+        protocol_id, source_label or "?", target_label or "?",
+        numbers, STATUS_SHORT.get(status, status),
+    )
+
+
 def format_result(straight_mm, straight_valid, surface_mm, surface_valid,
                   decimals=2):
     """Compact "straight / surface mm" for a list row (sect. 11)."""
