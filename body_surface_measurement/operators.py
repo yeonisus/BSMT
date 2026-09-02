@@ -8,8 +8,8 @@ import numpy as np
 import bpy
 from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 
-from . import (attach, geodesic, landmarks, measurement, picking, protocol,
-               state, visualization)
+from . import (attach, geodesic, landmarks, measurement, measurements,
+               picking, protocol, state, visualization)
 
 # Events that must keep working while the modal picker is active, so the user
 # can orbit / zoom / change the view before committing to a click.
@@ -194,7 +194,7 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         if not surface_note.startswith("triangle"):
             # A click that produced no canonical attachment is not a pick.
             # Nothing is stored and guided picking does not advance.
-            state.clear_landmark_position(item)
+            state.clear_landmark_position(item, context)
             self.report({'WARNING'}, "BSMT: %s" % surface_note)
             return {'RUNNING_MODAL'}
 
@@ -203,6 +203,14 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         visualization.update_landmark_marker(
             context, props, item, item.surface_point.world_xyz
         )
+        # Targeted, not a sweep: only the definitions that reference THIS
+        # landmark lose their result (sect. 13).
+        affected = state.invalidate_measurements_for_landmark(
+            context, item.stable_id, "landmark '%s' was re-picked" % item.label
+        )
+        if affected:
+            print("[BSMT] re-picking '%s' invalidated %d measurement result(s)"
+                  % (item.label, affected))
 
         self._restore(context)
         advanced = ""
@@ -1518,7 +1526,7 @@ class BSMT_OT_clear_landmark_position(bpy.types.Operator):
         item = state.active_landmark(context, props)
         if item is None:
             return {'CANCELLED'}
-        state.clear_landmark_position(item)
+        state.clear_landmark_position(item, context)
         visualization.remove_landmark_marker(item.stable_id)
         self.report({'INFO'}, "BSMT: cleared position of '%s'" % item.label)
         return {'FINISHED'}
@@ -1544,8 +1552,18 @@ class BSMT_OT_clear_landmarks(bpy.types.Operator):
         props = state.get_props(context)
         collection = state.get_landmarks(context)
         count = len(collection) if collection else 0
+        stale_ids = [int(item.stable_id) for item in collection]
         state.clear_landmarks(context, props)
         removed = visualization.clear_landmark_markers()
+        for stable_id in stale_ids:
+            state.invalidate_measurements_for_landmark(
+                context, stable_id, "all landmarks were cleared"
+            )
+        for item in state.get_measurements(context) or ():
+            source, target = state.resolve_measurement_landmarks(context, item)
+            if source is None or target is None:
+                item.status = measurements.STATUS_INVALID_REFERENCE
+                item.status_detail = "the referenced landmark no longer exists"
         self.report({'INFO'},
                     "BSMT: cleared %d landmark(s), removed %d marker(s). "
                     "A/B and the scan are untouched." % (count, removed))
@@ -1855,6 +1873,706 @@ class BSMT_OT_load_protocol(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Measurement Manager (Milestone 3.1)
+# ---------------------------------------------------------------------------
+#
+# There is deliberately NO all-pairs path anywhere below. "Calculate All
+# Defined" means the enabled definitions the researcher wrote, and nothing
+# else: for 50 landmarks that is the handful they care about, not 1,225
+# combinations (sect. 20).
+
+
+def _measure_one(context, props, item, report_lines=None):
+    """Calculate one measurement definition. Returns (ok, message).
+
+    Never returns a substituted number. Every refusal states which landmark
+    or which condition caused it.
+    """
+    started = time.perf_counter()
+    source, target = state.resolve_measurement_landmarks(context, item)
+
+    status, detail = measurements.readiness(
+        source, target, item.source_stable_id, item.target_stable_id
+    )
+    if status != measurements.STATUS_READY:
+        state.clear_measurement_result(item)
+        item.status = status
+        item.status_detail = detail
+        return False, detail or status
+
+    source_point = source.surface_point
+    target_point = target.surface_point
+
+    if source_point.source_object != target_point.source_object:
+        state.clear_measurement_result(item)
+        item.status = measurements.STATUS_FAILED
+        item.status_detail = (
+            "landmarks belong to different scan objects ('%s' and '%s')"
+            % (source_point.source_object, target_point.source_object)
+        )
+        return False, item.status_detail
+
+    obj = bpy.data.objects.get(source_point.source_object)
+    if obj is None or obj.type != 'MESH':
+        state.clear_measurement_result(item)
+        item.status = measurements.STATUS_FAILED
+        item.status_detail = ("source object '%s' is missing"
+                              % source_point.source_object)
+        return False, item.status_detail
+
+    wants_straight = measurements.needs_straight(item.measurement_type)
+    wants_surface = measurements.needs_surface(item.measurement_type)
+
+    # --- straight ---------------------------------------------------------
+    straight_mm = 0.0
+    if wants_straight:
+        # The Phase 1 production function, unchanged. The distance
+        # mathematics is not reimplemented here (sect. 7).
+        straight_mm = measurement.straight_distance_mm(
+            source_point.world_xyz, target_point.world_xyz, props.unit
+        )
+
+    # --- surface ----------------------------------------------------------
+    surface_mm = 0.0
+    surface_report = None
+    surface_mode = ""
+    canonical = None
+    if wants_surface:
+        unavailable = geodesic.ensure_loaded()
+        if unavailable:
+            state.clear_measurement_result(item)
+            item.status = measurements.STATUS_FAILED
+            item.status_detail = unavailable
+            return False, unavailable
+
+        broken = geodesic.measure_error()
+        if broken:
+            state.clear_measurement_result(item)
+            item.status = measurements.STATUS_FAILED
+            item.status_detail = broken
+            return False, broken
+
+        solve = geodesic.solve
+        if not geodesic.registry.available():
+            message = solve.failure_message(
+                'BACKEND_MISSING', geodesic.registry.unavailable_reason()
+            )
+            state.clear_measurement_result(item)
+            item.status = measurements.STATUS_FAILED
+            item.status_detail = message
+            return False, message
+
+        try:
+            canonical = geodesic.meshcache.get(context, obj, props.unit)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            message = "canonical mesh unavailable (%s)" % exc
+            state.clear_measurement_result(item)
+            item.status = measurements.STATUS_FAILED
+            item.status_detail = message
+            return False, message
+
+        specs = []
+        for point in (source_point, target_point):
+            specs.append(solve.PointSpec(
+                point.triangle_index,
+                np.array(point.barycentric, dtype=np.float64),
+                component_id=point.component_id,
+                source_object=point.source_object,
+                geometry_hash=point.geometry_hash,
+                status=point.status,
+                valid=point.valid,
+            ))
+
+        try:
+            # The Milestone 2.3 production pipeline, unchanged: validation,
+            # scratch-mesh endpoint insertion, bounded exact MMP query and
+            # the result invariants.
+            result = solve.surface_distance(
+                canonical.vertices_solver,
+                canonical.triangles,
+                specs[0],
+                specs[1],
+                geometry_hash=canonical.geometry_hash,
+            )
+        except solve.MeasurementError as exc:
+            state.clear_measurement_result(item)
+            item.status = measurements.STATUS_FAILED
+            item.status_detail = exc.message
+            return False, exc.message
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            message = solve.failure_message(
+                'BACKEND_ERROR', "%s: %s" % (type(exc).__name__, exc)
+            )
+            state.clear_measurement_result(item)
+            item.status = measurements.STATUS_FAILED
+            item.status_detail = message
+            return False, message
+
+        surface_mm = float(result.distance_mm)
+        surface_report = result.report
+        surface_mode = result.mode
+
+        if not wants_straight:
+            # Recorded for the ratio and the invariant even when the
+            # researcher only asked for the surface distance.
+            straight_mm = float(result.straight_mm)
+
+    if canonical is None:
+        try:
+            canonical = geodesic.meshcache.get(context, obj, props.unit)
+        except Exception:                             # noqa: BLE001
+            canonical = None
+
+    # --- store ------------------------------------------------------------
+    item.straight_valid = bool(wants_straight)
+    item.straight_mm = float(straight_mm)
+    item.surface_valid = bool(wants_surface)
+    item.surface_mm = float(surface_mm)
+    item.ratio = (measurements.ratio(straight_mm, surface_mm)
+                  if wants_surface else 0.0)
+    item.surface_mode = surface_mode
+    item.backend_name = (surface_report.backend_name
+                         if surface_report is not None else "")
+    item.backend_version = (surface_report.backend_version
+                            if surface_report is not None else "")
+    item.bound_factor = (
+        float(surface_report.bound_factor)
+        if surface_report is not None and surface_report.bound_factor is not None
+        else 0.0
+    )
+    item.unbounded_fallback = bool(
+        surface_report.unbounded_fallback if surface_report is not None else False
+    )
+    item.attempts = int(surface_report.attempts) if surface_report is not None else 0
+    item.elapsed_s = time.perf_counter() - started
+
+    if canonical is not None:
+        item.result_object = canonical.source_object
+        item.result_geometry_hash = canonical.geometry_hash
+        item.result_metric_tensor = state.metric_tensor(
+            obj.matrix_world, canonical.unit_multiplier
+        )
+    item.status = measurements.STATUS_VALID
+    item.status_detail = ""
+
+    line = "%s %s: %s" % (
+        item.protocol_id, item.label,
+        measurements.format_result(item.straight_mm, item.straight_valid,
+                                   item.surface_mm, item.surface_valid),
+    )
+    if wants_surface:
+        line += "  ratio %.4f" % item.ratio
+        line += "  | bound %s, attempts %d" % (
+            "unbounded" if item.unbounded_fallback else "%.2fx" % item.bound_factor,
+            item.attempts,
+        )
+    line += "  | %.3f s" % item.elapsed_s
+    if report_lines is not None:
+        report_lines.append(line)
+    print("[BSMT] " + line)
+    return True, line
+
+
+class BSMT_OT_add_measurement(bpy.types.Operator):
+    """Define a measurement between two named landmarks.
+
+    The landmarks need not be picked yet: a definition is a plan, and its
+    status simply reports that it is not ready
+    """
+
+    bl_idname = "bsmt.add_measurement"
+    bl_label = "Add Measurement"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    use_selected: BoolProperty(
+        name="Use Selected Landmark As Source",
+        description="Start the definition from the landmark selected in the "
+                    "Landmark Manager",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return state.get_measurements(context) is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_landmarks(context)
+        if props is None:
+            self.report({'ERROR'}, "BSMT: add-on properties are not registered")
+            return {'CANCELLED'}
+        if not collection:
+            self.report({'ERROR'},
+                        "BSMT: define some landmarks before defining a "
+                        "measurement between them")
+            return {'CANCELLED'}
+
+        source = target = None
+        if self.use_selected:
+            source = state.active_landmark(context, props)
+        if source is None:
+            source = collection[0]
+        if len(collection) > 1:
+            target = collection[1] if collection[1] is not source else collection[0]
+        else:
+            target = source
+
+        try:
+            item = state.add_measurement(
+                context, props, source=source, target=target,
+                measurement_type=measurements.TYPE_BOTH,
+            )
+        except measurements.MeasurementError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        state.refresh_measurement_status(context, item)
+        self.report({'INFO'}, "BSMT: added measurement %s '%s'"
+                    % (item.protocol_id, item.label))
+        return {'FINISHED'}
+
+
+class BSMT_OT_remove_measurement(bpy.types.Operator):
+    """Delete the selected measurement definition"""
+
+    bl_idname = "bsmt.remove_measurement"
+    bl_label = "Delete Measurement"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return state.active_measurement(context) is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        item = state.active_measurement(context, props)
+        if item is None:
+            return {'CANCELLED'}
+        label = item.label
+        state.remove_measurement(context, props, props.measurement_index)
+        self.report({'INFO'}, "BSMT: deleted measurement '%s'" % label)
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_measurements(bpy.types.Operator):
+    """Delete every measurement definition. Landmarks, A/B and the scan are
+    not affected"""
+
+    bl_idname = "bsmt.clear_measurements"
+    bl_label = "Clear Measurements"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(state.get_measurements(context))
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        count = state.clear_measurements(context, props)
+        self.report({'INFO'}, "BSMT: cleared %d measurement definition(s)" % count)
+        return {'FINISHED'}
+
+
+class BSMT_OT_remove_invalid_measurements(bpy.types.Operator):
+    """Delete only the measurements whose landmark references cannot be
+    resolved.
+
+    Explicit and opt-in: a broken reference is never cleaned up automatically
+    """
+
+    bl_idname = "bsmt.remove_invalid_measurements"
+    bl_label = "Remove Invalid Measurements"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        collection = state.get_measurements(context)
+        if not collection:
+            return False
+        return any(item.status == measurements.STATUS_INVALID_REFERENCE
+                   for item in collection)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_measurements(context)
+        removed = 0
+        for index in range(len(collection) - 1, -1, -1):
+            source, target = state.resolve_measurement_landmarks(
+                context, collection[index]
+            )
+            if source is None or target is None:
+                state.remove_measurement(context, props, index)
+                removed += 1
+        self.report({'INFO'},
+                    "BSMT: removed %d measurement(s) with unresolved "
+                    "references" % removed)
+        return {'FINISHED'}
+
+
+class BSMT_OT_calculate_measurement(bpy.types.Operator):
+    """Calculate the selected measurement.
+
+    A surface measurement runs the exact MMP backend and may block Blender
+    for several seconds on a dense scan
+    """
+
+    bl_idname = "bsmt.calculate_measurement"
+    bl_label = "Calculate Selected"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or props.measurement_running:
+            return False
+        return state.active_measurement(context) is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        item = state.active_measurement(context, props)
+        if item is None:
+            return {'CANCELLED'}
+        if props.measurement_running:
+            self.report({'WARNING'}, "BSMT: a calculation is already running")
+            return {'CANCELLED'}
+
+        props.measurement_running = True
+        props.measurement_progress = "Calculating %s %s" % (
+            item.protocol_id, item.label
+        )
+        try:
+            ok, message = _measure_one(context, props, item)
+        finally:
+            props.measurement_running = False
+            props.measurement_progress = ""
+
+        self.report({'INFO'} if ok else {'ERROR'}, "BSMT: " + message)
+        return {'FINISHED'} if ok else {'CANCELLED'}
+
+
+class BSMT_OT_calculate_all_measurements(bpy.types.Operator):
+    """Calculate every ENABLED measurement definition, in order.
+
+    Only the definitions the researcher wrote, and only the enabled ones. No
+    landmark pair is measured unless a definition says so
+    """
+
+    bl_idname = "bsmt.calculate_all_measurements"
+    bl_label = "Calculate All Defined"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or props.measurement_running:
+            return False
+        return bool(state.get_measurements(context))
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_measurements(context)
+        if props is None or not collection:
+            return {'CANCELLED'}
+        if props.measurement_running:
+            self.report({'WARNING'}, "BSMT: a batch is already running")
+            return {'CANCELLED'}
+
+        plan = measurements.batch_plan(collection)
+        print("\n[BSMT] Calculate All Defined: %s" % plan["summary"])
+        if plan["disabled"]:
+            print("[BSMT] skipping %d disabled definition(s)" % plan["disabled"])
+        if plan["enabled"] == 0:
+            self.report({'WARNING'},
+                        "BSMT: no enabled measurement definitions to calculate")
+            return {'CANCELLED'}
+
+        enabled = [item for item in collection if item.enabled]
+        props.measurement_running = True
+        started = time.perf_counter()
+        lines = []
+        statuses = []
+        try:
+            for position, item in enumerate(enabled, start=1):
+                # Sequential, single threaded (sect. 8). Progress is reported
+                # between measurements, which is all Blender can repaint while
+                # a blocking C++ solve is running.
+                progress = "Calculating %d / %d: %s %s" % (
+                    position, plan["enabled"], item.protocol_id, item.label
+                )
+                props.measurement_progress = progress
+                print("[BSMT] " + progress)
+                self._nudge(context)
+                try:
+                    _measure_one(context, props, item, lines)
+                except Exception as exc:              # noqa: BLE001
+                    # One failure must never abort the batch (sect. 10).
+                    traceback.print_exc()
+                    state.clear_measurement_result(item)
+                    item.status = measurements.STATUS_FAILED
+                    item.status_detail = "%s: %s" % (type(exc).__name__, exc)
+                statuses.append(item.status)
+        finally:
+            props.measurement_running = False
+            props.measurement_progress = ""
+
+        elapsed = time.perf_counter() - started
+        _counts, summary = measurements.summarise(statuses)
+        props.measurement_summary = summary
+        print("[BSMT] batch finished in %.2f s: %s" % (elapsed, summary))
+
+        failed = sum(1 for status in statuses
+                     if status in (measurements.STATUS_FAILED,
+                                   measurements.STATUS_INVALID_REFERENCE))
+        self.report(
+            {'WARNING'} if failed else {'INFO'},
+            "BSMT: %s in %.2f s (%d disabled, skipped)"
+            % (summary, elapsed, plan["disabled"]),
+        )
+        return {'FINISHED'}
+
+    @staticmethod
+    def _nudge(context):
+        """Best-effort redraw between measurements."""
+        try:
+            if context.area is not None:
+                context.area.tag_redraw()
+        except Exception:                             # pragma: no cover
+            pass
+
+
+class BSMT_OT_clear_measurement_results(bpy.types.Operator):
+    """Forget every calculated result. The definitions are kept"""
+
+    bl_idname = "bsmt.clear_measurement_results"
+    bl_label = "Clear Results"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        collection = state.get_measurements(context)
+        return bool(collection) and any(item.has_result for item in collection)
+
+    def execute(self, context):
+        count = state.invalidate_all_measurement_results(
+            context, "results cleared by the operator"
+        )
+        props = state.get_props(context)
+        if props is not None:
+            props.measurement_summary = ""
+        self.report({'INFO'}, "BSMT: cleared %d result(s)" % count)
+        return {'FINISHED'}
+
+
+class BSMT_OT_refresh_measurements(bpy.types.Operator):
+    """Re-evaluate every measurement's status against the current landmarks,
+    geometry and metric"""
+
+    bl_idname = "bsmt.refresh_measurements"
+    bl_label = "Refresh Status"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(state.get_measurements(context))
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_measurements(context)
+        geodesic.ensure_loaded()
+        meshcache = geodesic.meshcache if geodesic.MESHCACHE_AVAILABLE else None
+
+        statuses = []
+        for item in collection:
+            canonical = None
+            matrix = None
+            name = item.result_object
+            if meshcache is not None and name:
+                canonical = meshcache.peek(name)
+                obj = bpy.data.objects.get(name)
+                if obj is not None:
+                    matrix = obj.matrix_world
+            state.refresh_measurement_status(context, item, canonical, matrix)
+            statuses.append(item.status)
+
+        _counts, summary = measurements.summarise(statuses)
+        props.measurement_summary = summary
+        self.report({'INFO'}, "BSMT: %s" % summary)
+        return {'FINISHED'}
+
+
+class BSMT_OT_save_measurement_template(bpy.types.Operator):
+    """Save the measurement definitions as a reusable template.
+
+    Definitions only: no distances, no timings, no coordinates
+    """
+
+    bl_idname = "bsmt.save_measurement_template"
+    bl_label = "Save Measurement Template"
+    bl_options = {'REGISTER'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+    check_existing: BoolProperty(default=True, options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return bool(state.get_measurements(context))
+
+    def invoke(self, context, event):
+        props = state.get_props(context)
+        if not self.filepath:
+            name = (props.measurement_protocol_name
+                    or "bsmt_measurements").replace(" ", "_")
+            self.filepath = name + ".json"
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_measurements(context)
+        if not collection:
+            self.report({'ERROR'}, "BSMT: there are no measurements to save")
+            return {'CANCELLED'}
+
+        entries = []
+        for item in collection:
+            source, target = state.resolve_measurement_landmarks(context, item)
+            # The landmark PROTOCOL id travels in the file, because that is
+            # what makes a template meaningful alongside a landmark protocol
+            # on another scan. The live protocol id wins when the reference
+            # still resolves; the cached one is the fallback so an unresolved
+            # definition can still be saved and diagnosed.
+            from_id = source.protocol_id if source is not None else item.source_protocol_id
+            to_id = target.protocol_id if target is not None else item.target_protocol_id
+            from_name = source.name if source is not None else item.source_name
+            to_name = target.name if target is not None else item.target_name
+            entries.append((
+                item.protocol_id, item.name,
+                from_id, from_name, to_id, to_name,
+                item.measurement_type, bool(item.enabled), item.notes,
+            ))
+
+        try:
+            protocol.save_measurements(
+                self.filepath,
+                props.measurement_protocol_name or "BSMT Measurement Template",
+                entries,
+            )
+        except (protocol.ProtocolError, OSError) as exc:
+            self.report({'ERROR'}, "BSMT: could not save template: %s" % exc)
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, "BSMT: saved %d measurement definition(s) to %s"
+                    % (len(entries), self.filepath))
+        return {'FINISHED'}
+
+
+class BSMT_OT_load_measurement_template(bpy.types.Operator):
+    """Load measurement definitions from a template.
+
+    Landmark references resolve by landmark protocol id. A reference that
+    cannot be resolved is marked INVALID_REFERENCE - never matched to a
+    different landmark
+    """
+
+    bl_idname = "bsmt.load_measurement_template"
+    bl_label = "Load Measurement Template"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+    replace: BoolProperty(
+        name="Replace Existing Measurements",
+        description="Delete the current definitions before loading",
+        default=True,
+    )
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is None:
+            return {'CANCELLED'}
+        try:
+            name, entries = protocol.load_measurements(self.filepath)
+        except protocol.ProtocolError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        if self.replace:
+            state.clear_measurements(context, props)
+
+        landmark_collection = state.get_landmarks(context)
+        by_protocol_id = {}
+        if landmark_collection:
+            for landmark in landmark_collection:
+                if landmark.protocol_id:
+                    by_protocol_id.setdefault(landmark.protocol_id, landmark)
+
+        unresolved = 0
+        for entry in entries:
+            item = state.add_measurement(
+                context, props,
+                name=entry["name"],
+                measurement_type=entry["type"],
+                notes=entry["notes"],
+                protocol_id=entry["id"],
+            )
+            item.enabled = entry["enabled"]
+
+            for slot, id_key, name_key in (
+                ("source", "from_landmark_id", "from_landmark_name"),
+                ("target", "to_landmark_id", "to_landmark_name"),
+            ):
+                # The id is authoritative. The name is recorded for
+                # diagnostics and is NEVER used to find a substitute
+                # landmark (sect. 16).
+                landmark = by_protocol_id.get(entry[id_key])
+                if landmark is not None:
+                    state.bind_measurement_landmark(item, slot, landmark)
+                else:
+                    setattr(item, slot + "_stable_id", 0)
+                    setattr(item, slot + "_protocol_id", entry[id_key])
+                    setattr(item, slot + "_name", entry[name_key])
+
+            state.refresh_measurement_status(context, item)
+            if item.status == measurements.STATUS_INVALID_REFERENCE:
+                unresolved += 1
+
+        props.measurement_protocol_name = name
+        props.measurement_index = 0
+        _counts, summary = measurements.summarise(
+            [item.status for item in state.get_measurements(context)]
+        )
+        props.measurement_summary = summary
+
+        if unresolved:
+            self.report(
+                {'WARNING'},
+                "BSMT: loaded '%s' - %d definition(s), %d with unresolved "
+                "landmark references. Load the matching landmark protocol "
+                "first." % (name, len(entries), unresolved),
+            )
+        else:
+            self.report({'INFO'}, "BSMT: loaded measurement template '%s' - "
+                                  "%d definition(s)" % (name, len(entries)))
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_topology(bpy.types.Operator):
     """Clear the topology diagnostics report"""
 
@@ -1896,6 +2614,16 @@ classes = (
     BSMT_OT_guided_picking,
     BSMT_OT_save_protocol,
     BSMT_OT_load_protocol,
+    BSMT_OT_add_measurement,
+    BSMT_OT_remove_measurement,
+    BSMT_OT_clear_measurements,
+    BSMT_OT_remove_invalid_measurements,
+    BSMT_OT_calculate_measurement,
+    BSMT_OT_calculate_all_measurements,
+    BSMT_OT_clear_measurement_results,
+    BSMT_OT_refresh_measurements,
+    BSMT_OT_save_measurement_template,
+    BSMT_OT_load_measurement_template,
 )
 
 

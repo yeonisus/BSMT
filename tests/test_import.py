@@ -282,6 +282,7 @@ def test_fresh_import():
     check_package(bsmt, "fresh")
     check("fresh: operators module loaded", hasattr(bsmt, "operators"))
     check("fresh: landmarks module loaded", hasattr(bsmt, "landmarks"))
+    check("fresh: measurements module loaded", hasattr(bsmt, "measurements"))
     check("fresh: protocol module loaded", hasattr(bsmt, "protocol"))
     check("fresh: register/unregister present",
           callable(bsmt.register) and callable(bsmt.unregister))
@@ -814,7 +815,7 @@ def test_landmark_modules_are_pure(bsmt):
     print("\nMilestone 3.0 modules are importable without Blender")
     import ast as _ast
     import os as _os
-    for name in ("landmarks", "protocol"):
+    for name in ("landmarks", "protocol", "measurements"):
         path = _os.path.join(ROOT, "body_surface_measurement", name + ".py")
         tree = _ast.parse(open(path).read())
         imported = set()
@@ -840,6 +841,29 @@ def test_landmark_modules_are_pure(bsmt):
           "landmarks.stale_reason(" in source)
     check("no second geometry-hash stale comparison remains in operators.py",
           source.count("geometry_hash != point.geometry_hash") == 0)
+
+    # Milestone 3.1: there must be no all-pairs generation anywhere, and the
+    # dynamic landmark picker must never be read back for identity.
+    for path in ("operators.py", "panels.py", "state.py", "measurements.py"):
+        text = open(_os.path.join(ROOT, "body_surface_measurement", path)).read()
+        lowered = text.lower()
+        for forbidden in ("itertools.combinations", "all_pairs", "allpairs"):
+            check("%s contains no %s" % (path, forbidden),
+                  forbidden not in lowered)
+    ops_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                  "operators.py")).read()
+    check("operators.py never reads a landmark picker back",
+          "source_picker" not in ops_text and "target_picker" not in ops_text,
+          "the picker remaps by index and must never decide identity")
+    check("the calculation path resolves by stable id",
+          "resolve_measurement_landmarks" in ops_text)
+    state_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                    "state.py")).read()
+    check("the picker is consumed in exactly one place",
+          state_text.count("_adopt_landmark(self, context") == 2,
+          str(state_text.count("_adopt_landmark(self, context")))
+    check("resolution is by stable id, never by name",
+          "landmark_by_stable_id" in state_text)
 
     # And one place writes SurfacePoint fields.
     state_source = open(_os.path.join(ROOT, "body_surface_measurement",

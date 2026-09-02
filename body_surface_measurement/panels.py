@@ -2,7 +2,7 @@
 
 import bpy
 
-from . import geodesic, landmarks, measurement, state
+from . import geodesic, landmarks, measurement, measurements, state
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
@@ -604,12 +604,241 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         note.label(text="Protocols carry names, not scan positions.")
 
 
+class BSMT_UL_measurements(bpy.types.UIList):
+    """Measurement rows: id, From to To, type, result and status.
+
+    Compact on purpose (sect. 11): the numbers a researcher scans down the
+    list, with the detail for the selected definition drawn below.
+    """
+
+    bl_idname = "BSMT_UL_measurements"
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_property, index=0, flt_flag=0):
+        if self.layout_type not in {'DEFAULT', 'COMPACT'}:
+            layout.alignment = 'CENTER'
+            layout.label(
+                text="",
+                icon=measurements.STATUS_ICONS.get(item.status, 'BLANK1'),
+            )
+            return
+
+        column = layout.column(align=True)
+
+        top = column.row(align=True)
+        toggle = top.row(align=True)
+        toggle.prop(item, "enabled", text="")
+        identifier = top.row()
+        identifier.scale_x = 0.35
+        identifier.enabled = False
+        identifier.label(text=item.protocol_id or "-")
+        label = top.row()
+        label.enabled = bool(item.enabled)
+        label.label(text=item.label)
+        kind = top.row()
+        kind.alignment = 'RIGHT'
+        kind.scale_x = 0.6
+        kind.enabled = False
+        kind.label(text=item.measurement_type)
+
+        bottom = column.row(align=True)
+        bottom.scale_y = 0.75
+        pair = bottom.row()
+        pair.enabled = False
+        pair.label(text="   %s \u2192 %s" % (
+            item.source_name or item.source_protocol_id or "?",
+            item.target_name or item.target_protocol_id or "?",
+        ))
+        result = bottom.row()
+        result.alignment = 'RIGHT'
+        if item.has_result:
+            text = measurements.format_result(
+                item.straight_mm, item.straight_valid,
+                item.surface_mm, item.surface_valid,
+            )
+            if item.surface_valid and item.straight_valid and item.ratio:
+                text += "  r %.3f" % item.ratio
+            result.label(text=text)
+        else:
+            result.label(
+                text=measurements.STATUS_SHORT.get(item.status, item.status),
+                icon=measurements.STATUS_ICONS.get(item.status, 'BLANK1'),
+            )
+
+
+class BSMT_PT_measurements(bpy.types.Panel):
+    """User-defined measurements between named landmarks (Milestone 3.1).
+
+    Only the definitions the researcher writes are ever calculated. There is
+    no all-pairs path: the workflow is protocol-driven, not combinatorial.
+    """
+
+    bl_label = "Measurement Manager"
+    bl_idname = "BSMT_PT_measurements"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "BSMT"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = state.get_props(context)
+        collection = state.get_measurements(context)
+        if props is None or collection is None:
+            layout.label(text="Add-on state unavailable", icon='ERROR')
+            return
+
+        if props.measurement_protocol_name:
+            row = layout.row()
+            row.enabled = False
+            row.label(text="Template: %s" % props.measurement_protocol_name)
+
+        if props.measurement_running and props.measurement_progress:
+            box = layout.box()
+            box.label(text=props.measurement_progress, icon='TIME')
+
+        layout.template_list(
+            "BSMT_UL_measurements", "",
+            context.scene, "bsmt_measurements",
+            props, "measurement_index",
+            rows=6 if len(collection) > 3 else 3,
+        )
+
+        row = layout.row(align=True)
+        row.operator("bsmt.add_measurement", text="Add", icon='ADD')
+        row.operator("bsmt.remove_measurement", text="Delete", icon='REMOVE')
+
+        self._draw_selected(context, layout, props, collection)
+
+        layout.separator()
+        column = layout.column(align=True)
+        column.operator("bsmt.calculate_all_measurements", icon='PLAY')
+        plan = measurements.batch_plan(collection)
+        info = column.column(align=True)
+        info.scale_y = 0.7
+        info.enabled = False
+        info.label(text=plan["summary"])
+        if plan["disabled"]:
+            info.label(text="%d disabled, will be skipped" % plan["disabled"])
+        if props.measurement_summary:
+            info.label(text="Last run: %s" % props.measurement_summary)
+
+        row = layout.row(align=True)
+        row.operator("bsmt.refresh_measurements", text="Refresh",
+                     icon='FILE_REFRESH')
+        row.operator("bsmt.clear_measurement_results", text="Clear Results",
+                     icon='X')
+
+        self._draw_template(layout)
+
+        layout.separator()
+        row = layout.row(align=True)
+        row.operator("bsmt.remove_invalid_measurements",
+                     text="Remove Invalid", icon='CANCEL')
+        row.operator("bsmt.clear_measurements", text="Clear All", icon='TRASH')
+
+    @staticmethod
+    def _draw_selected(context, layout, props, collection):
+        index = props.measurement_index
+        if not 0 <= index < len(collection):
+            layout.box().label(text="No measurement selected")
+            return
+        item = collection[index]
+        box = layout.box()
+
+        header = box.row(align=True)
+        header.prop(
+            props, "show_measurement_detail",
+            icon='TRIA_DOWN' if props.show_measurement_detail else 'TRIA_RIGHT',
+            emboss=False, text="Selected: %s" % item.label,
+        )
+        if not props.show_measurement_detail:
+            return
+
+        box.prop(item, "name", text="Name")
+
+        # From / To. These pickers WRITE the authoritative stable id through
+        # their update callbacks and are never read back for identity: a
+        # dynamic enum remaps by index when the landmark list changes, which
+        # would silently repoint a measurement (see state.landmark_enum_items).
+        source, target = state.resolve_measurement_landmarks(context, item)
+        for slot, picker, resolved, cached_id, cached_name in (
+            ("From", "source_picker", source,
+             item.source_protocol_id, item.source_name),
+            ("To", "target_picker", target,
+             item.target_protocol_id, item.target_name),
+        ):
+            row = box.row(align=True)
+            row.prop(item, picker, text=slot)
+            if resolved is None:
+                warn = box.row()
+                warn.alert = True
+                warn.label(
+                    text="   %s unresolved: %s %s" % (
+                        slot, cached_id or "?", cached_name or ""
+                    ),
+                    icon='CANCEL',
+                )
+
+        box.prop(item, "measurement_type", text="Type")
+        box.prop(item, "enabled")
+        box.prop(item, "notes", text="Notes")
+
+        box.operator("bsmt.calculate_measurement", icon='PLAY')
+
+        detail = box.column(align=True)
+        detail.scale_y = 0.7
+        detail.label(
+            text="Status: %s" % measurements.STATUS_SHORT.get(
+                item.status, item.status),
+            icon=measurements.STATUS_ICONS.get(item.status, 'BLANK1'),
+        )
+        if item.status_detail:
+            for line in _wrap(item.status_detail, 42):
+                detail.label(text="   " + line)
+
+        if not item.has_result:
+            return
+        detail.separator()
+        if item.straight_valid:
+            detail.label(text="Straight: %s"
+                              % measurement.format_mm(item.straight_mm))
+        if item.surface_valid:
+            detail.label(text="Surface:  %s"
+                              % measurement.format_mm(item.surface_mm))
+            if item.straight_valid and item.ratio:
+                detail.label(text="Surface / Straight: %.4f" % item.ratio)
+            detail.label(text="Backend:  %s %s" % (item.backend_name,
+                                                   item.backend_version))
+            detail.label(text="Bound:    %s" % (
+                "unbounded fallback" if item.unbounded_fallback
+                else "%.2fx" % item.bound_factor))
+            detail.label(text="Attempts: %d" % item.attempts)
+        detail.label(text="Elapsed:  %.3f s" % item.elapsed_s)
+
+    @staticmethod
+    def _draw_template(layout):
+        layout.separator()
+        layout.label(text="Measurement Template (definitions only)")
+        row = layout.row(align=True)
+        row.operator("bsmt.load_measurement_template", text="Load",
+                     icon='IMPORT')
+        row.operator("bsmt.save_measurement_template", text="Save",
+                     icon='EXPORT')
+        note = layout.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        note.label(text="Templates carry definitions, not results.")
+
+
 classes = (
     BSMT_PT_body_measurement,
     BSMT_PT_diagnostics,
     BSMT_PT_geodesic_backend,
     BSMT_UL_landmarks,
     BSMT_PT_landmarks,
+    BSMT_UL_measurements,
+    BSMT_PT_measurements,
 )
 
 

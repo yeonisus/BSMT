@@ -17,7 +17,7 @@ from bpy.props import (
     StringProperty,
 )
 
-from . import geodesic, landmarks, measurement, visualization
+from . import geodesic, landmarks, measurement, measurements, visualization
 
 
 def _on_display_changed(self, context):
@@ -40,6 +40,14 @@ def _on_unit_changed(self, context):
     # displayed. The straight distance above can simply be rescaled; a
     # geodesic cannot, because a non-uniform metric change moves the path.
     clear_surface_result(self)
+    # Same reasoning for every user-defined measurement: a distance computed
+    # under a different physical metric is not this measurement's answer.
+    try:
+        invalidate_all_measurement_results(
+            context, "the coordinate unit interpretation changed"
+        )
+    except Exception:                                 # pragma: no cover
+        pass
     # Physical millimetre coordinates depend on the unit but not on the world
     # position, so nothing else would refresh them. Imported late: attach
     # imports state, and this is the only direction that would close a cycle.
@@ -179,6 +187,150 @@ class BSMT_Landmark(bpy.types.PropertyGroup):
     @property
     def label(self):
         return self.display_name or self.name or "(unnamed)"
+
+
+# Blender garbage-collects the strings behind a dynamic EnumProperty unless a
+# reference is held, so the generated list is cached here on purpose.
+_LANDMARK_ENUM_CACHE = [('0', "(no landmarks)", "")]
+
+
+def landmark_enum_items(self, context):
+    """Items for the From/To pickers: "L03  Shoulder_L", valued by stable id.
+
+    WRITE-ONLY. Measured in Blender 4.5.13: a dynamic enum remaps by index
+    when its item list changes, so after deleting landmark 42 a picker set to
+    "42" reads back as "43" - a different landmark, silently. Nothing reads
+    these back; the authoritative reference is the integer stable id, and the
+    update callbacks below are the only place the picker is consumed.
+    """
+    global _LANDMARK_ENUM_CACHE
+    scene = getattr(context, "scene", None) if context is not None else None
+    collection = getattr(scene, "bsmt_landmarks", None) if scene else None
+    items = []
+    if collection:
+        for item in collection:
+            items.append((
+                str(item.stable_id),
+                "%s  %s" % (item.protocol_id or "--", item.label),
+                item.notes or "",
+            ))
+    if not items:
+        items = [('0', "(no landmarks)", "")]
+    _LANDMARK_ENUM_CACHE = items
+    return _LANDMARK_ENUM_CACHE
+
+
+def _adopt_landmark(measurement_item, context, slot, raw_value):
+    """Copy a picker choice into the authoritative reference fields."""
+    try:
+        stable_id = int(raw_value)
+    except (TypeError, ValueError):
+        return
+    collection = get_landmarks(context)
+    landmark = (landmark_by_stable_id(collection, stable_id)
+                if collection else None)
+    if landmark is None:
+        return
+    setattr(measurement_item, slot + "_stable_id", stable_id)
+    setattr(measurement_item, slot + "_protocol_id", landmark.protocol_id)
+    setattr(measurement_item, slot + "_name", landmark.name)
+    invalidate_measurement_result(
+        measurement_item, "the %s landmark selection changed" % slot
+    )
+
+
+def _on_source_picker(self, context):
+    _adopt_landmark(self, context, "source", self.source_picker)
+
+
+def _on_target_picker(self, context):
+    _adopt_landmark(self, context, "target", self.target_picker)
+
+
+def _on_definition_changed(self, context):
+    """Any change to what a measurement MEANS invalidates its result."""
+    invalidate_measurement_result(self, "the measurement definition changed")
+
+
+class BSMT_Measurement(bpy.types.PropertyGroup):
+    """One user-defined measurement between two named landmarks.
+
+    Landmark references are stable ids, never list indices: deleting or
+    reordering landmarks must not be able to repoint a measurement at a
+    different one (sect. 2). The cached protocol id and name are for
+    templates and for saying *which* landmark is missing when a reference
+    cannot be resolved - they are never used to find a substitute.
+    """
+
+    stable_id: IntProperty(name="Stable ID", default=0)
+    protocol_id: StringProperty(name="ID", default="")
+    name: StringProperty(name="Name", default="",
+                         update=_on_definition_changed)
+    notes: StringProperty(name="Notes", default="")
+    enabled: BoolProperty(
+        name="Enabled",
+        description="Include this measurement in Calculate All Defined",
+        default=True,
+    )
+
+    source_stable_id: IntProperty(name="From (stable id)", default=0)
+    target_stable_id: IntProperty(name="To (stable id)", default=0)
+    source_protocol_id: StringProperty(default="")
+    target_protocol_id: StringProperty(default="")
+    source_name: StringProperty(default="")
+    target_name: StringProperty(default="")
+
+    source_picker: EnumProperty(
+        name="From", description="Source landmark",
+        items=landmark_enum_items, update=_on_source_picker,
+    )
+    target_picker: EnumProperty(
+        name="To", description="Target landmark",
+        items=landmark_enum_items, update=_on_target_picker,
+    )
+
+    measurement_type: EnumProperty(
+        name="Type",
+        items=measurements.TYPE_ITEMS,
+        default=measurements.TYPE_BOTH,
+        update=_on_definition_changed,
+    )
+
+    status: EnumProperty(
+        name="Status",
+        items=measurements.STATUS_ITEMS,
+        default=measurements.STATUS_NOT_READY,
+    )
+    status_detail: StringProperty(default="")
+
+    # --- results, cleanly separated from the definition ------------------
+    straight_valid: BoolProperty(default=False)
+    straight_mm: FloatProperty(name="Straight (mm)", default=0.0)
+    surface_valid: BoolProperty(default=False)
+    surface_mm: FloatProperty(name="Surface (mm)", default=0.0)
+    ratio: FloatProperty(name="Surface / Straight", default=0.0)
+
+    # --- provenance of the surface result --------------------------------
+    backend_name: StringProperty(default="")
+    backend_version: StringProperty(default="")
+    bound_factor: FloatProperty(default=0.0)
+    unbounded_fallback: BoolProperty(default=False)
+    attempts: IntProperty(default=0)
+    elapsed_s: FloatProperty(default=0.0)
+    surface_mode: StringProperty(default="")
+
+    # --- dependency fingerprint, for sect. 12 invalidation ---------------
+    result_object: StringProperty(default="")
+    result_geometry_hash: StringProperty(default="")
+    result_metric_tensor: FloatVectorProperty(size=9, default=(0.0,) * 9)
+
+    @property
+    def label(self):
+        return self.name or self.protocol_id or "(unnamed)"
+
+    @property
+    def has_result(self):
+        return bool(self.straight_valid or self.surface_valid)
 
 
 class BSMT_ComponentInfo(bpy.types.PropertyGroup):
@@ -467,6 +619,33 @@ class BSMT_Properties(bpy.types.PropertyGroup):
     )
 
     # ------------------------------------------------------------------
+    # Milestone 3.1 - Measurement Manager settings. The definitions live on
+    # the Scene as scene.bsmt_measurements.
+    # ------------------------------------------------------------------
+    measurement_index: IntProperty(
+        name="Active Measurement", default=0, min=0,
+    )
+    measurement_next_id: IntProperty(
+        name="Next Measurement ID", default=1, min=1,
+    )
+    measurement_protocol_name: StringProperty(
+        name="Measurement Template", default="",
+    )
+    measurement_summary: StringProperty(
+        name="Measurement Summary", default="",
+    )
+    measurement_progress: StringProperty(
+        name="Batch Progress", default="",
+    )
+    measurement_running: BoolProperty(
+        name="Batch Running", default=False, options={'SKIP_SAVE'},
+    )
+    show_measurement_detail: BoolProperty(
+        name="Details", description="Show the selected measurement's detail",
+        default=True,
+    )
+
+    # ------------------------------------------------------------------
     # Milestone 2.3 - production surface (geodesic) distance.
     # Stored SEPARATELY from the Phase 1 straight distance so neither can
     # overwrite the other, and invalidated independently (sect. 6.5).
@@ -741,9 +920,19 @@ def remove_landmark(context, props, index):
     if collection is None or not 0 <= index < len(collection):
         return None
     stable_id = int(collection[index].stable_id)
+    label = collection[index].label
     collection.remove(index)
     if props.landmark_index >= len(collection):
         props.landmark_index = max(0, len(collection) - 1)
+    # Measurements that referenced it are NOT deleted or redirected. They
+    # keep their definition and become INVALID_REFERENCE, so the loss is
+    # visible rather than silently repaired (sect. 14).
+    invalidate_measurements_for_landmark(
+        context, stable_id, "landmark '%s' was deleted" % label
+    )
+    for item in measurements_referencing(get_measurements(context), stable_id):
+        item.status = measurements.STATUS_INVALID_REFERENCE
+        item.status_detail = "landmark '%s' (id %d) was deleted" % (label, stable_id)
     return stable_id
 
 
@@ -765,11 +954,20 @@ def clear_landmarks(context, props):
     return stable_ids
 
 
-def clear_landmark_position(item):
-    """Forget a landmark's surface location, keeping its name and stable id."""
+def clear_landmark_position(item, context=None):
+    """Forget a landmark's surface location, keeping its name and stable id.
+
+    Any measurement that referenced it loses its result: a distance to a
+    landmark that no longer has a position is not a measurement (sect. 12).
+    """
     clear_surface_point(item.surface_point)
     item.status = landmarks.STATUS_NOT_PICKED
     item.status_detail = ""
+    if context is not None:
+        invalidate_measurements_for_landmark(
+            context, item.stable_id,
+            "landmark '%s' position was cleared" % item.label,
+        )
 
 
 def set_landmark_status(item, status, detail=""):
@@ -816,6 +1014,238 @@ def landmark_by_stable_id(collection, stable_id):
         if int(item.stable_id) == int(stable_id):
             return item
     return None
+
+
+# ---------------------------------------------------------------------------
+# Measurement Manager (Milestone 3.1)
+# ---------------------------------------------------------------------------
+
+
+def get_measurements(context):
+    scene = getattr(context, "scene", None)
+    return getattr(scene, "bsmt_measurements", None) if scene is not None else None
+
+
+def active_measurement(context, props=None):
+    collection = get_measurements(context)
+    if not collection:
+        return None
+    if props is None:
+        props = get_props(context)
+    if props is None:
+        return None
+    index = props.measurement_index
+    return collection[index] if 0 <= index < len(collection) else None
+
+
+def measurement_protocol_ids(collection):
+    return [item.protocol_id for item in collection]
+
+
+def add_measurement(context, props, name="", source=None, target=None,
+                    measurement_type=None, notes="", protocol_id=""):
+    """Append a measurement definition. Returns it.
+
+    Landmarks need not be picked yet (sect. 5): a definition is a plan, and
+    its status simply reports that it is not ready.
+    """
+    collection = get_measurements(context)
+    if collection is None:
+        raise measurements.MeasurementError(
+            "measurement collection is not registered"
+        )
+    item = collection.add()
+    item.stable_id = props.measurement_next_id
+    props.measurement_next_id += 1
+    item.protocol_id = (str(protocol_id).strip()
+                        or measurements.next_protocol_id(
+                            measurement_protocol_ids(collection)))
+    item.measurement_type = measurement_type or measurements.TYPE_BOTH
+    item.notes = str(notes or "")
+    item.enabled = True
+
+    if source is not None:
+        bind_measurement_landmark(item, "source", source)
+    if target is not None:
+        bind_measurement_landmark(item, "target", target)
+
+    item.name = name or measurements.default_name(
+        source.label if source is not None else "",
+        target.label if target is not None else "",
+    )
+    props.measurement_index = len(collection) - 1
+    clear_measurement_result(item)
+    return item
+
+
+def bind_measurement_landmark(item, slot, landmark):
+    """Point one end of a measurement at a landmark, by stable id."""
+    setattr(item, slot + "_stable_id", int(landmark.stable_id))
+    setattr(item, slot + "_protocol_id", landmark.protocol_id)
+    setattr(item, slot + "_name", landmark.name)
+    # Keep the picker in step. Guarded: setting a dynamic enum to an
+    # identifier that is not currently in its item list raises.
+    try:
+        setattr(item, slot + "_picker", str(int(landmark.stable_id)))
+    except (TypeError, ValueError):
+        pass
+
+
+def remove_measurement(context, props, index):
+    collection = get_measurements(context)
+    if collection is None or not 0 <= index < len(collection):
+        return None
+    stable_id = int(collection[index].stable_id)
+    collection.remove(index)
+    if props.measurement_index >= len(collection):
+        props.measurement_index = max(0, len(collection) - 1)
+    return stable_id
+
+
+def clear_measurements(context, props):
+    collection = get_measurements(context)
+    if collection is None:
+        return 0
+    count = len(collection)
+    collection.clear()
+    props.measurement_index = 0
+    props.measurement_summary = ""
+    props.measurement_progress = ""
+    return count
+
+
+def clear_measurement_result(item):
+    """Forget a measurement's numbers. The definition is untouched."""
+    item.straight_valid = False
+    item.straight_mm = 0.0
+    item.surface_valid = False
+    item.surface_mm = 0.0
+    item.ratio = 0.0
+    item.backend_name = ""
+    item.backend_version = ""
+    item.bound_factor = 0.0
+    item.unbounded_fallback = False
+    item.attempts = 0
+    item.elapsed_s = 0.0
+    item.surface_mode = ""
+    item.result_object = ""
+    item.result_geometry_hash = ""
+    item.result_metric_tensor = (0.0,) * 9
+
+
+def invalidate_measurement_result(item, reason):
+    """Drop a stored result because a dependency changed (sect. 12).
+
+    Never leaves a number behind: a distance whose landmarks, geometry or
+    metric have changed is not a measurement of anything.
+    """
+    if item.has_result:
+        clear_measurement_result(item)
+        item.status = measurements.STATUS_NOT_READY
+        item.status_detail = "invalidated: %s" % reason
+    return item
+
+
+def measurements_referencing(collection, landmark_stable_id):
+    """Definitions that use a landmark. Cheap: one pass, integer compares."""
+    if not collection:
+        return []
+    wanted = int(landmark_stable_id)
+    return [
+        item for item in collection
+        if item.source_stable_id == wanted or item.target_stable_id == wanted
+    ]
+
+
+def invalidate_measurements_for_landmark(context, landmark_stable_id, reason):
+    """Invalidate only the definitions that reference this landmark (sect. 13).
+
+    Targeted rather than a sweep: a landmark change touches the measurements
+    that depend on it and nothing else, so 100 definitions stay responsive.
+    """
+    collection = get_measurements(context)
+    affected = measurements_referencing(collection, landmark_stable_id)
+    for item in affected:
+        invalidate_measurement_result(item, reason)
+    return len(affected)
+
+
+def resolve_measurement_landmarks(context, item):
+    """(source, target) landmark objects, either possibly None."""
+    collection = get_landmarks(context)
+    if collection is None:
+        return None, None
+    return (
+        landmark_by_stable_id(collection, item.source_stable_id)
+        if item.source_stable_id else None,
+        landmark_by_stable_id(collection, item.target_stable_id)
+        if item.target_stable_id else None,
+    )
+
+
+def refresh_measurement_status(context, item, canonical=None,
+                               matrix_world=None):
+    """Recompute one measurement's status. Returns it.
+
+    A stored result stays VALID only while every dependency it was computed
+    against still matches. Translation and rotation cannot reach the failing
+    branch: the metric tensor is rotation invariant and carries no
+    translation (sect. 6.4).
+    """
+    source, target = resolve_measurement_landmarks(context, item)
+    status, detail = measurements.readiness(
+        source, target, item.source_stable_id, item.target_stable_id
+    )
+
+    if not item.has_result:
+        item.status = status
+        item.status_detail = detail
+        return item
+
+    if status == measurements.STATUS_INVALID_REFERENCE:
+        clear_measurement_result(item)
+        item.status = status
+        item.status_detail = detail
+        return item
+    if status == measurements.STATUS_STALE:
+        clear_measurement_result(item)
+        item.status = measurements.STATUS_STALE
+        item.status_detail = detail
+        return item
+
+    if canonical is not None:
+        if canonical.geometry_hash != item.result_geometry_hash:
+            clear_measurement_result(item)
+            item.status = measurements.STATUS_STALE
+            item.status_detail = "the mesh geometry changed since this was calculated"
+            return item
+        if matrix_world is not None:
+            live = metric_tensor(matrix_world, canonical.unit_multiplier)
+            if not metric_tensors_match(live, item.result_metric_tensor):
+                clear_measurement_result(item)
+                item.status = measurements.STATUS_STALE
+                item.status_detail = (
+                    "the object scale or coordinate unit changed since this "
+                    "was calculated"
+                )
+                return item
+
+    item.status = measurements.STATUS_VALID
+    item.status_detail = ""
+    return item
+
+
+def invalidate_all_measurement_results(context, reason):
+    """Drop every stored measurement result. Definitions are untouched."""
+    collection = get_measurements(context)
+    if not collection:
+        return 0
+    count = 0
+    for item in collection:
+        if item.has_result:
+            invalidate_measurement_result(item, reason)
+            count += 1
+    return count
 
 
 def metric_tensor(matrix_world, multiplier):
@@ -1009,6 +1439,7 @@ classes = (
     # collection that holds it.
     BSMT_SurfacePoint,
     BSMT_Landmark,
+    BSMT_Measurement,
     BSMT_ComponentInfo,
     BSMT_Properties,
 )
@@ -1020,9 +1451,12 @@ def register():
     bpy.types.Scene.bsmt = bpy.props.PointerProperty(type=BSMT_Properties)
     # Scene-level, as specified in the Milestone 3.0 brief.
     bpy.types.Scene.bsmt_landmarks = CollectionProperty(type=BSMT_Landmark)
+    bpy.types.Scene.bsmt_measurements = CollectionProperty(type=BSMT_Measurement)
 
 
 def unregister():
+    if hasattr(bpy.types.Scene, "bsmt_measurements"):
+        del bpy.types.Scene.bsmt_measurements
     if hasattr(bpy.types.Scene, "bsmt_landmarks"):
         del bpy.types.Scene.bsmt_landmarks
     if hasattr(bpy.types.Scene, "bsmt"):

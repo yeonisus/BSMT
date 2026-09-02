@@ -6,8 +6,8 @@
 **Target environment:** Blender 4.5.13 LTS, macOS 26.5 (Apple Silicon, arm64),
 bundled Python 3.11.15, numpy 1.26.4 — **all detected at runtime, 2026-09-02** (§5.1a)
 **Status:** Phase 1 complete and validated on a real human-body scan. Milestones 2.0, 2.0a,
-2.1, 2.2, 2.3 and **3.0 (Landmark Manager)** implemented and validated in Blender. Real-scan
-acceptance testing of 2.3 and 3.0 is outstanding.
+2.1, 2.2, 2.3, 3.0 (Landmark Manager) and **3.1 (Measurement Manager)** implemented and
+validated in Blender. Real-scan acceptance testing of 2.3, 3.0 and 3.1 is outstanding.
 
 > Note on this document's history: no `PROJECT_SPEC.md` existed in the project before this
 > revision. Phase 1 was specified conversationally and implemented from that specification.
@@ -25,7 +25,8 @@ on textured OBJ human-body scans.
 | 1 | Straight-line (Euclidean) distance between two ray-cast surface points | **Done** (v0.2.0) |
 | 2 | Surface (geodesic) distance between the same two points | **This document.** Milestones 2.0, 2.0a, 2.1, 2.1a, 2.2, **2.3 done** (v0.7.0); 2.4–2.6 outstanding |
 | 3.0 | Named research landmark manager: protocols, guided picking, Validate All | **Done** (v0.8.0) |
-| 3.1+ | Measurement templates, batch measurement, export, automatic landmark detection | Not designed |
+| 3.1 | User-defined measurement manager: definitions, batch calculation, templates | **Done** (v0.9.0) |
+| 3.2+ | CSV/XLSX export, surface path visualisation, alignment, automatic landmark detection | Not designed |
 | Future | Anatomical scan alignment (§13) | Requirement recorded, not designed |
 
 Non-goals for Phase 2, explicitly: automatic landmark detection, mesh repair as a measurement
@@ -1514,6 +1515,139 @@ round-trip, guided picking progression, and A/B regression (straight 161.55 mm, 
 landmarks at visibly different anatomical locations, picked through the viewport, then the
 transform and geometry-edit checks, and a 10-landmark protocol round-trip with guided picking.
 The viewport click is the one path that cannot be exercised headlessly.
+
+---
+
+## 11b. Milestone 3.1 — Measurement Manager (as implemented, 2026-09-02)
+
+User-defined measurements between named landmarks. The A/B quick workflow and the Landmark
+Manager are both unchanged and both remain fully functional.
+
+### 11b.1 The binding non-goal
+
+**BSMT never generates landmark pairs.** There is no "calculate every pair" button, no
+`itertools.combinations`, and no all-pairs helper anywhere in the codebase — enforced by a test
+that greps the source. For 50 landmarks BSMT computes the definitions the researcher wrote, not
+1,225 combinations. `Calculate All Defined` means *the enabled definitions*, and nothing else.
+
+### 11b.2 Data architecture
+
+```
+scene.bsmt_measurements : CollectionProperty(BSMT_Measurement)
+    stable_id           monotonic int, unique per scene, never reused
+    protocol_id         "M01" - template facing
+    name, notes, enabled
+    source_stable_id    -> BSMT_Landmark.stable_id      AUTHORITATIVE
+    target_stable_id    -> BSMT_Landmark.stable_id      AUTHORITATIVE
+    source_protocol_id / source_name   cached, for templates and diagnostics
+    measurement_type    STRAIGHT | SURFACE | BOTH
+    status              NOT_READY | READY | CALCULATING | VALID | STALE
+                        | INVALID_REFERENCE | FAILED
+    + results (straight_mm, surface_mm, ratio) and surface provenance
+    + dependency fingerprint (result_geometry_hash, result_metric_tensor)
+```
+
+### 11b.3 The dynamic-enum hazard, measured and defended
+
+References are landmark **stable ids**, never list indices. That is not a theoretical
+preference — a spike in Blender 4.5.13 established the concrete failure:
+
+> A dynamic `EnumProperty` built from the landmark collection **remaps by index** when the
+> collection changes. With the picker set to landmark `"42"`, deleting landmark 42 makes the
+> property read back as **`"43"`** — a different, unrelated landmark, with no error and no
+> warning.
+
+Reproduced again in the acceptance run against the production code: picker `14` → landmark 14
+deleted → picker silently reads `15` (the neighbour), while `target_stable_id` stayed `14`,
+resolution returned `None` rather than the neighbour, status became `INVALID_REFERENCE`, and
+`Calculate Selected` refused with *"missing target (landmark id 14)"* storing no number.
+
+**Therefore the From/To pickers are write-only.** Their update callbacks copy the choice into the
+authoritative integer, and nothing in the calculation path, the status path or the template path
+ever reads them back. A test asserts `operators.py` contains neither `source_picker` nor
+`target_picker`.
+
+### 11b.4 Deleting a referenced landmark (§14)
+
+The measurement is **not** deleted and **not** redirected. It keeps its definition, its cached
+protocol id and its landmark name, and becomes `INVALID_REFERENCE` so the loss is visible.
+`Remove Invalid Measurements` exists but is explicit, confirmed and opt-in — there is no
+automatic destructive cleanup.
+
+### 11b.5 Calculation reuses the production pipelines (§7)
+
+| Type | Path |
+|---|---|
+| STRAIGHT | `measurement.straight_distance_mm()` — the Phase 1 function, unchanged |
+| SURFACE | `geodesic.solve.surface_distance()` — the Milestone 2.3 pipeline, unchanged: validation, scratch-mesh endpoint insertion, bounded exact MMP query, result invariants |
+| BOTH | both |
+
+No distance mathematics is reimplemented. Every surface result records backend, version, bound
+factor, attempts and elapsed time.
+
+### 11b.6 Batch behaviour (§8, §10, §23)
+
+Sequential and single-threaded, as specified. Before running, the plan is reported —
+*"12 enabled measurements, 8 require surface distance, 4 straight-only"* — and disabled
+definitions are skipped, not calculated. Progress is printed and pushed to the panel between
+measurements, which is the most Blender can repaint around a blocking C++ solve.
+
+**One failure never aborts the batch.** Each definition keeps its own status and reason; the run
+ends with e.g. *"4 valid, 1 not ready"*. Verified by clearing one landmark's position mid-batch:
+the dependent measurement reported `NOT_READY — source 'Hip_L' is not picked` and every other
+measurement still calculated.
+
+### 11b.7 Invalidation (§12, §13)
+
+**Targeted, not a sweep.** A landmark change invalidates only the definitions that reference it,
+found by one integer comparison per definition. Measured: **0.0018 ms** to find the dependents of
+one landmark among 100 definitions, and 0.0114 ms to re-plan the whole batch — cheap enough to
+run in a panel redraw.
+
+Verified in Blender: re-picking one landmark invalidated **exactly one** measurement; the
+independent results survived, and the disabled definition was untouched.
+
+| Change | Result |
+|---|---|
+| Rigid translation | **stays VALID** ✔ |
+| Rigid rotation | **stays VALID** ✔ |
+| Uniform / non-uniform scale | invalidated → STALE, numbers dropped ✔ |
+| Coordinate-unit change | invalidated ✔ |
+| Geometry edit | invalidated → STALE ✔ |
+| Source or target re-picked / cleared | that definition only ✔ |
+| Referenced landmark deleted | INVALID_REFERENCE, definition kept ✔ |
+| From/To selection changed, type changed | result dropped ✔ |
+
+Rotation cannot reach the invalidating branch by construction: the metric tensor of §6.4 is
+rotation invariant and carries no translation.
+
+### 11b.8 Templates (§15–§18)
+
+`bsmt-measurement-protocol` v1, in `protocol.py` alongside the landmark protocol but as a
+**separate format** — each loader refuses the other's file and names the right one. A template
+carries protocol name, ids, names, landmark references, type, enabled flag, notes and order.
+
+It carries **no** results, timings, backend provenance, triangle indices, barycentrics or
+geometry hashes. Enforced in both directions: writing asserts, and reading **refuses** a file
+containing any of them rather than ignoring it — such a file is scan output, and loading it as a
+template would present one scan's numbers as another's definitions.
+
+Landmark references are the landmark **protocol ids** (`L01`), so a template resolves naturally
+alongside its landmark protocol. The human-readable name travels with each reference for
+diagnostics but is **never** used to find a substitute: loading the template with no matching
+landmarks left all six definitions `INVALID_REFERENCE`, with the reference id and name preserved
+for a later re-link and `source_stable_id == 0` — no landmark was invented.
+
+### 11b.9 Verified in Blender 4.5.13
+
+8 landmarks, 6 definitions mixing STRAIGHT / SURFACE / BOTH. `Calculate Selected` produced
+straight 194.089 mm, surface 266.736 mm, ratio 1.3743, bound 1.25×, 1 attempt, 0.012 s, with
+surface ≥ straight. STRAIGHT stored only a straight value, SURFACE only a surface value, and the
+row rendered `— / 124.42 mm`. `Calculate All Defined` with one disabled ran 5 and skipped 1.
+A/B regression: straight 181.315 mm, surface 228.114 mm. Landmark Manager regression: add,
+Validate All and guided picking all still work; the scan was never modified.
+
+**Outstanding: real-scan acceptance on 21_M_3400E** (§27 of the milestone brief).
 
 ---
 
