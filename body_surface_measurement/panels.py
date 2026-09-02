@@ -22,8 +22,9 @@ import math
 
 import bpy
 
-from . import (alignment, geodesic, landmarks, measurement, measurements,
-               preprocess, repair, scancopy, state, visualization, viz)
+from . import (alignment, geodesic, labels, landmarks, measurement,
+               measurements, preprocess, repair, scancopy, state,
+               visualization, viz)
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
@@ -550,16 +551,10 @@ class BSMT_UL_landmarks(bpy.types.UIList):
             )
 
 
-#: Short status text for the landmark list. Kept to one word wherever the
-#: list column allows it, and matched to the vocabulary in the module
-#: docstring: Ready, Stale, Invalid.
-_STATUS_SHORT = {
-    landmarks.STATUS_NOT_PICKED: "NOT PICKED",
-    landmarks.STATUS_VALID: "VALID",
-    landmarks.STATUS_NEEDS_REFRESH: "NEEDS REFRESH",
-    landmarks.STATUS_STALE: "STALE",
-    landmarks.STATUS_INVALID: "INVALID",
-}
+#: Short status text for the landmark list. Defined once in landmarks.py so
+#: the panel and the viewport overlay cannot disagree about what a status is
+#: called.
+_STATUS_SHORT = landmarks.STATUS_SHORT
 
 
 class BSMT_PT_landmarks(bpy.types.Panel):
@@ -700,9 +695,49 @@ class BSMT_PT_landmarks(bpy.types.Panel):
 
     @staticmethod
     def _draw_display(layout, props):
+        """Landmark Display (Milestone 3.8). Every control here is cosmetic.
+
+        Nothing in this section can move a landmark, change a distance or
+        touch the mesh - which is why it is safe to leave open while working.
+        """
         box = layout.box()
-        box.prop(props, "show_landmarks")
-        box.prop(props, "landmark_marker_size_mm")
+        header = box.row(align=True)
+        header.prop(
+            props, "show_landmark_display",
+            icon=('TRIA_DOWN' if props.show_landmark_display
+                  else 'TRIA_RIGHT'),
+            emboss=False, text="Landmark Display",
+        )
+        if not props.show_landmark_display:
+            return
+
+        row = box.row(align=True)
+        row.prop(props, "show_landmarks", toggle=False)
+        row.prop(props, "show_landmark_labels", toggle=False)
+
+        marker = box.column(align=True)
+        marker.enabled = bool(props.show_landmarks)
+        marker.prop(props, "landmark_marker_color")
+        marker.prop(props, "landmark_marker_size_mm")
+
+        label = box.column(align=True)
+        label.enabled = bool(props.show_landmark_labels)
+        label.prop(props, "landmark_label_color")
+        label.prop(props, "landmark_label_size")
+        label.prop(props, "landmark_label_offset")
+        label.prop(props, "landmark_label_shadow")
+        label.prop(props, "landmark_label_scope")
+
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("Label size is in screen pixels, so labels stay "
+                          "readable at any zoom.", 44):
+            note.label(text=line)
+        if props.show_landmark_labels and not labels.is_registered():
+            warn = box.row()
+            warn.alert = True
+            warn.label(text="Label overlay is not running", icon='ERROR')
 
     @staticmethod
     def _draw_protocol(layout, props):

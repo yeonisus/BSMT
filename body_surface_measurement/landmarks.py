@@ -74,6 +74,17 @@ STATUS_ITEMS = (
     (STATUS_INVALID, "Invalid", "Structurally unusable"),
 )
 
+#: Compact status text, for the landmark list and the viewport label. One
+#: definition, so the panel and the overlay can never disagree about what a
+#: status is called.
+STATUS_SHORT = {
+    STATUS_NOT_PICKED: "NOT PICKED",
+    STATUS_VALID: "VALID",
+    STATUS_NEEDS_REFRESH: "NEEDS REFRESH",
+    STATUS_STALE: "STALE",
+    STATUS_INVALID: "INVALID",
+}
+
 #: Icon per status, for the UIList.
 STATUS_ICONS = {
     STATUS_NOT_PICKED: 'BLANK1',

@@ -17,8 +17,8 @@ from bpy.props import (
     StringProperty,
 )
 
-from . import (alignment, geodesic, landmarks, measurement, measurements,
-               preprocess, readiness, visualization)
+from . import (alignment, geodesic, labels, landmarks, measurement,
+               measurements, preprocess, readiness, visualization)
 
 
 def _on_display_changed(self, context):
@@ -141,8 +141,19 @@ def _on_landmark_name_changed(self, context):
 
 
 def _on_landmark_display_changed(self, context):
-    """Re-apply landmark marker size and visibility. Cosmetic only."""
+    """Re-apply landmark marker size, colour and visibility. Cosmetic only."""
     visualization.apply_landmark_display(context, self)
+    labels.tag_redraw(context)
+
+
+def _on_landmark_label_changed(self, context):
+    """A label setting changes no object, so ask the viewport to repaint.
+
+    Without this the overlay would keep the old size or colour until the 3D
+    view happened to redraw for some other reason, and the control would look
+    broken.
+    """
+    labels.tag_redraw(context)
 
 
 class BSMT_Landmark(bpy.types.PropertyGroup):
@@ -758,6 +769,10 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         description="Row selected in the landmark list",
         default=0,
         min=0,
+        # Selecting a different row changes which marker is emphasised and
+        # which label is drawn in SELECTED scope, and neither is something
+        # Blender would repaint on its own.
+        update=_on_landmark_display_changed,
     )
     landmark_next_id: IntProperty(
         name="Next Stable ID",
@@ -771,26 +786,92 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         description="Name of the landmark protocol currently loaded",
         default="",
     )
+    # ------------------------------------------------------------------
+    # Milestone 3.8 - landmark display. Every property here is cosmetic:
+    # none of them can reach a SurfacePoint, a mesh or a distance.
+    # ------------------------------------------------------------------
     show_landmarks: BoolProperty(
-        name="Show Named Landmarks",
-        description="Show the named landmark markers. Independent of the "
-                    "A/B marker visibility",
+        name="Show Markers",
+        description="Show the landmark markers in the viewport. Independent "
+                    "of the Point A/B markers",
         default=True,
         update=_on_landmark_display_changed,
     )
     landmark_marker_size_mm: FloatProperty(
-        name="Landmark Size (mm)",
-        description="Diameter of a named landmark marker, in millimetres",
+        name="Marker Size (mm)",
+        description="Diameter of a landmark marker, in millimetres. The "
+                    "marker is a display helper; changing it never moves a "
+                    "landmark",
         default=12.0,
         min=0.1,
         soft_max=100.0,
         update=_on_landmark_display_changed,
     )
-    show_landmark_labels: BoolProperty(
-        name="Show Landmark Labels",
-        description="Draw the landmark name next to each marker in the viewport",
-        default=False,
+    landmark_marker_color: FloatVectorProperty(
+        name="Marker Color",
+        description="Color of a VALID landmark marker. A stale or invalid "
+                    "landmark keeps its status color instead, so a marker "
+                    "that cannot be trusted never looks like one that can",
+        subtype='COLOR', size=4,
+        default=visualization.LANDMARK_COLOR,
+        min=0.0, max=1.0,
         update=_on_landmark_display_changed,
+    )
+    show_landmark_labels: BoolProperty(
+        name="Show Labels",
+        description="Draw each landmark's name next to its marker in the "
+                    "viewport. Display only: nothing is added to the scene",
+        default=True,
+        update=_on_landmark_label_changed,
+    )
+    landmark_label_color: FloatVectorProperty(
+        name="Label Color",
+        description="Color of a VALID landmark's label. A stale or invalid "
+                    "landmark uses its status color instead",
+        subtype='COLOR', size=4,
+        default=(1.0, 1.0, 1.0, 1.0),
+        min=0.0, max=1.0,
+        update=_on_landmark_label_changed,
+    )
+    landmark_label_size: IntProperty(
+        name="Label Size",
+        description="Label text height in SCREEN PIXELS, so labels stay the "
+                    "same size however far you zoom",
+        default=labels.DEFAULT_LABEL_SIZE,
+        min=6, max=64,
+        update=_on_landmark_label_changed,
+    )
+    landmark_label_offset: IntProperty(
+        name="Label Offset",
+        description="How far the label sits from the marker, in screen "
+                    "pixels, so the text never covers the surface point it "
+                    "names",
+        default=labels.DEFAULT_LABEL_OFFSET,
+        min=0, max=60,
+        update=_on_landmark_label_changed,
+    )
+    landmark_label_shadow: BoolProperty(
+        name="Label Shadow",
+        description="Draw a dark shadow behind the label so it stays readable "
+                    "over a light-colored scan",
+        default=True,
+        update=_on_landmark_label_changed,
+    )
+    show_landmark_display: BoolProperty(
+        name="Landmark Display",
+        description="Show the landmark marker and label settings",
+        default=False,
+    )
+    landmark_label_scope: EnumProperty(
+        name="Show",
+        description="Which landmarks get a label",
+        items=(
+            ('ALL', "All Landmarks", "Label every positioned landmark"),
+            ('SELECTED', "Selected Landmark Only",
+             "Label only the landmark selected in the list"),
+        ),
+        default='ALL',
+        update=_on_landmark_label_changed,
     )
     landmark_summary: StringProperty(
         name="Landmark Summary",

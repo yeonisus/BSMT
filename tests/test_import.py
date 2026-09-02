@@ -79,6 +79,26 @@ def install_stubs():
         "Object", "Scene", "Material", "Collection",
     ):
         setattr(bpy_types, name, type(name, (object,), {}))
+
+    # The label overlay installs a viewport draw handler, so the stub has to
+    # model one: a list stands in for Blender's handler registry, which is
+    # enough to prove register/unregister balance.
+    _draw_handlers = []
+
+    class _SpaceView3D(object):
+        @staticmethod
+        def draw_handler_add(callback, arguments, region, event):
+            handle = (callback, region, event, len(_draw_handlers))
+            _draw_handlers.append(handle)
+            return handle
+
+        @staticmethod
+        def draw_handler_remove(handle, region):
+            if handle in _draw_handlers:
+                _draw_handlers.remove(handle)
+
+    bpy_types.SpaceView3D = _SpaceView3D
+    bpy_types._draw_handlers = _draw_handlers
     bpy.types = bpy_types
 
     bpy_props = types.ModuleType("bpy.props")
@@ -111,6 +131,9 @@ def install_stubs():
         handlers=types.SimpleNamespace(
             depsgraph_update_post=[], persistent=_persistent
         ),
+        # BSMT keeps the label draw handle here so it survives a Reload
+        # Scripts, exactly as Blender's own driver namespace does.
+        driver_namespace={},
     )
     handlers_mod = types.ModuleType("bpy.app.handlers")
     handlers_mod.persistent = _persistent
@@ -1087,6 +1110,51 @@ def test_ui_wording_is_consistent(bsmt):
 
     readiness_text = open(_os.path.join(ROOT, "body_surface_measurement",
                                         "readiness.py")).read()
+    # Milestone 3.8: the label overlay is a draw handler, not a pile of Text
+    # objects. If it ever started creating datablocks, fifty landmarks would
+    # mean fifty extra objects in the researcher's file.
+    labels_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                     "labels.py")).read()
+    check("labels module is loaded", hasattr(bsmt, "labels"))
+    # The handler must balance: register/unregister leaves nothing behind, and
+    # a second register does not stack a duplicate overlay.
+    handlers = sys.modules["bpy"].types._draw_handlers
+    before = len(handlers)
+    bsmt.labels.register()
+    check("register installs one draw handler", len(handlers) == before + 1)
+    bsmt.labels.register()
+    check("registering again does not stack a second",
+          len(handlers) == before + 1, len(handlers))
+    check("unregister removes it", bsmt.labels.unregister())
+    check("and leaves none behind", len(handlers) == before)
+    check("unregistering twice is harmless",
+          bsmt.labels.unregister() is False)
+    check("labels are drawn with a SpaceView3D handler",
+          "SpaceView3D.draw_handler_add" in labels_text)
+    check("in POST_PIXEL space, so text is screen-sized",
+          "'POST_PIXEL'" in labels_text)
+    check("and it creates no object of its own",
+          "objects.new" not in labels_text and "bpy.ops" not in labels_text)
+    check("the overlay is registered with the add-on",
+          "labels.register()" in open(_os.path.join(
+              ROOT, "body_surface_measurement", "__init__.py")).read())
+    check("and unregistered with it",
+          "labels.unregister()" in open(_os.path.join(
+              ROOT, "body_surface_measurement", "__init__.py")).read())
+    check("label size is never a millimetre value",
+          "landmark_label_size_mm" not in
+          open(_os.path.join(ROOT, "body_surface_measurement",
+                             "state.py")).read())
+    check("the panel section is called Landmark Display",
+          '"Landmark Display"' in panels_text)
+    for expected in ("show_landmarks", "show_landmark_labels",
+                     "landmark_marker_color", "landmark_label_color",
+                     "landmark_label_size", "landmark_label_offset"):
+        check("the panel exposes %s" % expected,
+              '"%s"' % expected in panels_text)
+    check("landmark status text has one definition",
+          "_STATUS_SHORT = landmarks.STATUS_SHORT" in panels_text)
+
     check("the readiness module imports nothing at all",
           not _re.search(r"^\s*(import|from)\s", readiness_text, _re.M),
           _re.findall(r"^\s*(?:import|from)\s.*", readiness_text, _re.M))

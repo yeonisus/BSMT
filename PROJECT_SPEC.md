@@ -2557,6 +2557,139 @@ tracebacks. Offline: 1,514 checks across eleven suites without pygeodesic, 1,624
 
 ---
 
+## 11l. Milestone 3.8 — Landmark labels and display controls (v0.16.0, 2026-09-02)
+
+A protocol of fifty landmarks is a field of identical green dots until each one carries its name.
+This milestone draws the name beside the marker, and gives the researcher control over how both
+look. Nothing analytical was added: every property in this milestone is cosmetic, and none of them
+can reach a `SurfacePoint`, a mesh or a distance.
+
+### 11l.1 A draw handler, not one Text object per landmark
+
+The labels are drawn by a `SpaceView3D` draw handler in **POST_PIXEL** space (`labels.py`).
+
+A Blender Text object per landmark was the alternative, and it is worse in every dimension that
+matters here. It is a real datablock: it appears in the Outliner, joins the selection and the
+depsgraph, has to be re-oriented toward the viewer every frame, and — decisively — it scales in
+**world units**, so it becomes unreadable the moment the researcher zooms in on a shoulder. Fifty
+landmarks would mean fifty extra objects in a file that must stay recognisably the researcher's
+scan, and any of them could be moved or exported by accident.
+
+The overlay has none of those properties. It creates no datablock, cannot be selected, and draws
+in screen pixels, so a label is the same size at any zoom. It also **only reads**: a test asserts
+`labels.py` contains no `bpy.ops`, no `objects.new`, no `bmesh`, and never imports the solver.
+
+The handle is kept in `bpy.app.driver_namespace`, not a module global, because Blender's "Reload
+Scripts" re-imports the module and would otherwise lose the handle and leak a callback that can
+never be removed. `register()` is idempotent; `unregister()` never raises.
+
+### 11l.2 What the label is anchored to
+
+**The marker helper object's world location**, when one exists. The marker and the label then move
+together *by construction*: whatever moves the marker — a translate, a rotate, Apply Alignment,
+Reset Alignment — has already moved the thing the label is positioned from, so the two cannot
+drift apart even if a refresh is a frame late. The stored `SurfacePoint.world_xyz` is the fallback
+for a landmark whose marker has been removed, and is the same value by definition. An object with
+the right name that is *not* a BSMT helper is never trusted as an anchor.
+
+The **text** is read from the landmark on every redraw. There is no cache to invalidate, so
+renaming `P03` to `Acromion_L` shows on the next frame (§10) — asserted both offline and in
+Blender.
+
+The label is offset in **screen space** (default 8 px, up and right) so it never covers the exact
+surface point it names.
+
+### 11l.3 Status is said in words, not only in colour
+
+A landmark that is not VALID reads `P02  [STALE]`, and takes the colour the existing status system
+already assigns — `visualization.landmark_color()`, not a new palette invented in the overlay.
+
+Colour alone was not enough. It is invisible to a colour-blind reader and it does not survive a
+screenshot pasted into a paper, and §9 asks that a stale landmark never be shown as normal VALID
+data. The word is the report; the colour is the reinforcement.
+
+The same rule governs the markers: **Marker Color applies to VALID landmarks only.** A stale or
+invalid landmark keeps its status colour whatever the setting, so a marker that cannot be trusted
+can never be made to look like one that can. `landmarks.STATUS_SHORT` is now the single definition
+of the status words, used by both the list and the overlay.
+
+### 11l.4 Display controls
+
+A collapsible **Landmark Display** section: Show Markers, Show Labels, Marker Color, Marker Size
+(mm), Label Color, Label Size, Label Offset, Label Shadow, and a scope of All Landmarks / Selected
+Landmark Only.
+
+**Label Size is in screen pixels** (default 13, range 6–64), not millimetres — a label is an
+annotation on the screen, not a feature of the body. A test asserts `labels.py` performs no
+millimetre conversion at all. Marker Size stays in millimetres, in the existing BSMT convention,
+and is applied as object *scale* on a unit sphere, so changing it rebuilds no geometry.
+
+Every label property has an update callback that calls `labels.tag_redraw()`. A label setting
+changes no object, so nothing would make Blender repaint on its own, and Label Size would appear
+to do nothing until the viewport redrew for some other reason.
+
+The **selected** landmark is emphasised: its marker is drawn `SELECTED_MARKER_SCALE = 1.35` times
+larger and its label two pixels bigger. Both are display-time computations — the marker emphasis
+is carried entirely by object scale — so nothing about the stored landmark changes to highlight
+it (§6). Verified: selecting a landmark and selecting away leaves its stored position identical.
+
+### 11l.5 Performance
+
+Measured in Blender 4.5.13, building the full per-frame draw list:
+
+| Landmarks | Per frame | Labels drawn |
+|---|---|---|
+| 10 | 0.030 ms | 10 |
+| 50 | 0.170 ms | 50 |
+| 100 | 0.423 ms | 100 |
+
+At 100 landmarks the overlay costs about 0.4 ms of a 16.7 ms frame. Nothing is rebuilt to draw a
+label: after 20 full passes the canonical mesh has the same geometry hash and triangle count, and
+no `SurfacePoint` was touched. `MAX_LABELS = 512` exists only so that a pathological scene cannot
+make the viewport unusable.
+
+### 11l.6 Alignment regression (§12), and a precision limit worth recording
+
+Three landmarks, an arbitrary scanner orientation, four alignment references, Apply, then Reset:
+
+| Check | Result |
+|---|---|
+| Labels moved with the object | yes |
+| Every label still on its marker | to 1e-9 |
+| Every marker on its stored world position | exact |
+| Triangle index, barycentric, component, geometry hash | **unchanged** |
+| Landmarks after alignment | all still VALID |
+| Labels after Reset | back to 1.5e-8 |
+| SurfacePoints after the round trip | identical |
+
+The transform is restored to **single-precision exactness** — a maximum error of 5.96e-08, which
+is half a float32 ULP at 1.0 — and not bit-exact. That is a property of Blender, not of BSMT, and
+it is worth recording precisely because it looks like a bug. Measured on 4.5.13: storing a matrix
+in a `FloatVectorProperty` and reading it back is **lossless** (0.0 difference), but *assigning*
+`obj.matrix_world` costs 5.96e-08 — and assigning `obj.matrix_basis` costs exactly the same,
+because both setters decompose the matrix into float32 location, rotation and scale. Only storing
+those three fields directly could avoid it.
+
+It is not worth avoiding. On a 1710 mm body the error is 1e-4 mm; the metric tensor that governs
+whether a stored distance stays valid is unchanged by it (asserted); and Blender itself loses the
+same bit restoring a pose it saved. The alternative — storing rotation mode plus the matching
+rotation field — would add real state and branching to buy 100 nanometres.
+
+### 11l.7 Verified in Blender 4.5.13
+
+79 checks, 0 failures: three landmarks labelled `P01 P02 P03`, each label on its own marker;
+renaming P03 updates immediately; marker color, marker size, label color, label size and label
+offset all take effect; selection emphasis appears and clears without touching stored data; a
+stale landmark reads `[STALE]` in its status colour and the Marker Color setting cannot override
+it; both label scopes; the alignment round trip above; the 10/50/100 performance table; handler
+register/unregister balance; and all nine panels still drawing.
+
+Offline: `tests/test_labels.py`, 65 checks. Full regression 1,599 checks across twelve suites,
+1,709 with pygeodesic staged, 0 failures. Acceptance scripts for milestones 3.2 through 3.7 all
+re-run clean.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

@@ -50,6 +50,10 @@ REPAIR_BOUNDARY_COLOR = (0.15, 0.6, 1.0, 1.0)        # blue
 
 # Marker spheres are built once at radius 1.0 and resized with object scale, so
 # changing "Marker Size" never rebuilds geometry.
+#: The selected landmark's marker is drawn this much larger. Scale only: the
+#: stored landmark is not touched to highlight it (sect. 6).
+SELECTED_MARKER_SCALE = 1.35
+
 MARKER_BASE_RADIUS = 1.0
 BASE_RADIUS_KEY = "bsmt_base_radius"
 MIN_HELPER_RADIUS = 1e-9
@@ -346,14 +350,24 @@ _LANDMARK_STATUS_COLORS = {
 }
 
 
-def landmark_color(status):
+def landmark_color(status, valid_color=None):
+    """The display colour for a landmark marker of this status.
+
+    `valid_color` is the researcher's Marker Color and applies to a VALID
+    landmark only. A stale, invalid or unverified landmark keeps the status
+    colour whatever the setting, because a marker that cannot be trusted must
+    never be able to look like one that can (sect. 9).
+    """
+    if status == landmarks.STATUS_VALID and valid_color is not None:
+        return tuple(float(v) for v in valid_color)
     return _LANDMARK_STATUS_COLORS.get(status, LANDMARK_COLOR)
 
 
 def update_landmark_marker(context, props, item, world_location):
     """Create or move the marker for one named landmark. Returns the object."""
     name = landmark_object_name(item.stable_id)
-    color = landmark_color(item.status)
+    color = landmark_color(item.status,
+                           getattr(props, "landmark_marker_color", None))
     obj = _existing_helper(name)
     if (
         obj is None
@@ -413,23 +427,31 @@ def apply_landmark_display(context, props):
     """Push landmark marker size, colour and visibility. Cosmetic only.
 
     Never creates, deletes or moves a marker, and never touches a stored
-    surface location.
+    surface location. The selected landmark is drawn slightly larger - an
+    emphasis carried entirely by object SCALE, so nothing about the landmark
+    itself, not even its stored colour, is changed to highlight it (sect. 6).
     """
     radius = landmark_marker_radius(props)
     show = bool(props.show_landmarks)
+    valid_color = getattr(props, "landmark_marker_color", None)
     collection = getattr(context.scene, "bsmt_landmarks", None)
-    statuses = (
-        {landmark_object_name(item.stable_id): item.status
-         for item in collection}
-        if collection is not None else {}
-    )
+    statuses = {}
+    selected_name = ""
+    if collection is not None:
+        for index, item in enumerate(collection):
+            statuses[landmark_object_name(item.stable_id)] = item.status
+            if index == int(getattr(props, "landmark_index", -1)):
+                selected_name = landmark_object_name(item.stable_id)
+
     for obj in landmark_marker_objects():
-        obj.scale = (radius, radius, radius)
+        scale = radius * (SELECTED_MARKER_SCALE
+                          if obj.name == selected_name else 1.0)
+        obj.scale = (scale, scale, scale)
         obj.hide_viewport = not show
         obj.hide_render = not show
         status = statuses.get(obj.name)
         if status is not None:
-            obj.color = landmark_color(status)
+            obj.color = landmark_color(status, valid_color)
 
 
 def clear_landmark_markers():
