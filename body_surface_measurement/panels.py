@@ -2,7 +2,7 @@
 
 import bpy
 
-from . import geodesic, measurement, state
+from . import geodesic, landmarks, measurement, state
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
@@ -417,10 +417,199 @@ class BSMT_PT_geodesic_backend(bpy.types.Panel):
                 column.separator()
 
 
+class BSMT_UL_landmarks(bpy.types.UIList):
+    """Landmark rows: name and a concise status.
+
+    A UIList because the manager has to stay usable at 20-50 landmarks: it
+    scrolls, filters and sorts without the panel growing without bound, and it
+    draws only the visible rows. Per-landmark detail belongs in the panel
+    below the list, not in every row (sect. 3).
+    """
+
+    bl_idname = "BSMT_UL_landmarks"
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_property, index=0, flt_flag=0):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            identifier = row.row()
+            identifier.scale_x = 0.35
+            identifier.enabled = False
+            identifier.label(text=item.protocol_id or "-")
+            row.label(text=item.label)
+            status = row.row()
+            status.alignment = 'RIGHT'
+            status.label(
+                text=_STATUS_SHORT.get(item.status, item.status),
+                icon=landmarks.STATUS_ICONS.get(item.status, 'BLANK1'),
+            )
+        else:
+            layout.alignment = 'CENTER'
+            layout.label(
+                text="", icon=landmarks.STATUS_ICONS.get(item.status, 'BLANK1')
+            )
+
+
+_STATUS_SHORT = {
+    landmarks.STATUS_NOT_PICKED: "NOT PICKED",
+    landmarks.STATUS_VALID: "VALID",
+    landmarks.STATUS_NEEDS_REFRESH: "REFRESH",
+    landmarks.STATUS_STALE: "STALE",
+    landmarks.STATUS_INVALID: "INVALID",
+}
+
+
+class BSMT_PT_landmarks(bpy.types.Panel):
+    """Named research landmarks (Milestone 3.0).
+
+    A separate layer from the A/B workflow above, which stays available for
+    quick ad-hoc measurement and is not affected by anything here.
+    """
+
+    bl_label = "Landmark Manager"
+    bl_idname = "BSMT_PT_landmarks"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "BSMT"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = state.get_props(context)
+        collection = state.get_landmarks(context)
+        if props is None or collection is None:
+            layout.label(text="Add-on state unavailable", icon='ERROR')
+            return
+
+        if props.protocol_name:
+            row = layout.row()
+            row.enabled = False
+            row.label(text="Protocol: %s" % props.protocol_name)
+
+        layout.template_list(
+            "BSMT_UL_landmarks", "",
+            context.scene, "bsmt_landmarks",
+            props, "landmark_index",
+            rows=6 if len(collection) > 3 else 3,
+        )
+
+        row = layout.row(align=True)
+        row.operator("bsmt.add_landmark", text="Add", icon='ADD')
+        row.operator("bsmt.remove_landmark", text="Delete", icon='REMOVE')
+
+        self._draw_selected(layout, props, collection)
+        self._draw_guided(layout, props, collection)
+
+        layout.separator()
+        column = layout.column(align=True)
+        column.operator("bsmt.validate_landmarks", icon='CHECKMARK')
+        if props.landmark_summary:
+            info = column.row()
+            info.enabled = False
+            info.label(text=props.landmark_summary)
+
+        self._draw_display(layout, props)
+        self._draw_protocol(layout, props)
+
+        layout.separator()
+        layout.operator("bsmt.clear_landmarks", text="Clear Landmark Data",
+                        icon='TRASH')
+
+    @staticmethod
+    def _draw_selected(layout, props, collection):
+        box = layout.box()
+        index = props.landmark_index
+        if not 0 <= index < len(collection):
+            box.label(text="No landmark selected")
+            return
+        item = collection[index]
+
+        box.label(text="Selected: %s" % item.label)
+        box.prop(item, "name", text="Name")
+        box.prop(item, "notes", text="Notes")
+
+        row = box.row(align=True)
+        row.operator(
+            "bsmt.pick_landmark",
+            text="Re-pick" if item.surface_point.valid else "Pick Selected",
+            icon='EYEDROPPER',
+        ).index = index
+        row.operator("bsmt.clear_landmark_position", text="Clear Position",
+                     icon='X')
+
+        column = box.column(align=True)
+        column.scale_y = 0.7
+        column.label(
+            text="Status: %s" % _STATUS_SHORT.get(item.status, item.status),
+            icon=landmarks.STATUS_ICONS.get(item.status, 'BLANK1'),
+        )
+        if item.status_detail:
+            for line in _wrap(item.status_detail, 42):
+                column.label(text="   " + line)
+        point = item.surface_point
+        if point.valid:
+            column.label(text="   Object:    %s" % point.source_object)
+            column.label(text="   Triangle:  %d" % point.triangle_index)
+            column.label(text="   Component: %d" % point.component_id)
+            column.label(
+                text="   Physical mm: %.1f, %.1f, %.1f"
+                % (point.physical_mm_xyz[0], point.physical_mm_xyz[1],
+                   point.physical_mm_xyz[2])
+            )
+
+    @staticmethod
+    def _draw_guided(layout, props, collection):
+        box = layout.box()
+        if not props.guided_active:
+            box.operator("bsmt.guided_picking", text="Start Guided Picking",
+                         icon='PLAY').action = 'START'
+            box.prop(props, "guided_skip_valid")
+            return
+
+        total = sum(
+            1 for item in collection
+            if not props.guided_skip_valid or item.status != landmarks.STATUS_VALID
+        )
+        index = props.landmark_index
+        label = collection[index].label if 0 <= index < len(collection) else "-"
+        box.label(text="Pick %d/%d: %s" % (props.guided_index + 1, total, label),
+                  icon='EYEDROPPER')
+
+        row = box.row(align=True)
+        row.operator("bsmt.guided_picking", text="Previous",
+                     icon='TRIA_LEFT').action = 'PREVIOUS'
+        row.operator("bsmt.pick_landmark", text="Pick",
+                     icon='EYEDROPPER').index = index
+        row.operator("bsmt.guided_picking", text="Next",
+                     icon='TRIA_RIGHT').action = 'NEXT'
+        box.operator("bsmt.guided_picking", text="Cancel",
+                     icon='X').action = 'CANCEL'
+
+    @staticmethod
+    def _draw_display(layout, props):
+        box = layout.box()
+        box.prop(props, "show_landmarks")
+        box.prop(props, "landmark_marker_size_mm")
+
+    @staticmethod
+    def _draw_protocol(layout, props):
+        layout.separator()
+        layout.label(text="Protocol (names and order only)")
+        row = layout.row(align=True)
+        row.operator("bsmt.load_protocol", text="Load", icon='IMPORT')
+        row.operator("bsmt.save_protocol", text="Save", icon='EXPORT')
+        note = layout.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        note.label(text="Protocols carry names, not scan positions.")
+
+
 classes = (
     BSMT_PT_body_measurement,
     BSMT_PT_diagnostics,
     BSMT_PT_geodesic_backend,
+    BSMT_UL_landmarks,
+    BSMT_PT_landmarks,
 )
 
 

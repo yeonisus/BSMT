@@ -32,7 +32,7 @@ import bpy
 import numpy as np
 from bpy.app.handlers import persistent
 
-from . import geodesic, measurement, state, visualization
+from . import geodesic, landmarks, measurement, state, visualization
 
 # Movement below this (world units) is not worth a property write.
 _POSITION_EPSILON = 1e-9
@@ -113,6 +113,124 @@ def _local_position(point, canonical):
     return np.array(point.local_xyz, dtype=np.float64), "cached-local"
 
 
+def _landmark_collection(props):
+    """The scene's landmark collection, reached from the props that own it.
+
+    `props.id_data` is the Scene the PropertyGroup is attached to, so this
+    works from a handler where there is no reliable context.
+    """
+    scene = getattr(props, "id_data", None)
+    return getattr(scene, "bsmt_landmarks", None) if scene is not None else None
+
+
+def refresh_landmarks(props, watched=None, multiplier=None):
+    """Move named landmark markers to follow their object. Returns a note.
+
+    Vectorised per source object (sect. 17): one canonical lookup, one
+    gather, one matrix product for every landmark on that object. It never
+    rebuilds topology, the BVH or a geometry hash - none of which is reachable
+    from here - so 50 landmarks cost three small numpy operations, not 50
+    round trips.
+
+    Nothing is re-projected. A landmark whose geometry hash no longer matches
+    the cached canonical mesh falls back to the local position already stored
+    on its SurfacePoint, which consults no geometry at all.
+    """
+    collection = _landmark_collection(props)
+    if not collection:
+        return "landmarks:none"
+    if multiplier is None:
+        multiplier = measurement.unit_multiplier(props.unit)
+
+    meshcache = geodesic.meshcache if geodesic.MESHCACHE_AVAILABLE else None
+
+    # Group by source object so the canonical mesh is looked up once each.
+    by_object = {}
+    for item in collection:
+        point = item.surface_point
+        if not point.valid or not point.source_object:
+            continue
+        if watched is not None and point.source_object not in watched:
+            continue
+        by_object.setdefault(point.source_object, []).append(item)
+
+    if not by_object:
+        return "landmarks:none-watched"
+
+    moved = 0
+    missing = 0
+    for object_name, items in by_object.items():
+        obj = bpy.data.objects.get(object_name)
+        if obj is None:
+            missing += len(items)
+            continue
+
+        canonical = meshcache.peek(object_name) if meshcache is not None else None
+        matrix = np.array(obj.matrix_world, dtype=np.float64)
+
+        # Split into landmarks the canonical mesh can still resolve and those
+        # that must use their own cached local position.
+        resolvable = []
+        cached = []
+        for item in items:
+            point = item.surface_point
+            if (
+                canonical is not None
+                and canonical.geometry_hash == point.geometry_hash
+                and 0 <= point.triangle_index < canonical.triangle_count
+            ):
+                resolvable.append(item)
+            else:
+                cached.append(item)
+
+        locals_list = []
+        ordered = []
+        if resolvable:
+            triangle_indices = np.fromiter(
+                (item.surface_point.triangle_index for item in resolvable),
+                dtype=np.int64, count=len(resolvable),
+            )
+            barycentrics = np.array(
+                [tuple(item.surface_point.barycentric) for item in resolvable],
+                dtype=np.float64,
+            )
+            locals_list.append(landmarks.local_positions(
+                triangle_indices, barycentrics,
+                canonical.vertices_local, canonical.triangles,
+            ))
+            ordered.extend(resolvable)
+        if cached:
+            locals_list.append(np.array(
+                [tuple(item.surface_point.local_xyz) for item in cached],
+                dtype=np.float64,
+            ))
+            ordered.extend(cached)
+
+        if not ordered:
+            continue
+        local = np.vstack(locals_list) if len(locals_list) > 1 else locals_list[0]
+        world = landmarks.to_world(local, matrix)
+
+        for item, position in zip(ordered, world):
+            point = item.surface_point
+            if _changed(point.world_xyz, position):
+                point.world_xyz = tuple(float(v) for v in position)
+            # Compared separately from the world position: a coordinate-unit
+            # change moves nothing in the world but does change the physical
+            # millimetre value, so keying this off "did it move" leaves a
+            # stale number on display.
+            wanted_mm = tuple(float(v) * multiplier for v in position)
+            if _changed(point.physical_mm_xyz, wanted_mm):
+                point.physical_mm_xyz = wanted_mm
+            if visualization.move_landmark_marker(item.stable_id, position):
+                moved += 1
+
+    note = "landmarks:moved=%d" % moved
+    if missing:
+        note += " missing-object=%d" % missing
+    return note
+
+
 def refresh(props, watched=None, reason="manual"):
     """Re-derive helper world positions. Returns a short outcome string."""
     if props is None:
@@ -155,8 +273,13 @@ def refresh(props, watched=None, reason="manual"):
         position_changed = _changed(point.world_xyz, world)
         if position_changed:
             point.world_xyz = tuple(float(v) for v in world)
-            point.physical_mm_xyz = tuple(float(v) * multiplier for v in world)
             moved_any = True
+        # Separate comparison, for the same reason as the landmark path: a
+        # unit change alters the physical millimetre value without moving
+        # anything.
+        wanted_mm = tuple(float(v) * multiplier for v in world)
+        if _changed(point.physical_mm_xyz, wanted_mm):
+            point.physical_mm_xyz = wanted_mm
 
         # Phase 1 straight-distance state follows the same surface location,
         # so the two can never drift apart.
@@ -185,6 +308,8 @@ def refresh(props, watched=None, reason="manual"):
                 props.distance_mm = distance
                 notes.append("distance=%.4f mm" % distance)
 
+    notes.append(refresh_landmarks(props, watched, multiplier))
+
     STATS["refresh_count"] += 1
     outcome = "%s | line=%s | %s" % (reason, line_state, " ".join(notes) or "nothing")
     STATS["last_outcome"] = outcome
@@ -194,11 +319,49 @@ def refresh(props, watched=None, reason="manual"):
     return outcome
 
 
+def refresh_physical_mm(props):
+    """Recompute physical millimetre coordinates for A/B and every landmark.
+
+    Pure property writes: no marker is moved, no geometry is read and no
+    handler is involved, so this is safe to call from a property update
+    callback. Exists because a coordinate-unit change alters the physical
+    value of an unmoved point.
+    """
+    if props is None:
+        return 0
+    multiplier = measurement.unit_multiplier(props.unit)
+    updated = 0
+
+    def apply(point):
+        if not point.valid:
+            return 0
+        wanted = tuple(float(v) * multiplier for v in point.world_xyz)
+        if _changed(point.physical_mm_xyz, wanted):
+            point.physical_mm_xyz = wanted
+            return 1
+        return 0
+
+    for slot in ('A', 'B'):
+        updated += apply(state.surface_point(props, slot))
+    collection = _landmark_collection(props)
+    if collection:
+        for item in collection:
+            updated += apply(item.surface_point)
+    return updated
+
+
 def _watched_objects(props):
+    """Objects whose transform BSMT needs to follow: A/B plus named landmarks."""
     names = set()
     for point in (props.surface_a, props.surface_b):
         if point.valid and point.source_object:
             names.add(point.source_object)
+    collection = _landmark_collection(props)
+    if collection:
+        for item in collection:
+            point = item.surface_point
+            if point.valid and point.source_object:
+                names.add(point.source_object)
     return names
 
 
@@ -239,6 +402,8 @@ def _on_depsgraph_update(scene, depsgraph=None):
             return
         debug = _debug_enabled(props)
 
+        # Covers A/B and every named landmark, so a scene with landmarks but
+        # no A/B picks still follows its object.
         watched = _watched_objects(props)
         if not watched:
             STATS["last_outcome"] = "no valid surface points"

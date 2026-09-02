@@ -6,9 +6,10 @@ import traceback
 import numpy as np
 
 import bpy
-from bpy.props import EnumProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 
-from . import attach, geodesic, measurement, picking, state, visualization
+from . import (attach, geodesic, landmarks, measurement, picking, protocol,
+               state, visualization)
 
 # Events that must keep working while the modal picker is active, so the user
 # can orbit / zoom / change the view before committing to a click.
@@ -45,6 +46,28 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         options={'SKIP_SAVE'},
     )
 
+    # Milestone 3.0. Additive, and 'AB' is the default, so every existing
+    # caller and the whole Phase 1 workflow behave exactly as before. The
+    # picking ALGORITHM is untouched: the same viewport ray, the same
+    # canonical BVH cast and the same SurfacePoint construction serve both
+    # targets, so there is only one picking implementation (sect. 5).
+    target: EnumProperty(
+        name="Target",
+        items=(
+            ('AB', "A/B Point", "Store into the Phase 1 A/B slot"),
+            ('LANDMARK', "Named Landmark",
+             "Store into the selected named research landmark"),
+        ),
+        default='AB',
+        options={'SKIP_SAVE'},
+    )
+    landmark_index: IntProperty(
+        name="Landmark Index",
+        description="Row in scene.bsmt_landmarks to store into",
+        default=-1,
+        options={'SKIP_SAVE'},
+    )
+
     # Runtime-only handles, not properties.
     _area = None
     _region = None
@@ -78,7 +101,12 @@ class BSMT_OT_pick_point(bpy.types.Operator):
 
         if event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
             self._restore(context)
-            self.report({'INFO'}, "BSMT: picking cancelled, Point %s unchanged" % self.point)
+            self.report(
+                {'INFO'},
+                "BSMT: picking cancelled, %s unchanged"
+                % ("the selected landmark" if self.target == 'LANDMARK'
+                   else "Point %s" % self.point),
+            )
             return {'CANCELLED'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
@@ -115,12 +143,17 @@ class BSMT_OT_pick_point(bpy.types.Operator):
             self.report({'ERROR'}, "BSMT: add-on properties are not registered")
             return {'CANCELLED'}
 
+        if self.target == 'LANDMARK':
+            return self._pick_landmark(context, props, obj, coord, location)
+
         # Phase 1 state: the exact ray/surface intersection, unchanged.
         state.set_point(props, self.point, location)
 
         # Phase 2 state: the canonical surface location for the same click.
         # One pick populates both; there is never a separately picked landmark.
-        surface_note = self._attach_surface_point(context, props, obj, coord)
+        surface_note = self._attach_surface_point(
+            context, props, obj, coord, state.surface_point(props, self.point)
+        )
 
         visualization.update_marker(context, props, self.point, location)
         # The previous line (if any) no longer matches the points.
@@ -141,14 +174,59 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         )
         return {'FINISHED'}
 
-    def _attach_surface_point(self, context, props, obj, coord):
-        """Capture the canonical surface location for this click.
+    def _pick_landmark(self, context, props, obj, coord, location):
+        """Store this click into the selected named landmark.
+
+        Only the landmark is touched: A/B, the straight line and any stored
+        surface distance are left exactly as they were (sect. 6, sect. 15).
+        """
+        collection = state.get_landmarks(context)
+        index = self.landmark_index if self.landmark_index >= 0 else props.landmark_index
+        if collection is None or not 0 <= index < len(collection):
+            self._restore(context)
+            self.report({'ERROR'}, "BSMT: no landmark selected to pick into")
+            return {'CANCELLED'}
+
+        item = collection[index]
+        surface_note = self._attach_surface_point(
+            context, props, obj, coord, item.surface_point
+        )
+        if not surface_note.startswith("triangle"):
+            # A click that produced no canonical attachment is not a pick.
+            # Nothing is stored and guided picking does not advance.
+            state.clear_landmark_position(item)
+            self.report({'WARNING'}, "BSMT: %s" % surface_note)
+            return {'RUNNING_MODAL'}
+
+        canonical = geodesic.meshcache.peek(item.surface_point.source_object)
+        state.refresh_landmark_status(item, canonical)
+        visualization.update_landmark_marker(
+            context, props, item, item.surface_point.world_xyz
+        )
+
+        self._restore(context)
+        advanced = ""
+        if props.guided_active:
+            advanced = " | " + _guided_advance(context, props)
+        self.report(
+            {'INFO'},
+            "BSMT: landmark '%s' set on '%s' - %s%s"
+            % (item.label, obj.name, surface_note, advanced),
+        )
+        return {'FINISHED'}
+
+    def _attach_surface_point(self, context, props, obj, coord, point):
+        """Capture the canonical surface location for this click into `point`.
 
         Uses the canonical BVH, so the triangle index returned directly
         indexes canonical_triangles. Never snaps to a vertex: the stored
         barycentrics reproduce the exact ray/surface intersection.
+
+        `point` is any BSMT_SurfacePoint - an A/B slot or a landmark's nested
+        one. The pipeline is identical either way; only the destination
+        differs, so there is one picking implementation, not two (sect. 5).
         """
-        state.clear_surface_point(state.surface_point(props, self.point))
+        state.clear_surface_point(point)
 
         unavailable = geodesic.ensure_loaded()
         if unavailable:
@@ -179,9 +257,8 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         reconstructed = canonical.local_from(triangle_index, bary)
         error = float(np.linalg.norm(reconstructed - local_xyz))
 
-        state.set_surface_point(
-            props,
-            self.point,
+        state.fill_surface_point(
+            point,
             canonical.source_object,
             canonical.geometry_hash,
             triangle_index,
@@ -193,6 +270,12 @@ class BSMT_OT_pick_point(bpy.types.Operator):
             np.asarray(world_xyz, dtype=np.float64) * canonical.unit_multiplier,
             error,
         )
+        if point is state.surface_point(props, 'A') or point is state.surface_point(props, 'B'):
+            # A/B consequence, unchanged from Phase 2: a re-picked A/B point
+            # invalidates the stored surface distance. A landmark pick must
+            # not, so this is decided by the destination, not by the caller.
+            state.clear_surface_result(props)
+            props.surface_status = ""
         return "triangle %d, component %d, %s" % (
             triangle_index,
             canonical.component_of(triangle_index),
@@ -200,10 +283,23 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         )
 
     def _set_status(self, context):
-        text = (
-            "BSMT: Left click on the mesh to set Point %s   |   "
-            "ESC or Right click: cancel" % self.point
-        )
+        if self.target == 'LANDMARK':
+            label = "landmark"
+            collection = state.get_landmarks(context)
+            props = state.get_props(context)
+            index = (self.landmark_index if self.landmark_index >= 0
+                     else (props.landmark_index if props else -1))
+            if collection is not None and 0 <= index < len(collection):
+                label = "'%s'" % collection[index].label
+            text = (
+                "BSMT: Left click on the mesh to set %s   |   "
+                "ESC or Right click: cancel" % label
+            )
+        else:
+            text = (
+                "BSMT: Left click on the mesh to set Point %s   |   "
+                "ESC or Right click: cancel" % self.point
+            )
         context.workspace.status_text_set(text)
         if self._area is not None:
             self._area.header_text_set(text)
@@ -580,16 +676,18 @@ class BSMT_OT_validate_surface_points(bpy.types.Operator):
                 stale += 1
                 continue
 
-            if canonical.geometry_hash != point.geometry_hash:
+            # One implementation of the stale rule, shared with the Landmark
+            # Manager (sect. 16), so A/B and named landmarks can never
+            # disagree about what "stale" means.
+            reason = landmarks.stale_reason(
+                point.geometry_hash,
+                point.triangle_index,
+                canonical.geometry_hash,
+                canonical.triangle_count,
+            )
+            if reason:
                 # Never reproject onto a changed surface.
-                point.status = "STALE: geometry changed (%s -> %s)" % (
-                    point.geometry_hash[:8], canonical.geometry_hash[:8]
-                )
-                stale += 1
-                continue
-
-            if not 0 <= point.triangle_index < canonical.triangle_count:
-                point.status = "STALE: triangle index out of range"
+                point.status = "STALE: " + reason
                 stale += 1
                 continue
 
@@ -1297,6 +1395,466 @@ class BSMT_OT_clear_backend_reports(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Landmark Manager (Milestone 3.0)
+# ---------------------------------------------------------------------------
+
+
+def _guided_targets(context, props):
+    """Indices guided picking will visit, in list order."""
+    collection = state.get_landmarks(context)
+    if not collection:
+        return []
+    if props.guided_skip_valid:
+        return [
+            index for index, item in enumerate(collection)
+            if item.status != landmarks.STATUS_VALID
+        ]
+    return list(range(len(collection)))
+
+
+def _guided_advance(context, props):
+    """Move guided picking to the next target. Returns a short note."""
+    targets = _guided_targets(context, props)
+    if not targets:
+        props.guided_active = False
+        return "guided picking complete"
+    collection = state.get_landmarks(context)
+    current = props.landmark_index
+    following = [index for index in targets if index > current]
+    if not following:
+        props.guided_active = False
+        return "guided picking complete"
+    props.landmark_index = following[0]
+    props.guided_index = targets.index(following[0])
+    return "next: %s" % collection[following[0]].label
+
+
+class BSMT_OT_add_landmark(bpy.types.Operator):
+    """Add a named research landmark. It starts NOT PICKED"""
+
+    bl_idname = "bsmt.add_landmark"
+    bl_label = "Add Landmark"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    landmark_name: StringProperty(
+        name="Name",
+        description="Anatomical landmark name. Any name you like; BSMT never "
+                    "assumes a naming convention",
+        default="",
+    )
+    notes: StringProperty(name="Notes", default="")
+    allow_duplicate: BoolProperty(
+        name="Allow Duplicate Name",
+        description="Add the landmark even though the name is already used. "
+                    "It is given a numeric suffix so the two stay "
+                    "distinguishable",
+        default=False,
+    )
+
+    def invoke(self, context, event):
+        collection = state.get_landmarks(context)
+        count = len(collection) + 1 if collection is not None else 1
+        if not self.landmark_name:
+            self.landmark_name = "P%02d" % count
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is None:
+            self.report({'ERROR'}, "BSMT: add-on properties are not registered")
+            return {'CANCELLED'}
+        try:
+            item = state.add_landmark(
+                context, props, self.landmark_name, notes=self.notes,
+                allow_duplicate=self.allow_duplicate,
+            )
+        except landmarks.LandmarkError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+        self.report({'INFO'}, "BSMT: added landmark '%s' (%s)"
+                    % (item.name, item.protocol_id))
+        return {'FINISHED'}
+
+
+class BSMT_OT_remove_landmark(bpy.types.Operator):
+    """Delete the selected landmark and its marker"""
+
+    bl_idname = "bsmt.remove_landmark"
+    bl_label = "Delete Landmark"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return state.active_landmark(context) is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        item = state.active_landmark(context, props)
+        if item is None:
+            return {'CANCELLED'}
+        name = item.label
+        stable_id = state.remove_landmark(context, props, props.landmark_index)
+        if stable_id is not None:
+            visualization.remove_landmark_marker(stable_id)
+        self.report({'INFO'}, "BSMT: deleted landmark '%s'" % name)
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_landmark_position(bpy.types.Operator):
+    """Forget the selected landmark's surface location, keeping its name"""
+
+    bl_idname = "bsmt.clear_landmark_position"
+    bl_label = "Clear Position"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        item = state.active_landmark(context)
+        return item is not None and item.surface_point.valid
+
+    def execute(self, context):
+        props = state.get_props(context)
+        item = state.active_landmark(context, props)
+        if item is None:
+            return {'CANCELLED'}
+        state.clear_landmark_position(item)
+        visualization.remove_landmark_marker(item.stable_id)
+        self.report({'INFO'}, "BSMT: cleared position of '%s'" % item.label)
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_landmarks(bpy.types.Operator):
+    """Delete every named landmark. A/B, the topology preview and the scan
+    are not affected"""
+
+    bl_idname = "bsmt.clear_landmarks"
+    bl_label = "Clear Landmark Data"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        collection = state.get_landmarks(context)
+        return bool(collection)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_landmarks(context)
+        count = len(collection) if collection else 0
+        state.clear_landmarks(context, props)
+        removed = visualization.clear_landmark_markers()
+        self.report({'INFO'},
+                    "BSMT: cleared %d landmark(s), removed %d marker(s). "
+                    "A/B and the scan are untouched." % (count, removed))
+        return {'FINISHED'}
+
+
+class BSMT_OT_validate_landmarks(bpy.types.Operator):
+    """Re-check every landmark against the current canonical mesh.
+
+    Refreshes transform-dependent coordinates and marks stale landmarks. A
+    stale landmark is never silently re-projected onto changed geometry
+    """
+
+    bl_idname = "bsmt.validate_landmarks"
+    bl_label = "Validate All Landmarks"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(state.get_landmarks(context))
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_landmarks(context)
+        if props is None or collection is None:
+            return {'CANCELLED'}
+
+        geodesic.ensure_loaded()
+        meshcache = geodesic.meshcache if geodesic.MESHCACHE_AVAILABLE else None
+
+        # One canonical mesh per source object, not per landmark (sect. 9).
+        wanted = {
+            item.surface_point.source_object
+            for item in collection
+            if item.surface_point.valid and item.surface_point.source_object
+        }
+        canonicals = {}
+        for name in sorted(wanted):
+            obj = bpy.data.objects.get(name)
+            if obj is None or obj.type != 'MESH':
+                canonicals[name] = None
+                continue
+            if meshcache is None:
+                canonicals[name] = None
+                continue
+            try:
+                canonicals[name] = meshcache.get(context, obj, props.unit,
+                                                 rebuild=True)
+            except Exception as exc:                  # noqa: BLE001
+                traceback.print_exc()
+                print("[BSMT] canonical mesh failed for '%s': %s" % (name, exc))
+                canonicals[name] = None
+
+        statuses = []
+        for item in collection:
+            point = item.surface_point
+            canonical = canonicals.get(point.source_object)
+            obj = bpy.data.objects.get(point.source_object)
+            status = state.refresh_landmark_status(
+                item, canonical, object_exists=obj is not None
+            )
+            statuses.append(status)
+
+            if status == landmarks.STATUS_VALID and canonical is not None:
+                # Refresh transform-dependent coordinates only. The canonical
+                # location itself is never touched.
+                bary = np.array(point.barycentric, dtype=np.float64)
+                world = canonical.world_from(point.triangle_index, bary)
+                point.local_xyz = tuple(
+                    float(v) for v in canonical.local_from(point.triangle_index, bary)
+                )
+                point.world_xyz = tuple(float(v) for v in world)
+                point.physical_mm_xyz = tuple(
+                    float(v) * canonical.unit_multiplier for v in world
+                )
+                point.component_id = canonical.component_of(point.triangle_index)
+                visualization.update_landmark_marker(context, props, item, world)
+            elif point.valid:
+                # Keep the marker where it is, recoloured to show it can no
+                # longer be trusted. Never re-projected.
+                visualization.update_landmark_marker(
+                    context, props, item, point.world_xyz
+                )
+
+        visualization.remove_orphan_landmark_markers(
+            [item.stable_id for item in collection]
+        )
+        visualization.apply_landmark_display(context, props)
+
+        counts, summary = landmarks.summarise(statuses)
+        props.landmark_summary = summary
+        problems = (counts.get(landmarks.STATUS_STALE, 0)
+                    + counts.get(landmarks.STATUS_INVALID, 0))
+        self.report({'WARNING'} if problems else {'INFO'},
+                    "BSMT: %s" % summary)
+        return {'FINISHED'}
+
+
+class BSMT_OT_pick_landmark(bpy.types.Operator):
+    """Pick the selected landmark on the mesh surface.
+
+    Thin launcher: the actual picking is the same modal operator, the same
+    viewport ray and the same canonical BVH pipeline the A/B workflow uses
+    """
+
+    bl_idname = "bsmt.pick_landmark"
+    bl_label = "Pick Selected"
+    bl_options = {'REGISTER'}
+
+    index: IntProperty(default=-1, options={'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        return (context.area is not None and context.area.type == 'VIEW_3D'
+                and state.active_landmark(context) is not None)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if self.index >= 0:
+            props.landmark_index = self.index
+        return bpy.ops.bsmt.pick_point(
+            'INVOKE_DEFAULT', target='LANDMARK',
+            landmark_index=props.landmark_index,
+        )
+
+
+class BSMT_OT_guided_picking(bpy.types.Operator):
+    """Start, step or cancel guided picking through the landmark list.
+
+    Guided picking is UI state, not a long-lived modal operator: only the
+    individual pick is modal, exactly as A/B already works. Normal Blender
+    keyboard input is therefore never globally swallowed (sect. 13)
+    """
+
+    bl_idname = "bsmt.guided_picking"
+    bl_label = "Guided Picking"
+    bl_options = {'REGISTER'}
+
+    action: EnumProperty(
+        name="Action",
+        items=(
+            ('START', "Start", "Begin guided picking"),
+            ('NEXT', "Next", "Move to the next landmark without picking"),
+            ('PREVIOUS', "Previous", "Move to the previous landmark"),
+            ('CANCEL', "Cancel", "Leave guided picking"),
+        ),
+        default='START',
+        options={'SKIP_SAVE'},
+    )
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_landmarks(context)
+        if props is None or collection is None or not len(collection):
+            self.report({'WARNING'}, "BSMT: there are no landmarks to pick")
+            return {'CANCELLED'}
+
+        if self.action == 'CANCEL':
+            props.guided_active = False
+            props.guided_index = 0
+            self.report({'INFO'}, "BSMT: guided picking cancelled")
+            return {'FINISHED'}
+
+        targets = _guided_targets(context, props)
+        if not targets:
+            props.guided_active = False
+            self.report({'INFO'},
+                        "BSMT: every landmark is already picked. Turn off "
+                        "'Skip Already Picked' to re-pick.")
+            return {'FINISHED'}
+
+        if self.action == 'START':
+            props.guided_active = True
+            props.guided_index = 0
+            props.landmark_index = targets[0]
+        elif self.action == 'NEXT':
+            props.guided_index = min(props.guided_index + 1, len(targets) - 1)
+            props.landmark_index = targets[props.guided_index]
+        elif self.action == 'PREVIOUS':
+            props.guided_index = max(props.guided_index - 1, 0)
+            props.landmark_index = targets[props.guided_index]
+
+        item = collection[props.landmark_index]
+        self.report({'INFO'}, "BSMT: pick %d/%d: %s"
+                    % (props.guided_index + 1, len(targets), item.label))
+        return {'FINISHED'}
+
+
+class BSMT_OT_save_protocol(bpy.types.Operator):
+    """Save the landmark names and order as a reusable protocol.
+
+    Names and order only. Scan-specific triangle indices and barycentric
+    coordinates are never written into a protocol file
+    """
+
+    bl_idname = "bsmt.save_protocol"
+    bl_label = "Save Landmark Protocol"
+    bl_options = {'REGISTER'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+    check_existing: BoolProperty(default=True, options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return bool(state.get_landmarks(context))
+
+    def invoke(self, context, event):
+        props = state.get_props(context)
+        if not self.filepath:
+            name = (props.protocol_name or "bsmt_protocol").replace(" ", "_")
+            self.filepath = name + ".json"
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_landmarks(context)
+        if not collection:
+            self.report({'ERROR'}, "BSMT: there are no landmarks to save")
+            return {'CANCELLED'}
+        entries = [
+            (item.protocol_id, item.name, item.notes) for item in collection
+        ]
+        try:
+            protocol.save(
+                self.filepath,
+                props.protocol_name or "BSMT Landmark Protocol",
+                entries,
+            )
+        except (protocol.ProtocolError, OSError) as exc:
+            self.report({'ERROR'}, "BSMT: could not save protocol: %s" % exc)
+            return {'CANCELLED'}
+        self.report({'INFO'}, "BSMT: saved %d landmark name(s) to %s"
+                    % (len(entries), self.filepath))
+        return {'FINISHED'}
+
+
+class BSMT_OT_load_protocol(bpy.types.Operator):
+    """Load a landmark protocol: names and order, no positions.
+
+    Every loaded landmark starts NOT PICKED. A file that carries scan-specific
+    coordinates is refused rather than partially imported
+    """
+
+    bl_idname = "bsmt.load_protocol"
+    bl_label = "Load Landmark Protocol"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+    replace: BoolProperty(
+        name="Replace Existing Landmarks",
+        description="Delete the current landmarks and their markers before "
+                    "loading. Turn off to append",
+        default=True,
+    )
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is None:
+            return {'CANCELLED'}
+        try:
+            name, entries = protocol.load(self.filepath)
+        except protocol.ProtocolError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        if self.replace:
+            state.clear_landmarks(context, props)
+            visualization.clear_landmark_markers()
+
+        added = 0
+        skipped = []
+        for protocol_id, landmark_name, notes in entries:
+            try:
+                state.add_landmark(context, props, landmark_name,
+                                   protocol_id=protocol_id, notes=notes)
+                added += 1
+            except landmarks.LandmarkError as exc:
+                skipped.append("%s (%s)" % (landmark_name, exc))
+
+        props.protocol_name = name
+        props.landmark_index = 0
+        props.landmark_summary = ""
+        _counts, summary = landmarks.summarise(
+            [item.status for item in state.get_landmarks(context)]
+        )
+        props.landmark_summary = summary
+
+        if skipped:
+            for line in skipped:
+                print("[BSMT] protocol landmark skipped: %s" % line)
+            self.report({'WARNING'},
+                        "BSMT: loaded '%s' - %d landmark(s), %d skipped "
+                        "(see the system console)" % (name, added, len(skipped)))
+        else:
+            self.report({'INFO'},
+                        "BSMT: loaded protocol '%s' - %d landmark(s), all NOT "
+                        "PICKED" % (name, added))
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_topology(bpy.types.Operator):
     """Clear the topology diagnostics report"""
 
@@ -1329,6 +1887,15 @@ classes = (
     BSMT_OT_check_geodesic_env,
     BSMT_OT_run_backend_selftest,
     BSMT_OT_clear_backend_reports,
+    BSMT_OT_add_landmark,
+    BSMT_OT_remove_landmark,
+    BSMT_OT_clear_landmark_position,
+    BSMT_OT_clear_landmarks,
+    BSMT_OT_validate_landmarks,
+    BSMT_OT_pick_landmark,
+    BSMT_OT_guided_picking,
+    BSMT_OT_save_protocol,
+    BSMT_OT_load_protocol,
 )
 
 

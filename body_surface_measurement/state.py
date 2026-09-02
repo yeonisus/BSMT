@@ -17,7 +17,7 @@ from bpy.props import (
     StringProperty,
 )
 
-from . import geodesic, measurement, visualization
+from . import geodesic, landmarks, measurement, visualization
 
 
 def _on_display_changed(self, context):
@@ -40,6 +40,15 @@ def _on_unit_changed(self, context):
     # displayed. The straight distance above can simply be rescaled; a
     # geodesic cannot, because a non-uniform metric change moves the path.
     clear_surface_result(self)
+    # Physical millimetre coordinates depend on the unit but not on the world
+    # position, so nothing else would refresh them. Imported late: attach
+    # imports state, and this is the only direction that would close a cycle.
+    try:
+        from . import attach
+        attach.refresh_physical_mm(self)
+    except Exception:                                 # pragma: no cover
+        # A display refresh must never break the unit setting itself.
+        pass
     # Helper sizes are specified in mm, so they depend on the unit too.
     _on_display_changed(self, context)
 
@@ -107,6 +116,69 @@ class BSMT_SurfacePoint(bpy.types.PropertyGroup):
                     "position, in local units",
         default=0.0,
     )
+
+
+def _on_landmark_display_changed(self, context):
+    """Re-apply landmark marker size and visibility. Cosmetic only."""
+    visualization.apply_landmark_display(context, self)
+
+
+class BSMT_Landmark(bpy.types.PropertyGroup):
+    """One named research landmark.
+
+    Composition, not a second surface-point representation (sect. 16): the
+    canonical location lives in a nested `BSMT_SurfacePoint`, the very same
+    PropertyGroup the A/B workflow uses, and every piece of mathematics on it
+    stays in surface_point.py / landmarks.py.
+
+    `stable_id` is a monotonic integer that is never reused within a scene.
+    It names the marker object, so a landmark can be renamed, reordered or
+    reloaded from a protocol without its helper object changing identity or
+    colliding with another landmark's (sect. 7).
+    """
+
+    stable_id: IntProperty(
+        name="Stable ID",
+        description="Internal identifier, unique within the scene and never "
+                    "reused. Names the marker object",
+        default=0,
+    )
+    protocol_id: StringProperty(
+        name="ID",
+        description="Protocol-facing identifier, e.g. L01",
+        default="",
+    )
+    name: StringProperty(
+        name="Name",
+        description="Anatomical landmark name. Chosen entirely by the "
+                    "researcher; BSMT never assumes or rewrites one",
+        default="",
+    )
+    display_name: StringProperty(
+        name="Display Name",
+        description="Optional label shown instead of the name",
+        default="",
+    )
+    notes: StringProperty(
+        name="Notes",
+        description="Free-text notes for this landmark",
+        default="",
+    )
+    surface_point: PointerProperty(
+        name="Surface Point",
+        description="Canonical surface location: triangle index + barycentric",
+        type=BSMT_SurfacePoint,
+    )
+    status: EnumProperty(
+        name="Status",
+        items=landmarks.STATUS_ITEMS,
+        default=landmarks.STATUS_NOT_PICKED,
+    )
+    status_detail: StringProperty(name="Status Detail", default="")
+
+    @property
+    def label(self):
+        return self.display_name or self.name or "(unnamed)"
 
 
 class BSMT_ComponentInfo(bpy.types.PropertyGroup):
@@ -329,6 +401,72 @@ class BSMT_Properties(bpy.types.PropertyGroup):
     )
 
     # ------------------------------------------------------------------
+    # Milestone 3.0 - Landmark Manager.
+    # The landmark COLLECTION lives on the Scene as scene.bsmt_landmarks, as
+    # specified. These are the manager's settings, kept here with every other
+    # BSMT setting so the panel has one props object to read.
+    # ------------------------------------------------------------------
+    landmark_index: IntProperty(
+        name="Active Landmark",
+        description="Row selected in the landmark list",
+        default=0,
+        min=0,
+    )
+    landmark_next_id: IntProperty(
+        name="Next Stable ID",
+        description="Monotonic counter. Never decreases, so a stable id is "
+                    "never reused within a scene",
+        default=1,
+        min=1,
+    )
+    protocol_name: StringProperty(
+        name="Protocol",
+        description="Name of the landmark protocol currently loaded",
+        default="",
+    )
+    show_landmarks: BoolProperty(
+        name="Show Named Landmarks",
+        description="Show the named landmark markers. Independent of the "
+                    "A/B marker visibility",
+        default=True,
+        update=_on_landmark_display_changed,
+    )
+    landmark_marker_size_mm: FloatProperty(
+        name="Landmark Size (mm)",
+        description="Diameter of a named landmark marker, in millimetres",
+        default=12.0,
+        min=0.1,
+        soft_max=100.0,
+        update=_on_landmark_display_changed,
+    )
+    show_landmark_labels: BoolProperty(
+        name="Show Landmark Labels",
+        description="Draw the landmark name next to each marker in the viewport",
+        default=False,
+        update=_on_landmark_display_changed,
+    )
+    landmark_summary: StringProperty(
+        name="Landmark Summary",
+        description="Result of the last Validate All",
+        default="",
+    )
+
+    # guided picking (sect. 13). Deliberately UI state rather than a
+    # long-lived modal operator: only the individual pick is modal, exactly
+    # as the A/B workflow already does it, so normal Blender keyboard input
+    # is never globally swallowed.
+    guided_active: BoolProperty(name="Guided Picking", default=False,
+                                options={'SKIP_SAVE'})
+    guided_index: IntProperty(name="Guided Position", default=0, min=0,
+                              options={'SKIP_SAVE'})
+    guided_skip_valid: BoolProperty(
+        name="Skip Already Picked",
+        description="During guided picking, step over landmarks that are "
+                    "already VALID",
+        default=True,
+    )
+
+    # ------------------------------------------------------------------
     # Milestone 2.3 - production surface (geodesic) distance.
     # Stored SEPARATELY from the Phase 1 straight distance so neither can
     # overwrite the other, and invalidated independently (sect. 6.5).
@@ -477,11 +615,15 @@ def clear_surface_point(point):
     point.reconstruction_error = 0.0
 
 
-def set_surface_point(props, slot, source_object, geometry_hash, triangle_index,
-                      barycentric, component_id, kind, local_xyz, world_xyz,
-                      physical_mm_xyz, reconstruction_error):
-    """Store the canonical surface location for slot 'A' or 'B'."""
-    point = surface_point(props, slot)
+def fill_surface_point(point, source_object, geometry_hash, triangle_index,
+                       barycentric, component_id, kind, local_xyz, world_xyz,
+                       physical_mm_xyz, reconstruction_error):
+    """Write a canonical surface location into any BSMT_SurfacePoint.
+
+    Side-effect free, so it serves both the A/B slots and a named landmark's
+    nested surface point. There is exactly one place these fields are written
+    (sect. 16); the A/B-specific consequences live in set_surface_point().
+    """
     point.valid = True
     point.source_object = source_object
     point.geometry_hash = geometry_hash
@@ -494,12 +636,186 @@ def set_surface_point(props, slot, source_object, geometry_hash, triangle_index,
     point.physical_mm_xyz = tuple(float(v) for v in physical_mm_xyz)
     point.status = "VALID"
     point.reconstruction_error = float(reconstruction_error)
-    # A re-picked landmark invalidates any surface distance that used the old
-    # one. set_point() also clears it, but this function is reachable on its
-    # own, so the rule is enforced in both places rather than assumed.
+    return point
+
+
+def set_surface_point(props, slot, source_object, geometry_hash, triangle_index,
+                      barycentric, component_id, kind, local_xyz, world_xyz,
+                      physical_mm_xyz, reconstruction_error):
+    """Store the canonical surface location for slot 'A' or 'B'."""
+    point = surface_point(props, slot)
+    fill_surface_point(
+        point, source_object, geometry_hash, triangle_index, barycentric,
+        component_id, kind, local_xyz, world_xyz, physical_mm_xyz,
+        reconstruction_error,
+    )
+    # A re-picked A/B point invalidates any surface distance that used the
+    # old one. set_point() also clears it, but this function is reachable on
+    # its own, so the rule is enforced in both places rather than assumed.
+    # Landmarks go through fill_surface_point() instead and therefore do NOT
+    # disturb the A/B result.
     clear_surface_result(props)
     props.surface_status = ""
     return point
+
+
+# ---------------------------------------------------------------------------
+# Landmark Manager (Milestone 3.0)
+# ---------------------------------------------------------------------------
+#
+# The collection lives on the Scene (scene.bsmt_landmarks); its settings live
+# on props. These helpers are the only place landmarks are created, removed or
+# re-statused, so the invariants of sect. 4 and sect. 8 hold in one place.
+
+
+def get_landmarks(context):
+    """The scene's landmark collection, or None if the add-on is not registered."""
+    scene = getattr(context, "scene", None)
+    return getattr(scene, "bsmt_landmarks", None) if scene is not None else None
+
+
+def landmark_names(collection):
+    return [item.name for item in collection]
+
+
+def landmark_protocol_ids(collection):
+    return [item.protocol_id for item in collection]
+
+
+def active_landmark(context, props=None):
+    """The selected landmark, or None."""
+    collection = get_landmarks(context)
+    if not collection:
+        return None
+    if props is None:
+        props = get_props(context)
+    if props is None:
+        return None
+    index = props.landmark_index
+    if 0 <= index < len(collection):
+        return collection[index]
+    return None
+
+
+def add_landmark(context, props, name, protocol_id="", notes="",
+                 allow_duplicate=False):
+    """Append a landmark. Returns it. Raises landmarks.LandmarkError.
+
+    Creation never requires picking: the new landmark starts NOT_PICKED
+    (sect. 4). Creation order is the collection order and is preserved.
+    """
+    collection = get_landmarks(context)
+    if collection is None:
+        raise landmarks.LandmarkError("landmark collection is not registered")
+
+    cleaned = landmarks.clean_name(name)
+    existing = landmark_names(collection)
+    if landmarks.name_exists(existing, cleaned):
+        if not allow_duplicate:
+            raise landmarks.LandmarkError(
+                "a landmark named '%s' already exists. Enable 'Allow "
+                "Duplicate Name' to add it anyway." % cleaned
+            )
+        # Explicitly confirmed: kept distinguishable rather than silently
+        # duplicated, so two rows can never be confused later (sect. 20).
+        cleaned = landmarks.unique_name(existing, cleaned)
+
+    item = collection.add()
+    item.stable_id = props.landmark_next_id
+    props.landmark_next_id += 1
+    item.protocol_id = (str(protocol_id).strip()
+                        or landmarks.next_protocol_id(
+                            landmark_protocol_ids(collection)))
+    item.name = cleaned
+    item.notes = str(notes or "")
+    item.status = landmarks.STATUS_NOT_PICKED
+    item.status_detail = ""
+    clear_surface_point(item.surface_point)
+    props.landmark_index = len(collection) - 1
+    return item
+
+
+def remove_landmark(context, props, index):
+    """Remove one landmark. Returns its stable id, or None."""
+    collection = get_landmarks(context)
+    if collection is None or not 0 <= index < len(collection):
+        return None
+    stable_id = int(collection[index].stable_id)
+    collection.remove(index)
+    if props.landmark_index >= len(collection):
+        props.landmark_index = max(0, len(collection) - 1)
+    return stable_id
+
+
+def clear_landmarks(context, props):
+    """Remove every named landmark. Returns the removed stable ids.
+
+    Named research landmarks only. A/B, the topology preview and the scan are
+    untouched (sect. 20).
+    """
+    collection = get_landmarks(context)
+    if collection is None:
+        return []
+    stable_ids = [int(item.stable_id) for item in collection]
+    collection.clear()
+    props.landmark_index = 0
+    props.landmark_summary = ""
+    props.guided_active = False
+    props.guided_index = 0
+    return stable_ids
+
+
+def clear_landmark_position(item):
+    """Forget a landmark's surface location, keeping its name and stable id."""
+    clear_surface_point(item.surface_point)
+    item.status = landmarks.STATUS_NOT_PICKED
+    item.status_detail = ""
+
+
+def set_landmark_status(item, status, detail=""):
+    item.status = status
+    item.status_detail = detail
+
+
+def refresh_landmark_status(item, canonical=None, object_exists=None):
+    """Recompute one landmark's status. Never re-projects anything.
+
+    `canonical` is None when the mesh is not cached, which yields
+    NEEDS_REFRESH rather than an assertion of validity (sect. 8).
+    """
+    point = item.surface_point
+    if object_exists is None:
+        object_exists = bool(
+            point.source_object
+            and bpy.data.objects.get(point.source_object) is not None
+        )
+    status, detail = landmarks.classify(
+        picked=bool(point.valid),
+        point_geometry_hash=point.geometry_hash,
+        triangle_index=point.triangle_index,
+        source_object=point.source_object,
+        object_exists=object_exists,
+        canonical_geometry_hash=(
+            canonical.geometry_hash if canonical is not None else None
+        ),
+        triangle_count=(
+            canonical.triangle_count if canonical is not None else None
+        ),
+    )
+    set_landmark_status(item, status, detail)
+    return status
+
+
+def picked_landmarks(collection):
+    """Landmarks that hold a surface location, in collection order."""
+    return [item for item in collection if item.surface_point.valid]
+
+
+def landmark_by_stable_id(collection, stable_id):
+    for item in collection:
+        if int(item.stable_id) == int(stable_id):
+            return item
+    return None
 
 
 def metric_tensor(matrix_world, multiplier):
@@ -688,7 +1004,11 @@ def reset(props):
 
 
 classes = (
+    # Order matters twice over: BSMT_SurfacePoint must exist before
+    # BSMT_Landmark can point at it, and BSMT_Landmark before the Scene
+    # collection that holds it.
     BSMT_SurfacePoint,
+    BSMT_Landmark,
     BSMT_ComponentInfo,
     BSMT_Properties,
 )
@@ -698,9 +1018,13 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.bsmt = bpy.props.PointerProperty(type=BSMT_Properties)
+    # Scene-level, as specified in the Milestone 3.0 brief.
+    bpy.types.Scene.bsmt_landmarks = CollectionProperty(type=BSMT_Landmark)
 
 
 def unregister():
+    if hasattr(bpy.types.Scene, "bsmt_landmarks"):
+        del bpy.types.Scene.bsmt_landmarks
     if hasattr(bpy.types.Scene, "bsmt"):
         del bpy.types.Scene.bsmt
     for cls in reversed(classes):

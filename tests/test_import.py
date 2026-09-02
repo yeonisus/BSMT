@@ -75,7 +75,7 @@ def install_stubs():
     bpy = types.ModuleType("bpy")
     bpy_types = types.ModuleType("bpy.types")
     for name in (
-        "PropertyGroup", "Operator", "Panel", "Mesh", "Curve",
+        "PropertyGroup", "Operator", "Panel", "UIList", "Mesh", "Curve",
         "Object", "Scene", "Material", "Collection",
     ):
         setattr(bpy_types, name, type(name, (object,), {}))
@@ -281,6 +281,8 @@ def test_fresh_import():
     bsmt = importlib.import_module("body_surface_measurement")
     check_package(bsmt, "fresh")
     check("fresh: operators module loaded", hasattr(bsmt, "operators"))
+    check("fresh: landmarks module loaded", hasattr(bsmt, "landmarks"))
+    check("fresh: protocol module loaded", hasattr(bsmt, "protocol"))
     check("fresh: register/unregister present",
           callable(bsmt.register) and callable(bsmt.unregister))
     return bsmt
@@ -802,6 +804,53 @@ def test_register_smoke(bsmt):
     check("unregister() completes", unregistered)
 
 
+def test_landmark_modules_are_pure(bsmt):
+    """landmarks.py and protocol.py must not depend on bpy.
+
+    They carry the status rules and the protocol format, so they have to stay
+    testable outside Blender - and protocol.py must stay usable by anything
+    that only needs to read a protocol file.
+    """
+    print("\nMilestone 3.0 modules are importable without Blender")
+    import ast as _ast
+    import os as _os
+    for name in ("landmarks", "protocol"):
+        path = _os.path.join(ROOT, "body_surface_measurement", name + ".py")
+        tree = _ast.parse(open(path).read())
+        imported = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, _ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        check("%s.py does not import bpy" % name, "bpy" not in imported,
+              sorted(imported))
+        check("%s.py does not import mathutils" % name,
+              "mathutils" not in imported, sorted(imported))
+    check("protocol.py needs only the standard library",
+          "numpy" not in open(
+              _os.path.join(ROOT, "body_surface_measurement", "protocol.py")
+          ).read().split("\n\n")[0])
+
+    # The single-implementation rule of sect. 16: the A/B validate operator
+    # and the Landmark Manager must call the same stale rule.
+    source = open(_os.path.join(ROOT, "body_surface_measurement",
+                                "operators.py")).read()
+    check("the A/B validate operator uses landmarks.stale_reason",
+          "landmarks.stale_reason(" in source)
+    check("no second geometry-hash stale comparison remains in operators.py",
+          source.count("geometry_hash != point.geometry_hash") == 0)
+
+    # And one place writes SurfacePoint fields.
+    state_source = open(_os.path.join(ROOT, "body_surface_measurement",
+                                      "state.py")).read()
+    check("fill_surface_point is the single field writer",
+          state_source.count("point.triangle_index = int(triangle_index)") == 1,
+          str(state_source.count("point.triangle_index = int(triangle_index)")))
+    check("set_surface_point delegates to it",
+          "fill_surface_point(" in state_source)
+
+
 def main():
     print("BSMT import regression tests (stubbed bpy, no Blender)")
     install_stubs()
@@ -815,6 +864,7 @@ def main():
     test_refresh_without_cached_canonical_mesh(bsmt)
     test_handler_persistence_and_duplicates(bsmt)
     test_extract_binds_submodules_directly(bsmt)
+    test_landmark_modules_are_pure(bsmt)
     test_register_smoke(bsmt)
     test_broken_extract_module()
 

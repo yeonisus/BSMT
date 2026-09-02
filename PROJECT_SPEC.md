@@ -6,8 +6,8 @@
 **Target environment:** Blender 4.5.13 LTS, macOS 26.5 (Apple Silicon, arm64),
 bundled Python 3.11.15, numpy 1.26.4 — **all detected at runtime, 2026-09-02** (§5.1a)
 **Status:** Phase 1 complete and validated on a real human-body scan. Milestones 2.0, 2.0a,
-2.1, 2.2 and **2.3** implemented and validated in Blender. Real-scan acceptance testing of 2.3
-(§11, Milestone 2.3) is outstanding.
+2.1, 2.2, 2.3 and **3.0 (Landmark Manager)** implemented and validated in Blender. Real-scan
+acceptance testing of 2.3 and 3.0 is outstanding.
 
 > Note on this document's history: no `PROJECT_SPEC.md` existed in the project before this
 > revision. Phase 1 was specified conversationally and implemented from that specification.
@@ -24,7 +24,8 @@ on textured OBJ human-body scans.
 |---|---|---|
 | 1 | Straight-line (Euclidean) distance between two ray-cast surface points | **Done** (v0.2.0) |
 | 2 | Surface (geodesic) distance between the same two points | **This document.** Milestones 2.0, 2.0a, 2.1, 2.1a, 2.2, **2.3 done** (v0.7.0); 2.4–2.6 outstanding |
-| 3+ | Preprocessing, landmark templates, automatic landmark detection, export, batch measurement | Not designed |
+| 3.0 | Named research landmark manager: protocols, guided picking, Validate All | **Done** (v0.8.0) |
+| 3.1+ | Measurement templates, batch measurement, export, automatic landmark detection | Not designed |
 | Future | Anatomical scan alignment (§13) | Requirement recorded, not designed |
 
 Non-goals for Phase 2, explicitly: automatic landmark detection, mesh repair as a measurement
@@ -1369,6 +1370,150 @@ Runtimes are to be measured, not predicted.
   welding prohibition (§7.3) must hold.
 - Landmark pairs that wrap a limb, where the shortest surface path is not the anatomically
   intended one.
+
+---
+
+## 11a. Milestone 3.0 — Landmark Manager (as implemented, 2026-09-02)
+
+A research layer for repeated, named measurements, added **alongside** the Phase 1 A/B
+workflow. A/B is unchanged and remains the quick ad-hoc / debugging / validation path; it is
+never converted into named landmarks and is never required by them.
+
+### 11a.1 Data architecture
+
+```
+scene.bsmt_landmarks : CollectionProperty(BSMT_Landmark)     <- Scene level, as specified
+    stable_id      IntProperty   monotonic, unique per scene, never reused
+    protocol_id    StringProperty "L01" - protocol facing
+    name           StringProperty arbitrary; no anatomical name is hard-coded anywhere
+    display_name   StringProperty optional
+    notes          StringProperty optional
+    surface_point  PointerProperty(BSMT_SurfacePoint)        <- THE SAME PropertyGroup as A/B
+    status         EnumProperty   NOT_PICKED | VALID | NEEDS_REFRESH | STALE | INVALID
+    status_detail  StringProperty
+```
+
+**Composition worked.** A nested `PointerProperty` to `BSMT_SurfacePoint` inside a
+`CollectionProperty` element registers and behaves correctly in Blender 4.5.13 (verified:
+`type(item.surface_point).__name__ == "BSMT_SurfacePoint"`), so there is literally one surface
+point implementation rather than an equivalent-fields copy. Registration order is
+`BSMT_SurfacePoint → BSMT_Landmark → BSMT_ComponentInfo → BSMT_Properties`.
+
+Manager *settings* (active index, marker size, visibility, protocol name, guided state) live on
+`BSMT_Properties` with every other BSMT setting; only the landmark *data* is on the Scene.
+
+### 11a.2 Single-implementation rule (§16), enforced
+
+| Concern | The one implementation | Used by |
+|---|---|---|
+| barycentric maths | `geodesic/surface_point.py` | everything |
+| batched reconstruction | `landmarks.local_positions` / `to_world` | `attach.refresh_landmarks` |
+| stale detection | `landmarks.stale_reason()` | Landmark Manager **and** the A/B validate operator |
+| status classification | `landmarks.classify()` | Landmark Manager |
+| writing SurfacePoint fields | `state.fill_surface_point()` | A/B **and** landmarks |
+| picking | `BSMT_OT_pick_point` + canonical BVH | A/B **and** landmarks, via a `target` enum |
+
+`state.set_surface_point()` is now a thin wrapper over `fill_surface_point()` that adds the
+A/B-only consequence of clearing the stored surface distance. A landmark pick deliberately does
+**not** clear it. `operators.py` no longer contains a second geometry-hash comparison; this is
+regression tested in `tests/test_import.py`.
+
+### 11a.3 Picking
+
+No new picking algorithm. `BSMT_OT_pick_point` gained a `target` enum (`AB` by default, so every
+existing caller and all Phase 1 behaviour is untouched) and a `landmark_index`. The viewport ray,
+the canonical BVH cast and the SurfacePoint construction are the same code for both targets; only
+the destination `BSMT_SurfacePoint` differs. Landmarks are never snapped to existing mesh
+vertices — the stored barycentrics reproduce the exact ray/surface intersection, as in 2.1.
+
+A click that yields no canonical attachment stores nothing, stays modal and does not advance
+guided picking.
+
+### 11a.4 Guided picking
+
+Deliberately **not** a long-lived modal operator. Guided mode is UI state (`guided_active`,
+`guided_index`) plus `bsmt.guided_picking` with START / NEXT / PREVIOUS / CANCEL; only the
+individual pick is modal, exactly as A/B already works. Normal Blender keyboard input is
+therefore never globally swallowed (§13). `guided_skip_valid` steps over already-VALID
+landmarks; turning it off allows deliberate re-picking.
+
+### 11a.5 Status semantics (§8)
+
+```
+geometry edit  ->  cache cleared  ->  NEEDS_REFRESH  ->  Validate All  ->  STALE
+rigid transform ->  VALID throughout
+scale / unit    ->  VALID; only the physical coordinates refresh
+```
+
+`NEEDS_REFRESH` exists because a cleared canonical mesh cache is this project's established
+"geometry may have changed" signal (Milestone 2.1a). It is not evidence of a change, but it is
+not evidence of sameness either, so the landmark is reported as unverified rather than asserted
+valid. **A stale landmark is never silently re-projected** — verified by comparing every
+`(triangle_index, barycentric)` before and after a geometry edit plus Validate All.
+
+`Validate All` rebuilds **one** canonical mesh per source object, not one per landmark (§9), and
+reports e.g. `18 valid, 2 not picked, 1 stale`.
+
+### 11a.6 Markers
+
+`BSMT_Landmark_%06d`, named from the stable id and never from the researcher's name, so a name
+containing awkward characters, a rename, or a protocol reload cannot collide or mangle an object
+name (§7). Colour encodes trust: green VALID, dull yellow NEEDS_REFRESH, orange STALE/INVALID. A
+stale marker is recoloured **in place**, never moved.
+
+Lifetimes are independent, as §20 requires: `Clear Points` skips the landmark prefix, and
+`Clear Landmark Data` leaves A/B, the component preview and the scan untouched. Both verified.
+
+### 11a.7 Performance (§17)
+
+`attach.refresh_landmarks()` groups landmarks by source object, looks the canonical mesh up once
+per object, and does one gather plus one matrix product for the whole group. It never rebuilds
+topology, the BVH or a geometry hash — none of which is reachable from it.
+
+| Measurement | Result |
+|---|---|
+| 50 landmarks, 320,000-triangle mesh, pure numpy | **0.008 ms** per refresh |
+| 50 landmarks in Blender, including 50 marker object writes | **0.51 ms** per refresh |
+
+Well inside a 16 ms frame, and it does not scale with mesh size: it gathers 50 triangles, not
+320,000.
+
+### 11a.8 Protocols
+
+`protocol.py` — pure standard library, no bpy, no numpy — reads and writes
+`bsmt-landmark-protocol` v1: protocol name, and an ordered list of `{id, name, notes}`.
+
+**The protocol / scan-data separation is enforced in both directions.** `dump()` asserts that
+nothing position-shaped reaches the output; `load()` **refuses** a file carrying
+`triangle_index`, `barycentric`, `geometry_hash`, `world_xyz`, `component_id`, `source_object`
+and similar, rather than quietly ignoring it — such a file is scan data, and importing it as a
+protocol would attach one scan's coordinates to a different scan unnoticed. Verified round-trip:
+save 10 names → clear → load → same 10 names, same order, all NOT PICKED, no positions, and
+fresh stable ids (not reused).
+
+### 11a.9 A defect found and fixed on the way
+
+`physical_mm_xyz` was refreshed only when the world position moved. A coordinate-unit change
+moves nothing but does change the physical millimetre value, so the displayed coordinate went
+stale. This was **pre-existing in the A/B path**, and the landmark path had inherited it. Both
+now compare the physical value separately, and `_on_unit_changed` calls
+`attach.refresh_physical_mm()`. It affected a displayed diagnostic only — no measurement reads
+`physical_mm_xyz` — but it was wrong.
+
+### 11a.10 Verified in Blender 4.5.13
+
+10 landmarks on a 3,968-triangle proxy scan: distinct triangle indices, all component 1, all
+VALID, markers at the surface. Translation, rotation, uniform scale and non-uniform scale — all
+markers follow to a worst **relative** error of 5.1e-8 (the float32 floor of `Object.location`),
+status stays VALID, and `(triangle_index, barycentric)` is bit-identical throughout. Geometry
+edit → 9 NEEDS_REFRESH → Validate All → `1 not picked, 9 stale`, no re-projection. Protocol
+round-trip, guided picking progression, and A/B regression (straight 161.55 mm, surface
+188.30 mm) all pass.
+
+**Outstanding: real-scan acceptance on 21_M_3400E** (§18, §19 of the milestone brief) — 10
+landmarks at visibly different anatomical locations, picked through the viewport, then the
+transform and geometry-edit checks, and a 10-landmark protocol round-trip with guided picking.
+The viewport click is the one path that cannot be exercised headlessly.
 
 ---
 
