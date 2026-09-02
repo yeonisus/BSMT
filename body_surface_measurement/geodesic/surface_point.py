@@ -22,8 +22,56 @@ import numpy as np
 # far under any scan's resolution.
 SNAP_TOLERANCE = 1e-7
 
-# Permitted departure of u+v+w from 1 before a point is rejected.
+# Permitted departure of u+v+w from 1 before a STORED point is rejected. This
+# guards data that did not come from a ray cast - a hand-written or corrupted
+# SurfacePoint - and stays strict.
 SUM_TOLERANCE = 1e-6
+
+# ---------------------------------------------------------------------------
+# Accepting a BVH hit (Milestone 3.12)
+# ---------------------------------------------------------------------------
+#
+# Blender's BVH returns a hit location as a mathutils Vector, which is SINGLE
+# precision. The reported point therefore lies a few float32 ulps away from
+# the exact ray-triangle intersection - a little off the triangle's plane,
+# and, when the true intersection is on a shared edge, a little outside the
+# triangle the BVH named.
+#
+# Judging that in BARYCENTRIC units was the mistake. A barycentric coordinate
+# is a RATIO: the same physical displacement produces a large excursion on a
+# small triangle and a small one on a large triangle, so a fixed barycentric
+# tolerance means a different physical thing on every face. Measured on a
+# 2000-triangle decimated body scan, a ray along exactly (1, 0, 0) produced a
+# barycentric excursion of 3.7e-06 - over the old 1e-6 limit, so the pick was
+# refused - while the point was geometrically only 5.8e-08 units, 58
+# NANOMETRES, from that triangle. It was refused for being 0.2 of a float32
+# ulp out of place.
+#
+# The rule here is geometric instead, in the units the mesh is actually in:
+#
+#     accept the hit when moving it onto its own triangle displaces it by
+#     less than a few float32 ulps of the coordinates involved
+#
+# That is scale aware by construction, and it is STRICTER than a barycentric
+# rule where it matters: a point a millimetre outside a large triangle is
+# refused however small its barycentric excursion happens to be.
+
+#: Relative spacing of float32, 2**-24. Blender's mathutils Vector - and so
+#: every BVH hit location - carries this much representation error per unit of
+#: coordinate magnitude.
+FLOAT32_EPS = 2.0 ** -24
+
+#: How many float32 ulps of displacement a hit may need before it is refused.
+#:
+#: Derived, not chosen: over 4000 random rays against a decimated body scan
+#: the largest off-plane distance of a legitimate hit was 4.5 ulp (p99.9 =
+#: 4.2), and the largest in-plane displacement needed to seat a hit on its own
+#: triangle was 0.2 ulp. Sixteen leaves roughly a 3.5x margin over the worst
+#: observed case while remaining a minuscule absolute distance: on a scan
+#: measured in millimetres with coordinates up to 2000, it is 0.002 mm. No
+#: anthropometric landmark is defined to two microns, and nothing that is
+#: genuinely on a different face is within it.
+HIT_TOLERANCE_ULPS = 16
 
 KIND_FACE = 'FACE'
 KIND_EDGE = 'EDGE'
@@ -37,9 +85,14 @@ class InsertionError(Exception):
 def barycentric(triangle, point):
     """Barycentric coordinates of `point` on `triangle` ((3,3) corners).
 
-    Returns (u, v, w) with point == u*A + v*B + w*C. The point is projected
-    onto the triangle plane, which is what we want: a ray hit is on the plane
-    up to floating point noise.
+    Returns (u, v, w) with point == u*A + v*B + w*C.
+
+    The point is ORTHOGONALLY PROJECTED onto the triangle plane first, and
+    that is worth saying loudly: a point a kilometre off the surface, whose
+    projection lands inside the triangle, comes back with perfectly clean
+    coordinates. This function therefore cannot, on its own, tell you whether
+    a point is on a triangle - it only tells you where its shadow falls. Use
+    `locate_hit`, which measures the off-plane distance as well.
     """
     triangle = np.asarray(triangle, dtype=np.float64)
     point = np.asarray(point, dtype=np.float64)
@@ -96,6 +149,88 @@ def normalize_barycentric(bary, tolerance=SUM_TOLERANCE):
         return bary, False, deviation
     bary = bary / total
     return bary, deviation <= tolerance, deviation
+
+
+def plane_projection(triangle, point):
+    """(projected point, signed distance) for `point` against the plane.
+
+    The sign is along the triangle's own normal, so the caller can report
+    which side a rejected point was on.
+    """
+    triangle = np.asarray(triangle, dtype=np.float64)
+    point = np.asarray(point, dtype=np.float64)
+    normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
+    length = float(np.linalg.norm(normal))
+    if length == 0.0:
+        raise InsertionError("degenerate triangle: it has no plane")
+    normal = normal / length
+    distance = float((point - triangle[0]) @ normal)
+    return point - distance * normal, distance
+
+
+def hit_tolerance(triangle, point, ray_scale=0.0, ulps=HIT_TOLERANCE_ULPS):
+    """How far a float32 hit may legitimately be out of place, in mesh units.
+
+    The scale is the largest coordinate magnitude involved, because that is
+    what sets the float32 spacing of the arithmetic that produced the hit.
+    The RAY's own magnitude counts: a hit is computed as origin + t*direction,
+    so a ray cast from far away is intrinsically less precise than one cast
+    from close by, and the tolerance follows it honestly.
+    """
+    triangle = np.asarray(triangle, dtype=np.float64)
+    point = np.asarray(point, dtype=np.float64)
+    scale = max(float(np.abs(triangle).max()), float(np.abs(point).max()),
+                float(abs(ray_scale)))
+    return float(ulps) * FLOAT32_EPS * scale
+
+
+def locate_hit(triangle, point, ray_scale=0.0, ulps=HIT_TOLERANCE_ULPS):
+    """Seat a BVH hit on the triangle the BVH reported. Returns a dict.
+
+    Keys: `bary` (a valid convex combination), `ok`, `off_plane` (signed
+    distance to the plane), `residual` (how far accepting the point moves it),
+    `tolerance`, `projected` and `point` (the reconstructed position).
+
+    The triangle is never changed, no neighbour is searched, and nothing is
+    snapped to a vertex. Either the hit is close enough to its OWN triangle to
+    be seated on it within float32 noise, or it is refused.
+
+    `residual` is measured as the distance the acceptance actually moves the
+    point - from the plane projection to the reconstruction of the clamped
+    coordinates. Clamp-and-renormalise is not exactly the closest point in the
+    triangle, so this is an upper bound on the true distance, which is the
+    conservative direction: it can only refuse a point the true distance would
+    have accepted.
+    """
+    triangle = np.asarray(triangle, dtype=np.float64)
+    point = np.asarray(point, dtype=np.float64)
+    tolerance = hit_tolerance(triangle, point, ray_scale, ulps)
+
+    if not np.isfinite(point).all() or not np.isfinite(triangle).all():
+        return {"bary": np.zeros(3), "ok": False, "off_plane": float("inf"),
+                "residual": float("inf"), "tolerance": tolerance,
+                "projected": point, "point": point}
+
+    projected, off_plane = plane_projection(triangle, point)
+    bary = barycentric(triangle, projected)
+
+    # `barycentric` sets u = 1 - v - w, so the sum is 1 by construction. What
+    # can still be wrong is a coordinate outside [0, 1], which means the hit
+    # is beside the triangle rather than on it.
+    clamped = np.clip(bary, 0.0, 1.0)
+    total = float(clamped.sum())
+    if total <= 0.0 or not np.isfinite(total):
+        return {"bary": bary, "ok": False, "off_plane": off_plane,
+                "residual": float("inf"), "tolerance": tolerance,
+                "projected": projected, "point": projected}
+    clamped = clamped / total
+
+    seated = reconstruct(triangle, clamped)
+    residual = float(np.linalg.norm(seated - projected))
+    ok = (abs(off_plane) <= tolerance) and (residual <= tolerance)
+    return {"bary": clamped, "ok": ok, "off_plane": float(off_plane),
+            "residual": residual, "tolerance": tolerance,
+            "projected": projected, "point": seated}
 
 
 def classify(bary, tolerance=SNAP_TOLERANCE):

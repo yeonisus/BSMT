@@ -11,7 +11,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
     "author": "BSMT",
-    "version": (0, 18, 0),
+    "version": (0, 18, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar (N) > BSMT",
     "description": (

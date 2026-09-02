@@ -397,6 +397,314 @@ def test_reconstruction_tolerance_grid():
     check("interior/edge/vertex reconstruction under 1e-9", worst < 1e-9, worst)
 
 
+# ---------------------------------------------------------------------------
+# Accepting a BVH hit (Milestone 3.12)
+# ---------------------------------------------------------------------------
+
+#: A triangle with an awkward shape and off-origin position, so nothing here
+#: passes by accident on a tidy unit triangle.
+AWKWARD = np.array([
+    [0.29182687, -0.00341, 0.95509612],
+    [0.30119, 0.01204, 0.93871],
+    [0.27455, 0.00087, 0.94120],
+], dtype=np.float64)
+
+
+def as_float32(point):
+    """What a mathutils Vector does to a coordinate: single precision."""
+    return np.asarray(np.asarray(point, dtype=np.float32), dtype=np.float64)
+
+
+def point_at(triangle, bary):
+    return sp.reconstruct(triangle, np.asarray(bary, dtype=np.float64))
+
+
+def test_hit_on_a_triangle():
+    print("\n[hit] a hit is seated on the triangle the BVH named")
+    cases = (
+        ("interior", (0.3, 0.35, 0.35)),
+        ("near an edge", (1e-9, 0.5, 0.5 - 1e-9)),
+        ("exactly on an edge", (0.0, 0.5, 0.5)),
+        ("near a vertex", (1.0 - 2e-9, 1e-9, 1e-9)),
+        ("exactly on a vertex", (1.0, 0.0, 0.0)),
+        ("on the second vertex", (0.0, 1.0, 0.0)),
+        ("on the third vertex", (0.0, 0.0, 1.0)),
+    )
+    for label, bary in cases:
+        exact = point_at(AWKWARD, bary)
+        result = sp.locate_hit(AWKWARD, exact)
+        check("%s is accepted" % label, result["ok"],
+              "off_plane %.3e residual %.3e tol %.3e"
+              % (result["off_plane"], result["residual"], result["tolerance"]))
+        check("  its coordinates sum to exactly 1",
+              abs(float(result["bary"].sum()) - 1.0) < 1e-15,
+              float(result["bary"].sum()) - 1.0)
+        check("  and none is outside [0, 1]",
+              result["bary"].min() >= 0.0 and result["bary"].max() <= 1.0,
+              result["bary"])
+        rebuilt = sp.reconstruct(AWKWARD, result["bary"])
+        check("  the reconstruction matches the hit",
+              float(np.linalg.norm(rebuilt - exact)) < 1e-12,
+              float(np.linalg.norm(rebuilt - exact)))
+
+    # The same points after float32 rounding - which is what a BVH returns.
+    for label, bary in cases:
+        rounded = as_float32(point_at(AWKWARD, bary))
+        result = sp.locate_hit(AWKWARD, rounded)
+        check("%s survives float32 rounding" % label, result["ok"],
+              "off_plane %.3e residual %.3e tol %.3e"
+              % (result["off_plane"], result["residual"], result["tolerance"]))
+        check("  and is still a convex combination",
+              abs(float(result["bary"].sum()) - 1.0) < 1e-15
+              and result["bary"].min() >= 0.0)
+
+
+def test_the_reproduced_failure():
+    print("\n[hit] the failure this milestone exists to fix")
+    # Measured on a decimated body scan: a hit whose float32 position is a
+    # fraction OUTSIDE the triangle the BVH named, because the true
+    # intersection lay on a shared edge. The old barycentric rule saw an
+    # excursion of 3.7e-06 and refused the pick; geometrically the point was
+    # 5.8e-08 units - 58 nanometres - from the triangle.
+    edge_point = point_at(AWKWARD, (0.0, 0.5, 0.5))
+    normal = np.cross(AWKWARD[1] - AWKWARD[0], AWKWARD[2] - AWKWARD[0])
+    normal = normal / np.linalg.norm(normal)
+    outward = np.cross(normal, AWKWARD[2] - AWKWARD[1])
+    outward = outward / np.linalg.norm(outward)
+    if float(np.dot(outward, AWKWARD[0] - edge_point)) > 0:
+        outward = -outward
+
+    # The ray was cast from 5 units away, and a hit is computed as
+    # origin + t*direction, so the float32 spacing that produced the error is
+    # the RAY's, not the triangle's. That is exactly why the barycentric
+    # excursion was large on a triangle only ~20 mm across.
+    ray_scale = 5.0
+    ulp = sp.FLOAT32_EPS * ray_scale
+    just_outside = edge_point + outward * (0.2 * ulp) + normal * (2.3 * ulp)
+
+    old_bary = sp.barycentric(AWKWARD, just_outside)
+    _clean, old_ok, old_deviation = sp.normalize_barycentric(old_bary)
+    check("the old barycentric rule refuses it", not old_ok,
+          "deviation %.3e against SUM_TOLERANCE %.1e"
+          % (old_deviation, sp.SUM_TOLERANCE))
+    check("  and the excursion it saw is ~1e-6, as measured in Blender",
+          1e-6 < old_deviation < 1e-4, old_deviation)
+
+    result = sp.locate_hit(AWKWARD, just_outside, ray_scale=ray_scale)
+    check("the geometric rule accepts it", result["ok"],
+          "off_plane %.3e residual %.3e tol %.3e"
+          % (result["off_plane"], result["residual"], result["tolerance"]))
+    check("  because it only has to move a fraction of a float32 ulp",
+          result["residual"] < ulp, "%.3e vs ulp %.3e" % (result["residual"], ulp))
+    check("  a displacement of nanometres, not micrometres",
+          result["residual"] < 1e-6, result["residual"])
+    check("  and the result is a valid convex combination",
+          abs(float(result["bary"].sum()) - 1.0) < 1e-15
+          and result["bary"].min() >= 0.0 and result["bary"].max() <= 1.0,
+          result["bary"])
+
+
+def test_the_old_rule_was_blind_off_the_plane():
+    print("\n[hit] the old rule measured the wrong thing in BOTH directions")
+    # `barycentric` computes the coordinates of the ORTHOGONAL PROJECTION onto
+    # the triangle plane - so a point arbitrarily far off the surface, whose
+    # projection lands inside the triangle, produced perfectly clean
+    # coordinates and passed. The old rule had no off-plane check at all.
+    flat = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    centre = flat.mean(axis=0)
+    for distance in (1e-6, 1e-3, 1.0, 1000.0):
+        point = centre + np.array([0.0, 0.0, distance])
+        _clean, old_ok, old_deviation = sp.normalize_barycentric(
+            sp.barycentric(flat, point))
+        check("the OLD rule accepted a point %g off the plane" % distance,
+              old_ok, "deviation %.1e" % old_deviation)
+        check("  the new rule refuses it",
+              not sp.locate_hit(flat, point)["ok"])
+    check("and both still accept a point actually on the plane",
+          sp.normalize_barycentric(sp.barycentric(flat, centre))[1]
+          and sp.locate_hit(flat, centre)["ok"])
+
+    # So the change is not "a looser tolerance". It is stricter off the plane
+    # and looser only within float32 noise in it.
+    tolerance = sp.hit_tolerance(flat, centre)
+    check("the off-plane bound is a few float32 ulps",
+          tolerance < 1e-6, tolerance)
+
+
+def test_genuinely_invalid_points_are_still_refused():
+    print("\n[hit] nothing that is really off the triangle gets through")
+    centre = point_at(AWKWARD, (1 / 3.0, 1 / 3.0, 1 / 3.0))
+    normal = np.cross(AWKWARD[1] - AWKWARD[0], AWKWARD[2] - AWKWARD[0])
+    normal = normal / np.linalg.norm(normal)
+    tolerance = sp.hit_tolerance(AWKWARD, centre)
+    check("the tolerance is sub-micron on a metre-scale mesh",
+          tolerance < 1e-6, tolerance)
+
+    for label, distance in (("1 mm", 1e-3), ("0.1 mm", 1e-4), ("1 um", 1e-6),
+                            ("10x tolerance", tolerance * 10.0),
+                            ("just over tolerance", tolerance * 1.01)):
+        result = sp.locate_hit(AWKWARD, centre + normal * distance)
+        check("%s off the plane is refused" % label, not result["ok"],
+              "off_plane %.3e tol %.3e" % (result["off_plane"], tolerance))
+    result = sp.locate_hit(AWKWARD, centre + normal * tolerance * 0.5)
+    check("half a tolerance off the plane is accepted", result["ok"])
+
+    # Beside the triangle, in its own plane.
+    direction = AWKWARD[0] - AWKWARD[1]
+    direction = direction / np.linalg.norm(direction)
+    for label, distance in (("1 mm", 1e-3), ("1 um", 1e-6),
+                            ("10x tolerance", tolerance * 10.0)):
+        result = sp.locate_hit(AWKWARD, AWKWARD[0] + direction * distance)
+        check("%s beside the triangle is refused" % label, not result["ok"],
+              "residual %.3e tol %.3e" % (result["residual"], tolerance))
+
+    check("a non-finite point is refused",
+          not sp.locate_hit(AWKWARD, [np.nan, 0.0, 0.0])["ok"])
+    check("  and reports an infinite residual",
+          not np.isfinite(
+              sp.locate_hit(AWKWARD, [np.inf, 0.0, 0.0])["residual"]))
+
+
+def test_tolerance_is_scale_aware():
+    print("\n[hit] the tolerance follows the coordinates, not a constant")
+    small = AWKWARD.copy()
+    metres = sp.hit_tolerance(small, small.mean(axis=0))
+    millimetres = sp.hit_tolerance(small * 1000.0,
+                                              small.mean(axis=0) * 1000.0)
+    check("a mesh in millimetres gets a 1000x larger tolerance",
+          abs(millimetres / metres - 1000.0) < 1e-9,
+          millimetres / metres)
+    check("  which is the SAME physical fraction",
+          abs((millimetres / 1000.0) / metres - 1.0) < 1e-9)
+
+    # Sect. 6: large mm-scale scanner coordinates, the real case.
+    scanner = AWKWARD * 1000.0 + np.array([1200.0, -450.0, 1700.0])
+    for label, bary in (("interior", (0.3, 0.35, 0.35)),
+                        ("on an edge", (0.0, 0.5, 0.5)),
+                        ("on a vertex", (0.0, 0.0, 1.0))):
+        rounded = as_float32(point_at(scanner, bary))
+        result = sp.locate_hit(scanner, rounded)
+        check("mm-scale scanner coordinates, %s" % label, result["ok"],
+              "off_plane %.3e residual %.3e tol %.3e"
+              % (result["off_plane"], result["residual"], result["tolerance"]))
+    tolerance = sp.hit_tolerance(scanner, scanner.mean(axis=0))
+    check("the mm-scale tolerance is a few microns, not a few mm",
+          1e-4 < tolerance < 1e-2, tolerance)
+
+    # The ray's own magnitude counts: a hit computed as origin + t*direction
+    # from far away is intrinsically less precise.
+    near = sp.hit_tolerance(AWKWARD, AWKWARD[0], ray_scale=1.0)
+    far = sp.hit_tolerance(AWKWARD, AWKWARD[0], ray_scale=1000.0)
+    check("a ray cast from far away gets a proportionally larger tolerance",
+          abs(far / near - 1000.0) < 1e-9, far / near)
+    check("and a ray from close by does not shrink it below the mesh scale",
+          sp.hit_tolerance(AWKWARD, AWKWARD[0], ray_scale=0.0) > 0.0)
+
+    check("the ulp count is a named, derived constant",
+          sp.HIT_TOLERANCE_ULPS == 16)
+    check("and float32 epsilon is the real one",
+          abs(sp.FLOAT32_EPS - 5.9604644775390625e-08) < 1e-20)
+
+
+def test_transformed_object():
+    print("\n[hit] an object transform changes nothing about the answer")
+    rng = np.random.default_rng(31)
+    for seed in range(6):
+        rotation, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+        if np.linalg.det(rotation) < 0:
+            rotation[:, 0] *= -1
+        offset = rng.normal(size=3) * 10.0
+        moved = AWKWARD @ rotation.T + offset
+
+        for label, bary in (("interior", (0.3, 0.35, 0.35)),
+                            ("on an edge", (0.0, 0.5, 0.5)),
+                            ("on a vertex", (1.0, 0.0, 0.0))):
+            here = sp.locate_hit(
+                AWKWARD, as_float32(point_at(AWKWARD, bary)))
+            there = sp.locate_hit(
+                moved, as_float32(point_at(moved, bary)))
+            check("seed %d, %s: accepted in both frames" % (seed, label),
+                  here["ok"] and there["ok"])
+            # The float32 rounding differs between frames, so the barycentric
+            # DIGITS differ slightly. What must hold is that each frame seats
+            # the point where that frame's hit actually was, within that
+            # frame's own tolerance - which is the property that matters.
+            check("  each frame seats its own hit within tolerance",
+                  here["residual"] <= here["tolerance"]
+                  and there["residual"] <= there["tolerance"])
+            check("  and both land on the same place on the triangle",
+                  np.allclose(here["bary"], there["bary"], atol=1e-4),
+                  "%s vs %s" % (here["bary"], there["bary"]))
+            mapped = rotation @ here["point"] + offset
+            check("  the transformed answer IS the answer transformed",
+                  float(np.linalg.norm(mapped - there["point"]))
+                  <= there["tolerance"] * 2.0,
+                  "%.3e vs tol %.3e"
+                  % (float(np.linalg.norm(mapped - there["point"])),
+                     there["tolerance"]))
+
+
+def test_the_triangle_is_never_reconsidered():
+    print("\n[hit] no neighbour search, no vertex snap, no other face")
+    source = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "body_surface_measurement", "geodesic", "surface_point.py")).read()
+    body = source.split("def locate_hit")[1].split("\ndef ")[0]
+    # Strip the docstring: it SAYS "no neighbour is searched", which is the
+    # claim, not a violation of it.
+    code = body.split('"""')[-1]
+    for forbidden in ("find_nearest", "neighbour", "neighbor", "argmin",
+                      "argmax", "for triangle", "triangles[", "vertices["):
+        check("locate_hit never uses %s" % forbidden, forbidden not in code)
+
+    cache = open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "body_surface_measurement", "geodesic", "meshcache.py")).read()
+    caster = cache.split("def ray_cast_local")[1].split("\ndef ")[0]
+    check("ray_cast_local still uses the BVH's own triangle index",
+          "triangle_index = int(hit[2])" in caster)
+    check("  and never looks for another",
+          "find_nearest" not in caster)
+    check("  and refuses rather than substituting",
+          'if not seated["ok"]:' in caster and "return None" in caster)
+
+    # An interior hit must come back exactly as it went in - the projection
+    # and clamp are no-ops there, not a quiet nudge.
+    exact = point_at(AWKWARD, (0.3, 0.35, 0.35))
+    result = sp.locate_hit(AWKWARD, exact)
+    check("an interior hit is not moved at all",
+          float(np.linalg.norm(result["point"] - exact)) < 1e-15,
+          float(np.linalg.norm(result["point"] - exact)))
+    check("  and its coordinates are the plain barycentric ones",
+          np.allclose(result["bary"], (0.3, 0.35, 0.35), atol=1e-12),
+          result["bary"])
+
+
+def test_stored_point_validation_is_unchanged():
+    print("\n[hit] the STORED-point check stays exactly as strict")
+    check("SUM_TOLERANCE is untouched", sp.SUM_TOLERANCE == 1e-6)
+    _c, ok, _d = sp.normalize_barycentric((0.5, 0.5, 0.0))
+    check("a clean triple is still accepted", ok)
+    _c, ok, deviation = sp.normalize_barycentric((0.5, 0.5, 0.1))
+    check("a triple that does not sum to 1 is still refused", not ok, deviation)
+    _c, ok, _d = sp.normalize_barycentric((-0.01, 0.5, 0.51))
+    check("a negative coordinate is still refused", not ok)
+    _c, ok, _d = sp.normalize_barycentric((np.nan, 0.5, 0.5))
+    check("a non-finite triple is still refused", not ok)
+
+    # And what locate_hit produces always passes it, including after the
+    # float32 round trip a stored SurfacePoint goes through.
+    for bary in ((0.3, 0.35, 0.35), (0.0, 0.5, 0.5), (1.0, 0.0, 0.0),
+                 (1e-9, 1 - 2e-9, 1e-9)):
+        result = sp.locate_hit(
+            AWKWARD, as_float32(point_at(AWKWARD, bary)))
+        stored = np.asarray(np.asarray(result["bary"], dtype=np.float32),
+                            dtype=np.float64)
+        _c, ok, deviation = sp.normalize_barycentric(stored)
+        check("what locate_hit produces survives float32 storage %s"
+              % (bary,), ok, "deviation %.3e" % deviation)
+
+
 def main():
     print("BSMT Milestone 2.1 - SurfacePoint tests (no Blender)")
     for test in (
@@ -411,6 +719,14 @@ def main():
         test_insert_mixed_and_degenerate_cases,
         test_insertion_preserves_components,
         test_reconstruction_tolerance_grid,
+        test_hit_on_a_triangle,
+        test_the_reproduced_failure,
+        test_the_old_rule_was_blind_off_the_plane,
+        test_genuinely_invalid_points_are_still_refused,
+        test_tolerance_is_scale_aware,
+        test_transformed_object,
+        test_the_triangle_is_never_reconsidered,
+        test_stored_point_validation_is_unchanged,
     ):
         test()
 

@@ -3040,6 +3040,118 @@ clean with 0 tracebacks.
 
 ---
 
+## 11p. Milestone 3.12 — Picking robustness (v0.18.1, 2026-09-02)
+
+§11o.8 recorded a rare pick failure: a click that reports nothing hit. Investigating it found that
+the rule deciding whether a BVH hit belongs to its triangle was measuring the wrong quantity, and
+was wrong in **both** directions at once.
+
+### 11p.1 What the failure actually was
+
+Not what the symptom suggested. `barycentric()` computes `u = 1 - v - w`, so the sum is 1 by
+construction and the "sum tolerance" was never what rejected anything. The rejected quantity was a
+**negative coordinate**: the hit lay a fraction *outside* the triangle the BVH named, because the
+true intersection was on a shared edge and float32 put the reported point on the other side of it.
+
+Measured on a decimated body scan, ray along exactly `(1, 0, 0)` from 5 units away:
+
+| Quantity | Value |
+|---|---|
+| barycentric sum error | **0.0** |
+| barycentric excursion outside [0,1] | 3.67e-06 — over the 1e-6 limit, so refused |
+| **geometric distance from the triangle** | **5.83e-08 units = 58 nanometres** |
+| that distance in float32 ulps of the ray | **0.20 ulp** |
+
+The pick was refused for being one fifth of a float32 ulp out of place.
+
+The reason the ratio looked large is that a barycentric coordinate **is** a ratio: the triangle's
+smallest altitude was 15.9 mm, so 58 nm of displacement is 3.7e-6 of it. A fixed barycentric
+tolerance means a different physical distance on every face in the mesh.
+
+### 11p.2 The old rule was blind in the other direction
+
+`barycentric()` orthogonally **projects** onto the triangle plane before solving. So a point a
+kilometre off the surface, whose projection lands inside the triangle, produced perfectly clean
+coordinates and passed. Verified, and now a test:
+
+| Off-plane distance | Old rule | New rule |
+|---|---|---|
+| 1e-06 | accepted | refused |
+| 1e-03 | accepted | refused |
+| 1.0 | accepted | refused |
+| 1000.0 | **accepted** | refused |
+
+So this milestone does not loosen a tolerance. It **replaces a rule that measured the wrong thing**
+with one that is stricter off the plane and looser only within float32 noise in it.
+
+### 11p.3 The rule
+
+`surface_point.locate_hit()` projects the hit onto the plane of the triangle the BVH reported,
+recomputes the barycentric coordinates there, clamps them into the simplex, and accepts only when
+**both** are within tolerance:
+
+- `|off_plane|` — the hit really lies on this triangle's plane;
+- `residual` — the distance seating the point actually moves it, measured as
+  `|reconstruct(clamped) - projected|`. Clamp-and-renormalise is not exactly the nearest point in
+  the triangle, so this is an *upper bound* on the true distance: it can only refuse a point the
+  exact distance would have accepted.
+
+Accepting returns a valid convex combination — sum exactly 1, every coordinate in [0,1] — and the
+stored XYZ is the reconstruction of those coordinates, so `triangle + barycentric` and the reported
+position describe the same point by construction rather than to within the hit's noise.
+
+**The triangle index is never reconsidered.** No neighbour search, no vertex snap, no substituted
+face — asserted by a test that reads the function body. Either the hit seats on its own triangle
+within float32 noise, or it is refused.
+
+### 11p.4 The tolerance, derived
+
+    tolerance = HIT_TOLERANCE_ULPS x FLOAT32_EPS x scale
+    scale     = max(|corners|inf, |hit|inf, |ray origin|inf)
+
+`FLOAT32_EPS = 2**-24` is the real relative spacing of float32, which is what a mathutils Vector —
+and therefore every BVH hit — carries. The **ray's own magnitude counts**: a hit is computed as
+`origin + t*direction`, so a ray cast from far away is intrinsically less precise, and the
+tolerance follows it honestly rather than pretending otherwise.
+
+`HIT_TOLERANCE_ULPS = 16` is measured, not chosen. Over 4000 random rays against a decimated body
+scan the largest off-plane distance of a legitimate hit was **4.5 ulp** (p99.9 = 4.2) and the
+largest in-plane displacement needed to seat one was **0.2 ulp**. Sixteen leaves roughly 3.5x
+margin over the worst observed case while staying a minuscule absolute distance: on a scan in
+millimetres with coordinates to 2000, it is **0.002 mm**. Nothing anthropometric is defined to two
+microns, and nothing genuinely on another face is within it.
+
+`SUM_TOLERANCE` is untouched. It now guards only STORED points — a hand-written or corrupted
+SurfacePoint — and stays strict. Everything `locate_hit` produces passes it, including after the
+float32 round trip a stored SurfacePoint goes through.
+
+### 11p.5 Verified in Blender 4.5.13
+
+42 checks, 0 failures.
+
+| Case | Result |
+|---|---|
+| The known failing click | **succeeds**, on the BVH's own triangle, moved 6.9e-07 units |
+| 48 axis-aligned rays x 4 distances (1.5 to 500) | every BVH hit accepted |
+| 8000 random rays | 0 refused, 0 triangles substituted, reconstruction exact |
+| Worst displacement | 1.42e-06, inside the derived 4.77e-06 bound |
+| Translated / rotated / both / uniformly scaled | 600 rays each, none refused, world position exact |
+| Millimetre-scale scanner coordinates (mesh at 1200, -450, 1700) | 212 hits, none refused; tolerance 0.005 mm |
+| 1 mm, 0.1 mm and **1 um** off the plane | all refused |
+| 1 mm beside the triangle, NaN | refused |
+| Full path through `pick_landmark` | stored point passes the strict stored-point check |
+
+The Milestone 3.11 export acceptance now picks its "Waist" landmark on exactly `(1, 0, 0)` — the
+ray it previously had to dodge — through the production picking path.
+
+Offline: `tests/test_surface_point.py` grows to 312 checks, covering triangle interior, near edge,
+exactly on edge, near vertex, exactly on vertex, the reproduced failure, six random rigid
+transforms, and millimetre-scale scanner coordinates, each also after float32 rounding. Full
+regression **2,091 checks across thirteen suites**, 2,201 with pygeodesic staged, 0 failures. All
+sixteen Blender acceptance scripts re-run clean.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

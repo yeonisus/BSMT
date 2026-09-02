@@ -29,7 +29,7 @@ from ..measurement import unit_multiplier
 from ..visualization import HELPER_FLAG
 from .extract import ExtractionError, extract_solver_mesh
 from .spaces import metric_key, to_solver_space
-from .surface_point import barycentric, normalize_barycentric, reconstruct
+from .surface_point import barycentric, locate_hit, reconstruct
 from .topology import analyse, component_labels
 
 _CACHE = {}
@@ -318,13 +318,24 @@ def ray_cast_local(canonical, matrix_world, origin_world, direction_world):
     if not 0 <= triangle_index < canonical.triangle_count:
         return None
 
-    bary = canonical.barycentric_local(triangle_index, location_local)
-    bary, ok, _deviation = normalize_barycentric(bary)
-    if not ok:
+    # Milestone 3.12: the BVH hit is a float32 point, so it lies a few ulps
+    # off the plane of the triangle the BVH named - and when the true
+    # intersection is on a shared edge, a few ulps OUTSIDE it. locate_hit
+    # projects it onto that triangle's own plane and seats it, refusing
+    # anything that would have to move further than float32 noise. The
+    # triangle index is never reconsidered: it is the BVH's answer.
+    seated = locate_hit(canonical.triangle_corners_local(triangle_index),
+                        location_local,
+                        ray_scale=float(np.abs(origin_local).max()))
+    if not seated["ok"]:
         return None
 
+    # The stored position is the reconstruction of the accepted coordinates,
+    # so triangle + barycentric and the reported XYZ describe the same point
+    # by construction rather than to within the hit's noise.
+    location_local = seated["point"]
     location_world = linear @ location_local + translation
-    return triangle_index, location_local, location_world, bary
+    return triangle_index, location_local, location_world, seated["bary"]
 
 
 # ---------------------------------------------------------------------------
