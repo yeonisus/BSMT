@@ -325,6 +325,102 @@ negative triangle indices, index-degenerate triangle, out-of-range source and ta
 1-point polyline each raise a typed `InvalidMeshError` with a specific message; `source == target`
 returns exactly `0.0` with no solver call. No case returns a substitute number.
 
+### 5.1b Query-mode investigation — Milestone 2.3 preparation (2026-09-02)
+
+Question: can one-to-all computation materially reduce runtime for repeated landmark measurements
+on a ~314k-triangle body scan? Source: `tools/benchmark_geodesic_modes.py`, run under
+`Blender --background` on Blender 4.5.13 / Python 3.11.15 / numpy 1.26.4 / arm64, pygeodesic
+0.1.11. Two meshes: the 327,680-triangle icosphere of §5.1a, and a body-proportioned cylinder
+(R = 150 mm, H = 1710 mm — the reference scan's height) of 313,880 triangles, 157,235 vertices.
+The real scan was not loaded.
+
+**Measured, three targets from one source**
+
+| | icosphere, 327,680 tri | body cylinder, 313,880 tri |
+|---|---|---|
+| Solver construction | 0.142 s | 0.098 s |
+| **A** pairwise ×3 (`geodesicDistance`, returns paths) | 17.96 + 19.25 + 17.82 = **55.03 s** | 26.29 + 25.57 + 26.49 = **78.35 s** |
+| **B1** one-to-all (`geodesicDistances`, all vertices, no path) | **19.07 s** (−65 % vs A) | **28.77 s** (−63 % vs A) |
+| **B2** one-to-many with stop points (no path) | **17.07 s** (−69 % vs A) | **25.00 s** (−68 % vs A) |
+| Lookup per target from the field | 2–7 × 10⁻⁷ s | 2–4 × 10⁻⁷ s |
+| Distance field memory | 1.3 MB | 1.2 MB |
+| Peak RSS | 1 818 → 1 828 MB | 1 949 → 1 950 MB |
+| Worst \|B1 − A\| over the three targets | 2.8e-14 mm | 3.9e-12 mm |
+
+Numerical agreement is exact to floating-point: the one-to-all field and the one-to-many subset
+reproduce the pairwise distances to ≤ 3.9e-12 mm, i.e. ≤ 2.8e-15 relative.
+
+**Finding 1 — the unbounded cost is independent of how far the target is.**
+On the cylinder a 170 mm target cost 26.3 s and a 1366 mm target cost 26.5 s. That is not what
+early termination should look like, and the cause is in the Kirsanov source:
+
+```cpp
+// geodesic_algorithm_exact.h — check_stop_conditions()
+double queue_distance = (*m_queue.begin())->min();
+if (queue_distance < stop_distance()) return false;      // stop_distance() == m_max_propagation_distance
+while (index < m_stop_vertices.size()) { /* per-stop-vertex check */ }
+```
+
+`geodesicDistance` hardcodes `max_propagation_distance = GEODESIC_INF`, and `geodesicDistances`
+defaults to it. `queue_distance < INF` is therefore always true and the function returns **before
+the stop-vertex loop is ever reached**. Stop points are inert on their own. Every unbounded call,
+pairwise or not, performs a full mesh propagation.
+
+This also explains B1 vs B2: they do the same propagation, and the ~2–4 s difference is only the
+per-vertex `best_source` readout over 157k–164k vertices.
+
+**Finding 2 — a finite `max_distance` re-enables correct early termination, and the effect is
+large.** Bounded queries on the body cylinder, verified against the unbounded reference:
+
+| Target | d_true | Unbounded | Bounded (1.05 × d) | Speed-up | Result |
+|---|---|---|---|---|---|
+| near, same meridian | 170.36 mm | 28.62 s | **0.125 s** | **229×** | exact |
+| mid, quarter turn | 641.74 mm | 29.42 s | **4.25 s** | **6.9×** | exact |
+| far, half turn | 1365.78 mm | 27.16 s | 25.23 s | 1.1× | exact |
+
+All 18 tested (target, k) combinations with k ∈ {0.5, 0.9, 1.001, 1.05, 1.25, 2.0} returned the
+**exact** unbounded distance. Notably k = 0.5 — a bound *below* the true distance — was still
+exact, because the stop-vertex loop refuses to stop until every stop vertex is settled.
+`max_distance` therefore acts as a *minimum* sweep radius, not as a truncation of the answer.
+Beyond the mesh diameter (≈1610 mm here) the bound stops mattering and the cost is a full sweep;
+the 39.5 s reading at k = 1.25 against 27.7 s at k = 2.0 is run-to-run noise at that plateau, not
+a real effect.
+
+**This behaviour is undocumented**, so BSMT must not rely on the k < 1 case being safe. The
+defensible pattern is to pass a bound that is a genuine upper estimate and to verify the result:
+start at ~1.1 × the straight-line distance (the straight distance is a valid *lower* bound on the
+geodesic), and if `inf` comes back — meaning the target was not covered — enlarge and retry. That
+loop was measured and needed exactly one attempt for all three targets (0.158 s / 4.587 s /
+21.431 s), because each failed attempt is itself cheap.
+
+**Finding 3 — a path is not obtainable from a field solve.**
+`geodesicDistances` returns `(distances, best_source)`; neither is a polyline. `trace_back` is
+declared in the Cython `extern` block of `geodesic.pyx` but **no Python method exposes it**, so
+the propagation state that would make a cheap trace-back possible is unreachable from Python. A
+polyline for an arbitrary target therefore requires a separate `geodesicDistance` call, which
+re-propagates from scratch: measured at 18.05 s immediately after the icosphere field solve
+against 17.82 s cold (1.01×), and 26.78 s against 26.49 s on the cylinder (1.01×). **Solver state
+is not reused between calls.** And because `geodesicDistance` hardcodes `GEODESIC_INF`, a path
+query cannot be bounded at all — it is always full-sweep cost.
+
+**Conclusion for Milestone 2.3.** One-to-all is *not* the answer for this workflow. It costs a
+full sweep per source, so with several landmark *pairs* — each a different source — it saves
+nothing over one bounded query per pair, and it cannot produce a path. The lever is bounding, not
+batching:
+
+| Need | Call | Cost at scan scale |
+|---|---|---|
+| Distance A→B | `geodesicDistances([A], [B], max_distance)` | 0.1–4 s for realistic landmark separations |
+| Path A→B | `geodesicDistance(A, B)` | ~26 s, unavoidable with the stock wheel |
+
+One-to-all keeps a legitimate future role — Phase 3 landmark fields (§12.4), where one source is
+genuinely queried against many targets — but not in 2.3.
+
+A future option, recorded but not taken: `trace_back` already exists on the C++ object, so
+exposing it would make a bounded path query possible. That means building pygeodesic from source
+and vendoring it, which trades the current one-line pip install for a build toolchain. It is only
+worth revisiting if path visualisation proves too slow in practice.
+
 ### 5.2 No approximate production fallback in Phase 2
 
 If the exact backend is unavailable, fails, or the problem is ill-posed, BSMT returns a
@@ -1068,14 +1164,31 @@ the query, not the setup, and it is not amortised by reuse.
 
 ### Milestone 2.3 — Exact A–B surface distance
 
-**Create:** `geodesic/registry.py`, `geodesic/backends/__init__.py`, `geodesic/backends/exact_mmp.py`
-**Change:** `state.py` (surface distance, failure state, provenance), `operators.py`
-(`bsmt.calculate_surface_distance`), `panels.py` (result + provenance display),
+**Create:** `geodesic/registry.py`
+**Change:** `geodesic/backends/exact_mmp.py` (add a bounded distance query; the module itself
+already exists from 2.2), `state.py` (surface distance, failure state, provenance),
+`operators.py` (`bsmt.calculate_surface_distance`), `panels.py` (result + provenance display),
 `measurement.py` (surface distance unit conversion and formatting)
+
+**Query strategy, decided by measurement (§5.1b) — bounded pairwise, not one-to-all.**
+The distance comes from `geodesicDistances([A], [B], max_distance=bound)` with a *finite* bound,
+because an unbounded call sweeps the whole mesh regardless of how close B is. The bound starts at
+~1.1 × the straight-line A–B distance and is enlarged and retried if the call returns `inf`;
+each failed attempt is cheap, and one attempt sufficed in every measured case. The returned value
+must be asserted finite and ≥ the straight distance before it is displayed. One-to-all is
+explicitly *not* used: it costs a full sweep per source and returns no path.
+
+The path polyline is **not** fetched here. It requires `geodesicDistance`, which cannot be bounded
+and costs ~26 s at scan scale, so it belongs to Milestone 2.4 behind an explicit request with
+progress feedback — never as a side effect of measuring a distance.
 
 **Success criteria**
 - Plane: surface distance equals Euclidean to ~1e-9 relative, on three different triangulations.
 - Same-triangle picks: surface distance == straight distance exactly (analytic short-circuit).
+- **The bounded query returns the same value as an unbounded one on every test mesh**, and an
+  `inf` result triggers an enlarge-and-retry rather than being reported as a distance.
+- **A near landmark pair on a scan-sized mesh completes in seconds, not tens of seconds** (§5.1b
+  measured 0.13 s at 170 mm separation on a 313,880-triangle body-proportioned mesh).
 - `d_surface ≥ d_straight` holds on every test; a violation raises rather than displays.
 - Disconnected components produce `DISCONNECTED` with component sizes and **no number**.
 - Backend absent produces `BACKEND_MISSING`; the add-on still loads and Phase 1 still works.
@@ -1083,6 +1196,11 @@ the query, not the setup, and it is not amortised by reuse.
 - No backend exception can reach the user as a Blender traceback.
 
 **Failure modes**
+- **Leaving `max_distance` at its `GEODESIC_INF` default**, which silently disables the
+  stop-vertex check and makes every query a full mesh sweep (§5.1b). This is the difference
+  between 0.13 s and 28.6 s and it produces no error, only slowness.
+- **Relying on the undocumented safety of a bound below the true distance.** Measured as exact,
+  but not documented behaviour; the enlarge-and-retry loop must exist regardless.
 - Index off-by-one between inserted vertices and the array handed to the backend.
 - MMP behaviour on meshes with boundaries or non-manifold edges not validated → wrong or hanging.
 - Long-running solve blocking the UI with no feedback.
@@ -1171,9 +1289,11 @@ the query, not the setup, and it is not amortised by reuse.
    for one-to-many queries, alongside — never replacing — the exact backend). **The §5.1a
    benchmark sharpens this: at 16.8 s per pair with no reuse benefit, an all-pairs workflow over
    more than a handful of landmarks is already unaffordable with the exact backend alone.**
-5. **New, from §5.1a:** whether `geodesicDistances` (one-to-all) amortises better than repeated
-   `geodesicDistance` calls. To be measured at the start of Milestone 2.3, before the operator
-   commits to a per-pair call.
+5. ~~**New, from §5.1a:** whether `geodesicDistances` (one-to-all) amortises better than repeated
+   `geodesicDistance` calls.~~ **Answered 2026-09-02 (§5.1b): no.** Every unbounded call is a full
+   mesh propagation, so one-to-all saves nothing across landmark *pairs* and yields no path. The
+   effective lever is a finite `max_distance` on `geodesicDistances`, which cuts a near-landmark
+   query from 28.6 s to 0.13 s while remaining exact.
 
 ---
 
