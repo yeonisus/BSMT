@@ -42,10 +42,20 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
 
         column = layout.column(align=True)
         column.operator("bsmt.calculate_distance", icon='ARROW_LEFTRIGHT')
+        column.operator("bsmt.calculate_surface_distance", icon='MOD_SIMPLIFY')
         column.operator("bsmt.clear_points", icon='TRASH')
 
         self._draw_surface_debug(layout, props)
+        self._draw_results(context, layout, props)
 
+    @staticmethod
+    def _draw_results(context, layout, props):
+        """Straight and surface distance, plus a compact query status.
+
+        The surface result is checked against the live canonical mesh before
+        it is shown. A distance computed under different geometry or a
+        different metric is never displayed as current (sect. 5.2, 6.5).
+        """
         box = layout.box()
         if props.distance_valid:
             box.label(
@@ -53,6 +63,72 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
             )
         else:
             box.label(text="Straight Distance: --")
+
+        problem = ""
+        if props.surface_valid:
+            canonical = None
+            matrix = None
+            meshcache = getattr(geodesic, "meshcache", None)
+            if meshcache is not None and props.surface_object:
+                # peek() never builds, so it is safe inside draw().
+                canonical = meshcache.peek(props.surface_object)
+                obj = bpy.data.objects.get(props.surface_object)
+                if obj is not None:
+                    matrix = obj.matrix_world
+            problem = state.surface_result_problem(props, canonical, matrix)
+
+        if props.surface_valid and not problem:
+            box.label(
+                text="Surface Distance:  %s"
+                % measurement.format_mm(props.surface_distance_mm)
+            )
+            box.label(text="Surface / Straight: %.3f" % props.surface_ratio)
+            status = box.column(align=True)
+            status.scale_y = 0.7
+            status.label(text=props.surface_backend_name or "Exact MMP")
+            if props.surface_mode == 'SOLVER':
+                status.label(
+                    text="Bound: %s"
+                    % ("unbounded fallback" if props.surface_unbounded_fallback
+                       else "%.2fx" % props.surface_bound_factor)
+                )
+                status.label(text="Attempts: %d" % props.surface_attempts)
+            else:
+                status.label(text="Analytic: %s" % props.surface_mode)
+            status.label(text="Elapsed: %.2f s" % props.surface_seconds)
+        elif props.surface_valid and problem:
+            column = box.column(align=True)
+            column.scale_y = 0.7
+            column.label(text="Surface Distance:  recompute required", icon='ERROR')
+            for line in _wrap(problem, 44):
+                column.label(text="   " + line)
+        elif props.surface_status:
+            column = box.column(align=True)
+            column.scale_y = 0.7
+            for line in _wrap(props.surface_status, 44):
+                column.label(text=line)
+        else:
+            box.label(text="Surface Distance:  --")
+
+        if props.surface_valid or props.surface_status:
+            box.operator("bsmt.clear_surface_distance", text="", icon='X')
+
+        if props.surface_valid and props.surface_provenance:
+            header = layout.row(align=True)
+            header.prop(
+                props,
+                "show_surface_provenance",
+                icon='TRIA_DOWN' if props.show_surface_provenance else 'TRIA_RIGHT',
+                emboss=False,
+            )
+            if props.show_surface_provenance:
+                column = layout.box().column(align=True)
+                column.scale_y = 0.7
+                for line in props.surface_provenance.split("\n"):
+                    if line.strip():
+                        column.label(text=line)
+                    else:
+                        column.separator()
 
     @staticmethod
     def _draw_surface_debug(layout, props):

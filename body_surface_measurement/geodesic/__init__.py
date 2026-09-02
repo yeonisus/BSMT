@@ -9,7 +9,9 @@ Module layout, per PROJECT_SPEC.md sect. 11:
     topology.py  pure numpy - mesh analysis
     extract.py   requires bpy - evaluated mesh extraction
     envreport.py stdlib - runtime environment detection (2.2)
-    backends/    pure numpy - geodesic solver backends (2.2, dev only)
+    backends/    pure numpy - geodesic solver backends (2.2)
+    registry.py  pure numpy - backend selection, bounded query, provenance (2.3)
+    solve.py     pure numpy - production A-B surface distance pipeline (2.3)
 
 spaces and topology import outside Blender and are unit tested there.
 extract imports bpy and is expected to import only inside Blender.
@@ -71,6 +73,13 @@ BACKENDS_AVAILABLE = False
 BACKENDS_IMPORT_ERROR = ""
 BACKENDS_IMPORT_TRACEBACK = ""
 
+# registry + solve: Milestone 2.3 production surface distance. Pure numpy.
+# They import the backends package, which guards pygeodesic itself, so they
+# load whether or not an exact backend is installed.
+MEASURE_AVAILABLE = False
+MEASURE_IMPORT_ERROR = ""
+MEASURE_IMPORT_TRACEBACK = ""
+
 spaces = None
 topology = None
 surface_point = None
@@ -79,6 +88,8 @@ meshcache = None
 preview = None
 envreport = None
 backends = None
+registry = None
+solve = None
 
 
 def _describe(exc):
@@ -237,13 +248,39 @@ def _load_backends():
     return True
 
 
+def _load_measure():
+    """Import registry + solve (Milestone 2.3). Returns True on success."""
+    global registry, solve
+    global MEASURE_AVAILABLE, MEASURE_IMPORT_ERROR, MEASURE_IMPORT_TRACEBACK
+
+    try:
+        registry = importlib.import_module(".registry", __name__)
+        solve = importlib.import_module(".solve", __name__)
+    except Exception as exc:
+        registry = None
+        solve = None
+        MEASURE_AVAILABLE = False
+        MEASURE_IMPORT_ERROR = _describe(exc)
+        MEASURE_IMPORT_TRACEBACK = traceback.format_exc()
+        print("[BSMT] failed to import surface distance modules: %s"
+              % MEASURE_IMPORT_ERROR)
+        print(MEASURE_IMPORT_TRACEBACK)
+        return False
+
+    MEASURE_AVAILABLE = True
+    MEASURE_IMPORT_ERROR = ""
+    MEASURE_IMPORT_TRACEBACK = ""
+    return True
+
+
 if NUMPY_AVAILABLE:
     # extract depends on spaces, so it is only attempted once analysis loads.
     if _load_analysis():
         if _load_extract():
             _load_meshcache()
         _load_preview()
-        _load_backends()
+        if _load_backends():
+            _load_measure()
 
 # envreport needs neither numpy nor bpy: it must work precisely when they are
 # the thing that is broken.
@@ -275,6 +312,10 @@ def ensure_loaded():
             _load_backends()
         elif backends is not None:
             backends.ensure_loaded()
+        if BACKENDS_AVAILABLE and (
+            not MEASURE_AVAILABLE or registry is None or solve is None
+        ):
+            _load_measure()
     if not ENVREPORT_AVAILABLE or envreport is None:
         _load_envreport()
     return diagnostics_error()
@@ -367,6 +408,9 @@ def reload_submodules():
     if backends is not None:
         importlib.reload(backends)
         backends.reload_submodules()
+    for module in (registry, solve):
+        if module is not None:
+            importlib.reload(module)
 
 
 def environment_error():
@@ -427,3 +471,18 @@ def backend_import_traceback():
     if backends is None:
         return ""
     return backends.status().get("import_traceback", "")
+
+
+def measure_error():
+    """Why surface distance measurement is unavailable, or ''.
+
+    Distinguishes a broken BSMT module from a missing pygeodesic: the first is
+    a bug, the second is the expected state on a machine without the backend,
+    and only the second leaves Phase 1 fully usable.
+    """
+    if not MEASURE_AVAILABLE or registry is None or solve is None:
+        return (
+            "Surface distance unavailable: failed to import the measurement "
+            "modules: %s" % (MEASURE_IMPORT_ERROR or "not loaded")
+        )
+    return ""

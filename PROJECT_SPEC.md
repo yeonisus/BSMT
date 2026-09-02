@@ -5,9 +5,9 @@
 **Date:** 2026-09-02
 **Target environment:** Blender 4.5.13 LTS, macOS 26.5 (Apple Silicon, arm64),
 bundled Python 3.11.15, numpy 1.26.4 — **all detected at runtime, 2026-09-02** (§5.1a)
-**Status:** Phase 1 complete and validated on a real human-body scan. Milestones 2.0, 2.0a and
-2.1 implemented and validated in Blender. Milestone 2.2 implemented; its in-Blender proof is
-recorded in §5.1a.
+**Status:** Phase 1 complete and validated on a real human-body scan. Milestones 2.0, 2.0a,
+2.1, 2.2 and **2.3** implemented and validated in Blender. Real-scan acceptance testing of 2.3
+(§11, Milestone 2.3) is outstanding.
 
 > Note on this document's history: no `PROJECT_SPEC.md` existed in the project before this
 > revision. Phase 1 was specified conversationally and implemented from that specification.
@@ -23,7 +23,7 @@ on textured OBJ human-body scans.
 | Phase | Content | Status |
 |---|---|---|
 | 1 | Straight-line (Euclidean) distance between two ray-cast surface points | **Done** (v0.2.0) |
-| 2 | Surface (geodesic) distance between the same two points | **This document.** Milestones 2.0, 2.0a, 2.1, 2.1a, **2.2 done** (v0.6.0); 2.3–2.6 outstanding |
+| 2 | Surface (geodesic) distance between the same two points | **This document.** Milestones 2.0, 2.0a, 2.1, 2.1a, 2.2, **2.3 done** (v0.7.0); 2.4–2.6 outstanding |
 | 3+ | Preprocessing, landmark templates, automatic landmark detection, export, batch measurement | Not designed |
 | Future | Anatomical scan alignment (§13) | Requirement recorded, not designed |
 
@@ -1206,6 +1206,99 @@ progress feedback — never as a side effect of measuring a distance.
 - Long-running solve blocking the UI with no feedback.
 - Unit conversion applied twice (mesh already scaled to world, then multiplied again).
 - Failure state left stale from a previous query and displayed next to a fresh straight distance.
+
+### Milestone 2.3a — as implemented (2026-09-02)
+
+**Created:** `geodesic/registry.py` (backend selection, the expanding-bound query strategy,
+provenance), `geodesic/solve.py` (the production pipeline, pure numpy),
+`tests/test_surface_distance.py`
+**Changed:** `geodesic/backends/exact_mmp.py` (`bounded_distances`, `bounded_distance`,
+`unbounded_distance`), `geodesic/__init__.py` (guarded loader, `measure_error()`),
+`state.py`, `operators.py`, `panels.py`, `__init__.py` (0.7.0), `tests/test_import.py`
+**Not touched:** `surface_point.py`, `meshcache.py`, `topology.py`, `spaces.py`, `extract.py`,
+`preview.py`, `picking.py`, `attach.py`, `visualization.py`, `measurement.py`,
+`backends/selftest.py`. **The SurfacePoint representation and the canonical triangle indexing
+are unchanged**, and `insert_points()` is used exactly as validated in Milestone 2.1.
+
+**Pipeline.** `bsmt.calculate_surface_distance` reads the two production SurfacePoints and
+hands their canonical locations to `solve.surface_distance()`, which validates → confirms one
+source object → confirms one geometry hash → confirms one component → short-circuits the
+analytic cases → builds a scratch mesh with both endpoints inserted → runs the bounded exact
+query → checks the invariants → returns millimetres. The canonical mesh is never modified; the
+solve runs on `canonical.vertices_solver`, which is already physical millimetres (§6.2), so the
+backend result is stored unmodified and no unit conversion is applied to it anywhere.
+
+**No path is computed.** A polyline needs an unbounded query (§5.1b), so it is deferred to
+Milestone 2.4 and cannot occur as a side effect of measuring.
+
+**Two findings from implementing it**
+
+1. **A too-small bound is exact, not short.** The expanding sequence 1.25× → 2× → 4× → 8× →
+   unbounded is implemented as specified, but measurement shows the first factor *always*
+   succeeds for a reachable pair. pygeodesic's stop-vertex loop keeps propagating until the
+   target is settled, so `max_distance` only ever adds sweeping; bounds of 1e-6×, 0.1×, 0.5×
+   and 0.9× the straight distance all returned the exact unbounded answer. `inf` therefore
+   means *genuinely unreachable*, never *bound too small*.
+
+   The sequence is consequently **defensive insurance, not everyday machinery**: it costs one
+   comparison per measurement and would be what saves the result if a future pygeodesic adopted
+   truncating stop semantics. Because it cannot be exercised against the real library, its
+   retry and fallback logic is tested against a stub with those semantics.
+
+   A smaller bound would be measurably faster (0.117 s vs 0.204 s at 170 mm, §5.1b) but would
+   rest entirely on undocumented behaviour. The specified sequence is the defensible choice.
+
+2. **`Object.matrix_world` is single precision, and that sets the metric tolerance.**
+   For a pure rotation R, `LᵀL` differs from the identity by ~3.6e-8 relative — not the ~1e-16
+   a float64 matrix would give. The first implementation compared metric tensors at 1e-9 and
+   therefore reported **every rotation as a scale change**, invalidating a surface distance that
+   §6.3 requires to stay valid. Caught by the in-Blender transform check, not by the offline
+   tests, which use float64 matrices and could never have seen it.
+
+   `state.METRIC_RELATIVE_TOLERANCE` is now 1e-6, justified by measurement: the float32 noise
+   floor is ~5e-8 while a 1.0001× uniform scale moves the tensor by ~2e-4, so the tolerance sits
+   ~25× above the noise and ~200× below the smallest real signal. Regression tested with
+   float32-rounded rotations.
+
+   *Related observation, not acted on:* `spaces.metric_key` quantises at ~1e-9 (§6.4) and would
+   have the same float32 sensitivity, but it is only computed, stored and displayed — never
+   compared — so it causes no behaviour today. Invalidation is driven by the tensor comparison
+   above. If `metric_key` is ever used for a comparison, its quantisation must be revisited first.
+
+**Invalidation, verified in Blender 4.5.13 against §6.3**
+
+| Change to the scan | Stored surface distance |
+|---|---|
+| Translation | **stays valid** ✔ |
+| Rotation (non-axis-aligned) | **stays valid** ✔ |
+| Uniform scale ×2 | invalidated, "recompute" ✔ |
+| Non-uniform scale (2, 3, 0.5) | invalidated, "recompute" ✔ |
+| Scale restored to 1 | valid again ✔ |
+| Coordinate-unit change | cleared outright ✔ |
+| A or B re-picked | cleared outright ✔ |
+| Vertex moved (geometry edit) | cache cleared → "recompute"; after rebuild, "the mesh geometry changed"; a solve refuses `STALE_POINTS` and stores no number ✔ |
+
+**Result validated against an analytic reference.** UV sphere R = 100 mm, 3,968 triangles,
+two points ~90° apart: surface 156.938 mm vs great circle 157.095 mm, relative 1.0e-3 —
+representation error at that mesh resolution, converging as §5.1a measured. Straight 141.205 mm,
+ratio 1.111, one attempt at bound 1.25×, 0.017 s.
+
+**Success criteria** — met offline and in Blender; real-scan acceptance outstanding
+- Plane, three triangulations: surface == straight to 3.0e-16 relative. ✔
+- Same-triangle picks: exactly equal, no solver call. ✔
+- Same edge: matches the closed form. Same vertex from two triangles: exactly 0. ✔
+- `d_surface ≥ d_straight` on every test; a violation raises `INVARIANT_VIOLATION`. ✔
+- A→A is exactly 0.0; A→B == B→A to ≤ 2.2e-16 relative on plane, cylinder and icosphere. ✔
+- Disconnected components produce `DISCONNECTED` with component ids and **no number**. ✔
+- Backend absent produces `BACKEND_MISSING`; the add-on still loads and Phase 1 still works. ✔
+- Provenance is displayed in a collapsed sub-panel. ✔
+- No backend exception reaches the user as a Blender traceback. ✔
+- Bound expansion, retry and the unbounded fallback behave correctly under a stub. ✔
+
+**Outstanding: real-scan acceptance test on 21_M_3400E** (§10 of the milestone brief). Three
+landmark separations — short 50–200 mm, medium 300–700 mm, long 1000 mm+ — recording straight
+distance, surface distance, ratio, initial bound, bound used, attempt count and elapsed time.
+Runtimes are to be measured, not predicted.
 
 ### Milestone 2.4 — Exact path visualization
 

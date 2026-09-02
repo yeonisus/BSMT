@@ -293,6 +293,156 @@ class ExactSolver(object):
     def distance(self, source_index, target_index):
         return self.distance_and_path(source_index, target_index)[0]
 
+    # -- bounded distance query (Milestone 2.3 production path) ------------
+    #
+    # READ THIS BEFORE "SIMPLIFYING" ANY OF IT BACK TO geodesicDistance().
+    #
+    # Measured on Blender 4.5.13 / pygeodesic 0.1.11, 313,880-triangle
+    # body-proportioned mesh (PROJECT_SPEC.md sect. 5.1b):
+    #
+    #     geodesicDistance(A, B)                     ~26 s, ANY separation
+    #     geodesicDistances([A], [B], max_distance)   0.13 s at 170 mm
+    #                                                 4.25 s at 642 mm
+    #
+    # The reason is in the Kirsanov C++, geodesic_algorithm_exact.h:
+    #
+    #     bool check_stop_conditions(unsigned& index) {
+    #         double queue_distance = (*m_queue.begin())->min();
+    #         if (queue_distance < stop_distance()) return false;   // == max_distance
+    #         while (index < m_stop_vertices.size()) { ... }        // NEVER REACHED
+    #     }
+    #
+    # geodesicDistance hardcodes max_propagation_distance = GEODESIC_INF, and
+    # geodesicDistances defaults to it. `queue_distance < INF` is always true,
+    # so the function returns before it ever looks at the stop vertices: the
+    # stop-point mechanism is INERT and the algorithm sweeps the entire mesh
+    # no matter how close the target is.
+    #
+    # Passing any FINITE max_distance re-enables the stop-vertex loop, and
+    # that loop is what makes early termination safe - it refuses to stop
+    # until every stop vertex is settled. max_distance therefore behaves as a
+    # *minimum* sweep radius, not as a truncation of the answer.
+    #
+    # Two consequences that must not be lost:
+    #   1. Production distance measurement MUST go through this method, not
+    #      through geodesicDistance(). Switching back would silently multiply
+    #      a 0.13 s measurement by ~200 with no error message, only slowness.
+    #   2. This method returns NO PATH. A polyline needs geodesicDistance(),
+    #      which cannot be bounded. That is why path computation is deferred
+    #      to Milestone 2.4 and must never be a side effect of measuring.
+    #
+    # The result remains exact MMP. Verified against unbounded queries in 18
+    # (target, bound-factor) combinations with zero difference (sect. 5.1b).
+
+    def bounded_distances(self, target_indices, source_index, max_distance):
+        """Exact distances to `target_indices`, bounded by `max_distance`.
+
+        Returns a float64 array in target order. An entry is `inf` when that
+        target was not reached within the bound - a detectable, honest "not
+        covered", never a substituted number.
+
+        `max_distance` must be finite and positive; passing infinity here is
+        the defect described above and is refused rather than silently
+        accepted.
+        """
+        require()
+
+        try:
+            bound = float(max_distance)
+        except Exception as exc:  # noqa: BLE001
+            raise InvalidMeshError(
+                "max_distance is not a number: %s" % _describe(exc)
+            )
+        if not np.isfinite(bound):
+            raise InvalidMeshError(
+                "max_distance must be finite. An infinite bound disables "
+                "pygeodesic's stop-vertex check and forces a full mesh sweep; "
+                "see the comment above bounded_distances()."
+            )
+        if bound <= 0.0:
+            raise InvalidMeshError(
+                "max_distance must be positive, got %r" % bound
+            )
+
+        source = _check_index("source_index", source_index, self.vertex_count)
+        targets = np.asarray(target_indices)
+        if targets.ndim == 0:
+            targets = targets.reshape(1)
+        if targets.ndim != 1 or targets.size == 0:
+            raise InvalidMeshError(
+                "target_indices must be a non-empty 1-D sequence, got shape %r"
+                % (targets.shape,)
+            )
+        checked = np.array(
+            [_check_index("target_indices[%d]" % i, value, self.vertex_count)
+             for i, value in enumerate(targets)],
+            dtype=np.int32,
+        )
+
+        try:
+            distances, _best_source = self._algorithm.geodesicDistances(
+                np.asarray([source], dtype=np.int32), checked, bound
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SolverError(
+                "pygeodesic raised during geodesicDistances(source=%d, "
+                "%d target(s), max_distance=%r): %s"
+                % (source, checked.size, bound, _describe(exc))
+            )
+
+        if distances is None:
+            # geodesicDistances reports bad input by printing and returning
+            # (None, None). Indices were validated above, so reaching here
+            # means something this wrapper does not model.
+            raise SolverError(
+                "pygeodesic returned None from geodesicDistances; see the "
+                "system console for its own error message"
+            )
+
+        distances = np.asarray(distances, dtype=np.float64)
+        if distances.shape != (checked.size,):
+            raise SolverError(
+                "pygeodesic returned %r distances for %d target(s)"
+                % (distances.shape, checked.size)
+            )
+        if np.any(distances < 0.0):
+            raise SolverError("pygeodesic returned a negative distance")
+        if np.any(np.isnan(distances)):
+            raise SolverError("pygeodesic returned NaN")
+        return distances
+
+    def bounded_distance(self, source_index, target_index, max_distance):
+        """Exact distance to one target, or None when the bound did not reach it."""
+        value = float(
+            self.bounded_distances([target_index], source_index, max_distance)[0]
+        )
+        return None if not np.isfinite(value) else value
+
+    def unbounded_distance(self, source_index, target_index):
+        """Last-resort exact distance with no propagation bound.
+
+        Full mesh sweep - tens of seconds at scan scale. Only for the final
+        fallback of the expanding-bound strategy, never the normal path.
+        Returns None if the target is unreachable (different component).
+        """
+        require()
+        source = _check_index("source_index", source_index, self.vertex_count)
+        target = _check_index("target_index", target_index, self.vertex_count)
+        try:
+            distances, _best = self._algorithm.geodesicDistances(
+                np.asarray([source], dtype=np.int32),
+                np.asarray([target], dtype=np.int32),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SolverError(
+                "pygeodesic raised during the unbounded fallback: %s"
+                % _describe(exc)
+            )
+        if distances is None:
+            raise SolverError("pygeodesic returned None from the unbounded fallback")
+        value = float(np.asarray(distances, dtype=np.float64)[0])
+        return None if not np.isfinite(value) else value
+
 
 def orient_path(path, source_xyz, target_xyz):
     """Return the polyline ordered source -> target.

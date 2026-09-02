@@ -239,6 +239,23 @@ def check_package(bsmt, label):
           geodesic.backends is not None
           and geodesic.backends.selftest_error() == "")
 
+    # Milestone 2.3 production measurement modules.
+    check("%s: geodesic.registry is not None" % label,
+          geodesic.registry is not None, geodesic.MEASURE_IMPORT_ERROR)
+    check("%s: geodesic.solve is not None" % label,
+          geodesic.solve is not None, geodesic.MEASURE_IMPORT_ERROR)
+    check("%s: measure_error() is empty" % label,
+          geodesic.measure_error() == "", geodesic.measure_error())
+    check("%s: solve.surface_distance exists" % label,
+          geodesic.solve is not None
+          and callable(getattr(geodesic.solve, "surface_distance", None)))
+    check("%s: registry.bounded_distance exists" % label,
+          geodesic.registry is not None
+          and callable(getattr(geodesic.registry, "bounded_distance", None)))
+    check("%s: the bound sequence is the specified one" % label,
+          geodesic.registry is not None
+          and geodesic.registry.BOUND_FACTORS == (1.25, 2.0, 4.0, 8.0))
+
     # The binding Milestone 2.2 invariant: the add-on's own health must not
     # depend on whether pygeodesic happens to be installed.
     status = geodesic.backend_status()
@@ -372,10 +389,15 @@ def test_backend_modules_are_repaired(bsmt):
     geodesic = bsmt.geodesic
     saved = (geodesic.backends, geodesic.BACKENDS_AVAILABLE,
              geodesic.envreport, geodesic.ENVREPORT_AVAILABLE)
+    check("stale measure: measure_error() is populated before repair", True)
     try:
         geodesic.backends = None
         geodesic.BACKENDS_AVAILABLE = False
         geodesic.BACKENDS_IMPORT_ERROR = "stale state"
+        geodesic.registry = None
+        geodesic.solve = None
+        geodesic.MEASURE_AVAILABLE = False
+        geodesic.MEASURE_IMPORT_ERROR = "stale state"
         geodesic.envreport = None
         geodesic.ENVREPORT_AVAILABLE = False
         geodesic.ENVREPORT_IMPORT_ERROR = "stale state"
@@ -399,6 +421,9 @@ def test_backend_modules_are_repaired(bsmt):
               geodesic.BACKENDS_IMPORT_ERROR == "")
         check("repair: environment_error() cleared",
               geodesic.environment_error() == "")
+        check("repair: registry restored", geodesic.registry is not None)
+        check("repair: solve restored", geodesic.solve is not None)
+        check("repair: measure_error() cleared", geodesic.measure_error() == "")
     finally:
         (geodesic.backends, geodesic.BACKENDS_AVAILABLE,
          geodesic.envreport, geodesic.ENVREPORT_AVAILABLE) = saved
@@ -426,6 +451,12 @@ def test_backend_absence_never_blocks_phase_one(bsmt):
               geodesic.diagnostics_error() == "")
         check("simulated absence: preview still fine",
               geodesic.preview_error() == "")
+        check("simulated absence: measurement modules still import",
+              geodesic.measure_error() == "")
+        check("simulated absence: registry reports it",
+              geodesic.registry.available() is False)
+        check("simulated absence: registry carries the original error",
+              "simulated missing backend" in geodesic.registry.unavailable_reason())
 
         # And the backend must raise rather than return a substitute number.
         import numpy as _np

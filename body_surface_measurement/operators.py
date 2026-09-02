@@ -248,6 +248,292 @@ class BSMT_OT_calculate_distance(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class BSMT_OT_calculate_surface_distance(bpy.types.Operator):
+    """Exact geodesic (surface) distance between Point A and Point B.
+
+    Runs the MMP exact backend on a scratch mesh with both landmarks inserted
+    as real vertices. The scan and the canonical mesh are never modified. This
+    can block Blender for several seconds on a dense scan
+    """
+
+    bl_idname = "bsmt.calculate_surface_distance"
+    bl_label = "Calculate Surface Distance"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or props.surface_running:
+            return False
+        return bool(props.surface_a.valid and props.surface_b.valid)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is None:
+            self.report({'ERROR'}, "BSMT: add-on properties are not registered")
+            return {'CANCELLED'}
+
+        # Guard against a second solve starting while one is already running.
+        # The solve is a blocking C++ call, so a double-click during it would
+        # otherwise queue a second full propagation.
+        if props.surface_running:
+            self.report({'WARNING'}, "BSMT: a surface solve is already running")
+            return {'CANCELLED'}
+
+        unavailable = geodesic.ensure_loaded()
+        if unavailable:
+            state.set_surface_failure(props, "Surface distance unavailable: " + unavailable)
+            self.report({'ERROR'}, "BSMT: " + unavailable)
+            return {'CANCELLED'}
+
+        broken = geodesic.measure_error()
+        if broken:
+            state.set_surface_failure(props, broken)
+            self.report({'ERROR'}, "BSMT: " + broken)
+            return {'CANCELLED'}
+
+        solve = geodesic.solve
+        registry = geodesic.registry
+
+        point_a = props.surface_a
+        point_b = props.surface_b
+        if not (point_a.valid and point_b.valid):
+            message = solve.failure_message('POINTS_MISSING')
+            state.set_surface_failure(props, message)
+            self.report({'WARNING'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        if not registry.available():
+            message = solve.failure_message(
+                'BACKEND_MISSING', registry.unavailable_reason()
+            )
+            state.set_surface_failure(props, message)
+            print("[BSMT] " + message)
+            original = geodesic.backend_import_traceback()
+            if original:
+                print(original)
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        obj = bpy.data.objects.get(point_a.source_object)
+        if obj is None or obj.type != 'MESH':
+            message = solve.failure_message(
+                'STALE_POINTS',
+                "source object '%s' is missing" % point_a.source_object,
+            )
+            state.set_surface_failure(props, message)
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        props.surface_running = True
+        self._set_status(context, obj)
+        try:
+            return self._solve(context, props, obj, solve, registry)
+        finally:
+            props.surface_running = False
+            self._restore(context)
+
+    # -- internals ---------------------------------------------------------
+
+    def _solve(self, context, props, obj, solve, registry):
+        started = time.perf_counter()
+        try:
+            canonical = geodesic.meshcache.get(context, obj, props.unit)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            message = solve.failure_message(
+                'STALE_POINTS', "canonical mesh unavailable (%s)" % exc
+            )
+            state.set_surface_failure(props, message)
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        specs = []
+        for slot in ('A', 'B'):
+            point = state.surface_point(props, slot)
+            specs.append(solve.PointSpec(
+                point.triangle_index,
+                np.array(point.barycentric, dtype=np.float64),
+                component_id=point.component_id,
+                source_object=point.source_object,
+                geometry_hash=point.geometry_hash,
+                status=point.status,
+                valid=point.valid,
+            ))
+
+        try:
+            # Solver space is physical millimetres (sect. 6.2), so the value
+            # returned here IS millimetres. No unit multiplication is applied
+            # to it anywhere downstream; doing so twice is a named failure mode.
+            result = solve.surface_distance(
+                canonical.vertices_solver,
+                canonical.triangles,
+                specs[0],
+                specs[1],
+                geometry_hash=canonical.geometry_hash,
+            )
+        except solve.MeasurementError as exc:
+            state.set_surface_failure(props, exc.message)
+            print("[BSMT] %s" % exc.message)
+            self.report({'ERROR'}, "BSMT: " + exc.message)
+            return {'CANCELLED'}
+        except Exception as exc:                      # noqa: BLE001
+            # No backend exception may reach the user as a Blender traceback.
+            traceback.print_exc()
+            message = solve.failure_message(
+                'BACKEND_ERROR', "%s: %s" % (type(exc).__name__, exc)
+            )
+            state.set_surface_failure(props, message)
+            self.report({'ERROR'}, "BSMT: " + message + " - see the system console")
+            return {'CANCELLED'}
+
+        elapsed = time.perf_counter() - started
+        self._store(props, canonical, obj, result, registry, elapsed)
+
+        self.report(
+            {'INFO'},
+            "BSMT: surface distance = %s (straight %s, ratio %.4f) | %s"
+            % (
+                measurement.format_mm(result.distance_mm),
+                measurement.format_mm(result.straight_mm),
+                result.ratio,
+                result.summary(),
+            ),
+        )
+        return {'FINISHED'}
+
+    @staticmethod
+    def _store(props, canonical, obj, result, registry, elapsed):
+        props.surface_distance_mm = float(result.distance_mm)
+        props.surface_straight_mm = float(result.straight_mm)
+        props.surface_ratio = float(result.ratio)
+        props.surface_mode = result.mode
+        props.surface_summary = result.summary()
+        props.surface_status = ""
+        props.surface_valid = True
+
+        props.surface_object = canonical.source_object
+        props.surface_geometry_hash = canonical.geometry_hash
+        props.surface_metric_key = canonical.metric_key
+        props.surface_metric_tensor = state.metric_tensor(
+            obj.matrix_world, canonical.unit_multiplier
+        )
+        props.surface_component_id = int(result.component_id)
+
+        report = result.report
+        props.surface_backend_name = (
+            report.backend_name if report is not None else registry.backend_name()
+        )
+        props.surface_backend_version = (
+            report.backend_version if report is not None else registry.backend_version()
+        )
+        props.surface_algorithm_version = registry.ALGORITHM_VERSION
+        props.surface_bound_factor = (
+            float(report.bound_factor)
+            if report is not None and report.bound_factor is not None
+            else 0.0
+        )
+        props.surface_unbounded_fallback = bool(
+            report.unbounded_fallback if report is not None else False
+        )
+        props.surface_attempts = int(report.attempts) if report is not None else 0
+        props.surface_seconds = float(elapsed)
+        props.surface_insertion_seconds = float(result.insertion_seconds)
+        props.surface_solver_seconds = float(result.solver_seconds)
+
+        record = registry.provenance(
+            report,
+            canonical.geometry_hash,
+            canonical.metric_key,
+            result.component_id,
+            props.unit,
+            canonical.source_object,
+        ) if report is not None else None
+
+        lines = [
+            "Backend:        %s %s" % (props.surface_backend_name,
+                                       props.surface_backend_version or "-"),
+            "Algorithm:      %s" % props.surface_algorithm_version,
+            "Mode:           %s" % result.mode,
+            "Source object:  %s" % canonical.source_object,
+            "Geometry hash:  %s" % canonical.geometry_hash,
+            "Metric key:     %s" % canonical.metric_key,
+            "Component:      %d" % result.component_id,
+            "Coordinate unit:%s (1 unit = %g mm)" % (props.unit,
+                                                     canonical.unit_multiplier),
+            "Endpoint kinds: A=%s B=%s" % result.endpoint_kinds,
+            "Scratch mesh:   %d vertices (+%d), %d triangles"
+            % (result.scratch_vertex_count, result.added_vertex_count,
+               result.scratch_triangle_count),
+            "Straight:       %.6f mm" % result.straight_mm,
+            "Surface:        %.6f mm" % result.distance_mm,
+            "Ratio:          %.6f" % result.ratio,
+            "Insertion:      %.3f s" % result.insertion_seconds,
+            "Solver:         %.3f s" % result.solver_seconds,
+            "Total:          %.3f s" % elapsed,
+        ]
+        if record is not None:
+            lines.append("Bound factor:   %s"
+                         % ("unbounded fallback"
+                            if record["unbounded_fallback"]
+                            else "%.2fx" % record["bound_factor"]))
+            lines.append("Bound used:     %.3f mm" % record["bound_mm"]
+                         if record["bound_mm"] not in (None, float("inf"))
+                         else "Bound used:     unbounded")
+            lines.append("Attempts:       %d" % record["attempts"])
+            for factor, bound, seconds, reached in report.attempt_log:
+                lines.append(
+                    "  attempt %-10s bound %-12s %6.3f s  %s"
+                    % ("unbounded" if factor is None else "%.2fx" % factor,
+                       "inf" if bound == float("inf") else "%.2f mm" % bound,
+                       seconds,
+                       "reached" if reached else "not reached"))
+            lines.append("Preprocessing:  weld=%s, %s"
+                         % (record["preprocessing"]["weld"],
+                            record["preprocessing"]["endpoint_insertion"]))
+        else:
+            lines.append("Bound factor:   n/a (analytic short-circuit)")
+        props.surface_provenance = "\n".join(lines)
+        print("\n[BSMT] Surface measurement\n" + props.surface_provenance + "\n")
+
+    def _set_status(self, context, obj):
+        text = ("BSMT: solving exact surface distance on '%s' - Blender may "
+                "not redraw until it finishes" % obj.name)
+        try:
+            context.workspace.status_text_set(text)
+            if context.area is not None:
+                context.area.header_text_set(text)
+                context.area.tag_redraw()
+        except Exception:                             # pragma: no cover
+            pass
+        print("[BSMT] " + text)
+
+    def _restore(self, context):
+        try:
+            context.workspace.status_text_set(None)
+            if context.area is not None:
+                context.area.header_text_set(None)
+                context.area.tag_redraw()
+        except Exception:                             # pragma: no cover
+            pass
+
+
+class BSMT_OT_clear_surface_distance(bpy.types.Operator):
+    """Clear the stored surface distance. Leaves the points and the straight
+    distance untouched"""
+
+    bl_idname = "bsmt.clear_surface_distance"
+    bl_label = "Clear Surface Distance"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is not None:
+            state.clear_surface_result(props)
+            props.surface_status = ""
+        return {'FINISHED'}
+
+
 class BSMT_OT_validate_surface_points(bpy.types.Operator):
     """Re-validate Point A/B against the current canonical mesh.
 
@@ -1028,6 +1314,8 @@ class BSMT_OT_clear_topology(bpy.types.Operator):
 classes = (
     BSMT_OT_pick_point,
     BSMT_OT_calculate_distance,
+    BSMT_OT_calculate_surface_distance,
+    BSMT_OT_clear_surface_distance,
     BSMT_OT_validate_surface_points,
     BSMT_OT_transform_handler_status,
     BSMT_OT_refresh_helpers,

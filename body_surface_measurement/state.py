@@ -35,6 +35,11 @@ def _on_unit_changed(self, context):
         self.distance_mm = measurement.straight_distance_mm(
             self.point_a, self.point_b, self.unit
         )
+    # A unit change rescales the physical metric (sect. 6.4), so any stored
+    # surface distance was computed under a different metric and must not be
+    # displayed. The straight distance above can simply be rescaled; a
+    # geodesic cannot, because a non-uniform metric change moves the path.
+    clear_surface_result(self)
     # Helper sizes are specified in mm, so they depend on the unit too.
     _on_display_changed(self, context)
 
@@ -323,6 +328,92 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         update=_on_component_isolate_changed,
     )
 
+    # ------------------------------------------------------------------
+    # Milestone 2.3 - production surface (geodesic) distance.
+    # Stored SEPARATELY from the Phase 1 straight distance so neither can
+    # overwrite the other, and invalidated independently (sect. 6.5).
+    # ------------------------------------------------------------------
+    surface_valid: BoolProperty(
+        name="Surface Distance Valid",
+        description="True when a surface distance has been computed and is current",
+        default=False,
+    )
+    surface_distance_mm: FloatProperty(
+        name="Surface Distance",
+        description="Exact geodesic distance along the surface, in millimetres",
+        default=0.0,
+    )
+    surface_straight_mm: FloatProperty(
+        name="Straight Distance At Solve",
+        description="Straight distance between the same two surface locations "
+                    "at the moment of the solve, in millimetres",
+        default=0.0,
+    )
+    surface_ratio: FloatProperty(
+        name="Surface / Straight",
+        default=0.0,
+    )
+    surface_status: StringProperty(
+        name="Surface Status",
+        description="Failure message when no surface distance is available",
+        default="",
+    )
+    surface_summary: StringProperty(
+        name="Surface Query Summary",
+        description="Compact record of how the result was obtained",
+        default="",
+    )
+    surface_mode: StringProperty(name="Surface Mode", default="")
+
+    # identity the result belongs to, for invalidation
+    surface_object: StringProperty(name="Surface Source Object", default="")
+    surface_geometry_hash: StringProperty(name="Surface Geometry Hash", default="")
+    surface_metric_key: StringProperty(name="Surface Metric Key", default="")
+    surface_metric_tensor: FloatVectorProperty(
+        name="Surface Metric Tensor",
+        description="(L^T L) * unit_multiplier^2 at solve time, row major. "
+                    "Rotation invariant by construction, so translation and "
+                    "rotation do not invalidate the result while any scale or "
+                    "unit change does (sect. 6.4)",
+        size=9,
+        default=(0.0,) * 9,
+    )
+    surface_component_id: IntProperty(name="Surface Component", default=0)
+
+    # provenance
+    surface_backend_name: StringProperty(name="Backend", default="")
+    surface_backend_version: StringProperty(name="Backend Version", default="")
+    surface_algorithm_version: StringProperty(name="Algorithm Version", default="")
+    surface_bound_factor: FloatProperty(
+        name="Bound Factor",
+        description="Multiple of the straight distance used as max_distance. "
+                    "0 means the unbounded last-resort fallback was used",
+        default=0.0,
+    )
+    surface_unbounded_fallback: BoolProperty(default=False)
+    surface_attempts: IntProperty(name="Attempts", default=0)
+    surface_seconds: FloatProperty(name="Elapsed", default=0.0)
+    surface_insertion_seconds: FloatProperty(default=0.0)
+    surface_solver_seconds: FloatProperty(default=0.0)
+    surface_provenance: StringProperty(
+        name="Surface Provenance",
+        description="Full provenance record for the stored surface distance",
+        default="",
+    )
+
+    show_surface_provenance: BoolProperty(
+        name="Provenance",
+        description="Show the full provenance record for the surface distance",
+        default=False,
+    )
+    surface_running: BoolProperty(
+        name="Surface Solve Running",
+        description="Guard against starting a second surface solve while one "
+                    "is already running",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
     point_a_valid: BoolProperty(
         name="Point A Valid",
         description="True once Point A has been picked on a mesh surface",
@@ -403,7 +494,138 @@ def set_surface_point(props, slot, source_object, geometry_hash, triangle_index,
     point.physical_mm_xyz = tuple(float(v) for v in physical_mm_xyz)
     point.status = "VALID"
     point.reconstruction_error = float(reconstruction_error)
+    # A re-picked landmark invalidates any surface distance that used the old
+    # one. set_point() also clears it, but this function is reachable on its
+    # own, so the rule is enforced in both places rather than assumed.
+    clear_surface_result(props)
+    props.surface_status = ""
     return point
+
+
+def metric_tensor(matrix_world, multiplier):
+    """(L^T L) * multiplier^2 as 9 floats, row major.
+
+    This is the sect. 6.4 metric, computed without hashing so it is cheap
+    enough to evaluate in a panel draw. L^T L is the right Cauchy-Green
+    tensor: for the polar decomposition L = R*S it equals S^2, so it is
+    exactly invariant to rotation and contains no translation at all.
+    Folding in the unit multiplier squared makes it the physical metric in
+    mm^2 per squared local unit, so a unit change registers as a metric
+    change while a rotation does not.
+
+    Pure Python on purpose: three dot products, no numpy import in state.
+    """
+    linear = [[float(matrix_world[row][col]) for col in range(3)]
+              for row in range(3)]
+    squared = float(multiplier) * float(multiplier)
+    flat = []
+    for i in range(3):
+        for j in range(3):
+            total = 0.0
+            for k in range(3):
+                total += linear[k][i] * linear[k][j]
+            flat.append(total * squared)
+    return tuple(flat)
+
+
+#: Relative tolerance when comparing two metric tensors.
+#:
+#: Set by the precision of Blender's own transform, not by float64. An
+#: ``Object.matrix_world`` is stored in SINGLE precision, so for a pure
+#: rotation R the product L^T L differs from the identity by about 3.6e-8
+#: relative - measured on Blender 4.5.13, not assumed. A tolerance tighter
+#: than that reports every rotation as a metric change and invalidates a
+#: surface distance that sect. 6.3 requires to stay valid. That is exactly
+#: what happened with 1e-9 before this constant existed.
+#:
+#: The discrimination gap is wide: the float32 noise floor is ~4e-8 relative,
+#: while the smallest scale change anyone would apply on purpose - a factor of
+#: 1.0001 - moves the tensor by ~2e-4. 1e-6 sits ~25x above the noise and
+#: ~200x below the smallest real signal.
+METRIC_RELATIVE_TOLERANCE = 1e-6
+
+
+def metric_tensors_match(first, second, relative=METRIC_RELATIVE_TOLERANCE):
+    """True when two metric tensors describe the same physical metric."""
+    first = tuple(float(v) for v in first)
+    second = tuple(float(v) for v in second)
+    scale = max(abs(v) for v in first + second) if first or second else 0.0
+    if scale == 0.0:
+        return all(v == 0.0 for v in first + second)
+    tolerance = relative * scale
+    return all(abs(a - b) <= tolerance for a, b in zip(first, second))
+
+
+def clear_surface_result(props):
+    """Forget the surface distance. Never touches the straight distance."""
+    props.surface_valid = False
+    props.surface_distance_mm = 0.0
+    props.surface_straight_mm = 0.0
+    props.surface_ratio = 0.0
+    props.surface_summary = ""
+    props.surface_mode = ""
+    props.surface_object = ""
+    props.surface_geometry_hash = ""
+    props.surface_metric_key = ""
+    props.surface_metric_tensor = (0.0,) * 9
+    props.surface_component_id = 0
+    props.surface_backend_name = ""
+    props.surface_backend_version = ""
+    props.surface_algorithm_version = ""
+    props.surface_bound_factor = 0.0
+    props.surface_unbounded_fallback = False
+    props.surface_attempts = 0
+    props.surface_seconds = 0.0
+    props.surface_insertion_seconds = 0.0
+    props.surface_solver_seconds = 0.0
+    props.surface_provenance = ""
+
+
+def set_surface_failure(props, message):
+    """Record a failure. No numeric surface distance is stored (sect. 5.2)."""
+    clear_surface_result(props)
+    props.surface_status = message
+
+
+def surface_result_problem(props, canonical=None, matrix_world=None):
+    """Why the stored surface distance is no longer current, or ''.
+
+    `canonical` is the live CanonicalMesh when one is cached, or None when it
+    is not. A cleared cache is the project's established "geometry changed"
+    signal (Milestone 2.1a), so it is reported as needing recomputation rather
+    than silently trusted: displaying a distance that may have been computed
+    on different geometry is exactly what sect. 5.2 forbids.
+    """
+    if not props.surface_valid:
+        return ""
+
+    for slot in ('A', 'B'):
+        point = surface_point(props, slot)
+        if not point.valid:
+            return "Point %s was cleared" % slot
+        if point.status != "VALID":
+            return "Point %s is %s" % (slot, point.status)
+        if point.source_object != props.surface_object:
+            return "Point %s is now on a different object" % slot
+        if point.geometry_hash != props.surface_geometry_hash:
+            return "Point %s refers to different geometry" % slot
+
+    if canonical is None:
+        return "canonical mesh not loaded - recompute to confirm"
+
+    if canonical.geometry_hash != props.surface_geometry_hash:
+        return "the mesh geometry changed since this was computed"
+
+    if matrix_world is not None:
+        live = metric_tensor(matrix_world, canonical.unit_multiplier)
+        if not metric_tensors_match(live, props.surface_metric_tensor):
+            # Translation and rotation cannot reach here: the tensor is
+            # rotation invariant and has no translation term. A scale or a
+            # unit change does, and a geodesic cannot be rescaled from a
+            # previous answer because a non-uniform scale moves the path.
+            return "the object scale or coordinate unit changed - recompute"
+
+    return ""
 
 
 def set_point(props, slot, location):
@@ -414,9 +636,11 @@ def set_point(props, slot, location):
     else:
         props.point_b = (location[0], location[1], location[2])
         props.point_b_valid = True
-    # A new point makes any previous result stale.
+    # A new point makes any previous result stale - both of them.
     props.distance_valid = False
     props.distance_mm = 0.0
+    clear_surface_result(props)
+    props.surface_status = ""
 
 
 def clear_component_preview_state(props):
@@ -459,6 +683,8 @@ def reset(props):
     props.point_b = (0.0, 0.0, 0.0)
     props.distance_valid = False
     props.distance_mm = 0.0
+    clear_surface_result(props)
+    props.surface_status = ""
 
 
 classes = (
