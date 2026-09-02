@@ -60,15 +60,71 @@ def world_ray(region, rv3d, coord):
     return _view_ray(region, rv3d, coord)
 
 
-def ray_cast_surface(context, region, rv3d, coord):
-    """Cast a ray through a viewport pixel onto the visible scene geometry.
+def ray_cast_object(context, obj, origin, direction):
+    """Cast a world-space ray at ONE object. Returns (location, normal) or None.
+
+    ``Object.ray_cast`` works in the object's own local space, so the ray is
+    transformed in and the hit transformed back out. The normal uses the
+    inverse-transpose so it stays perpendicular under a non-uniform scale.
+    """
+    depsgraph = context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    matrix = evaluated.matrix_world
+    try:
+        inverse = matrix.inverted()
+    except ValueError:
+        return None                      # degenerate transform
+
+    local_origin = inverse @ origin
+    local_direction = (inverse.to_3x3() @ direction)
+    if local_direction.length == 0.0:
+        return None
+    local_direction = local_direction.normalized()
+
+    try:
+        hit, location, normal, _index = evaluated.ray_cast(
+            local_origin, local_direction
+        )
+    except (RuntimeError, ValueError):
+        return None
+    if not hit:
+        return None
+
+    world_location = matrix @ location
+    world_normal = (matrix.to_3x3().inverted().transposed() @ normal)
+    if world_normal.length > 0.0:
+        world_normal = world_normal.normalized()
+    return world_location, world_normal
+
+
+def ray_cast_surface(context, region, rv3d, coord, target=None):
+    """Cast a ray through a viewport pixel onto scene geometry.
 
     Returns (location, normal, object) with a world-space location, or None if
     nothing but empty space (or our own markers) was under the cursor.
+
+    `target` restricts the cast to ONE object, and the pick operators always
+    pass the object the researcher is working on. That is not a refinement, it
+    is a correctness requirement: a BSMT measurement copy is created at the
+    same transform as its source, so the two are exactly COINCIDENT. A
+    scene-wide cast then returns whichever the depsgraph reaches first - in
+    practice the original - and the landmark is silently recorded as belonging
+    to a mesh the researcher was not working on. Every later stage then
+    faithfully measures the wrong object.
     """
+    origin, direction = _view_ray(region, rv3d, coord)
+
+    if target is not None and getattr(target, "type", None) == 'MESH' \
+            and not visualization.is_helper(target):
+        hit = ray_cast_object(context, target, origin, direction)
+        if hit is None:
+            return None
+        location, normal = hit
+        return location.copy(), normal.copy(), getattr(target, "original",
+                                                       target)
+
     scene = context.scene
     depsgraph = context.evaluated_depsgraph_get()
-    origin, direction = _view_ray(region, rv3d, coord)
 
     for _ in range(MAX_HELPER_SKIPS):
         hit, location, normal, _index, obj, _matrix = scene.ray_cast(

@@ -2175,6 +2175,74 @@ the same class.
 
 ---
 
+## 11i. Object-identity bug and fix (v0.13.2, 2026-09-02)
+
+A surface measurement taken on a repaired measurement copy was refused with the ORIGINAL scan's
+numbers — *"2,783,068 triangles"* and *"7 non-manifold edges"* — while the selected copy had
+349,992 triangles and none.
+
+### 11i.1 Where the identity was lost
+
+Reproduced headlessly, with the copy as the active object:
+
+```
+ACTIVE object is A_BSMT
+scene.ray_cast hit: True -> OBJECT: A
+```
+
+`picking.ray_cast_surface()` used `scene.ray_cast`, which searches the **whole scene** and skips
+only BSMT helpers. A measurement copy is created at the *same transform* as its source, so the two
+are exactly **coincident** and the cast returned whichever the depsgraph reached first — the
+original. The landmark was then faithfully recorded as belonging to `A`, and every later stage did
+the right thing with the wrong owner: `source_object` → canonical mesh → safety gate → solver.
+
+**Nothing downstream was at fault.** The measurement path already resolves the object from
+`SurfacePoint.source_object`, never from provenance or selection. Verified in the same run: the
+canonical cache holds separate entries with different geometry hashes and correct triangle counts
+(`A` 3,968 / `A_BSMT` 1,000), and `A.data is not A_BSMT.data`. The §5 and §6 hypotheses were
+checked and cleared; the fault was entirely in picking.
+
+### 11i.2 The fix
+
+`ray_cast_surface(..., target=None)` and a new `ray_cast_object()` cast against **one** object,
+transforming the world ray into its local space and the hit back out (normal via the
+inverse-transpose, so it stays perpendicular under non-uniform scale). The pick operators pass the
+active mesh object. Selection is the researcher's statement of intent and the only thing that can
+separate two coincident objects; the scene-wide path remains as the fallback when there is no
+usable active mesh.
+
+Two supporting changes:
+
+* **Picking on an original that has a measurement copy now warns** — by name, both objects — since
+  that is the exact situation which produced the wrong measurement. It is a warning, not a
+  refusal: measuring the original is a legitimate choice.
+* **`log_solver_target()` prints the object, mesh, triangle count and geometry hash** before every
+  solver call, at all three entry points, and refusal messages now name the object. Nothing in the
+  original output said which mesh the numbers belonged to, which is why a wrong-object measurement
+  looked like a topology problem.
+
+Ownership is now settled *before* the target is logged, so the log can never name a mesh the
+measurement was then refused on.
+
+**Provenance remains informational only.** `A_BSMT.bsmt_scan.source_name == "A"` is printed as a
+note and never redirects a measurement back to the source scan.
+
+### 11i.3 Verified in Blender 4.5.13
+
+| Case | Result |
+|---|---|
+| Object-restricted cast, target `A` | hits the 3,968-triangle mesh |
+| Object-restricted cast, target `A_BSMT` | hits the 1,000-triangle mesh |
+| Landmarks picked on `A_BSMT` | both own `A_BSMT` |
+| Surface distance on `A_BSMT` | succeeds; solver target logged as `A_BSMT`, 1,000 triangles |
+| Landmarks on different meshes | refused, no number stored |
+| Points stale after a geometry edit | refused until re-picked |
+| Provenance `source_name = "A"` | ignored by the solver |
+
+Milestone 3.3 and 3.5a acceptance re-run unchanged.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

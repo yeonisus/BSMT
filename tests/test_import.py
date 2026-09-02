@@ -907,6 +907,29 @@ def test_landmark_modules_are_pure(bsmt):
         check("panels.py never CALLS %s" % forbidden,
               forbidden not in panels_text.replace('"bsmt.', '"'),
               "drawing a panel must not modify geometry")
+    # Object identity: a pick must be able to target ONE object. A
+    # measurement copy is coincident with its source, so a scene-wide cast
+    # can silently record the landmark against the original.
+    picking_text = open(_os.path.join(ROOT, "body_surface_measurement",
+                                      "picking.py")).read()
+    check("ray_cast_surface accepts a target object",
+          "def ray_cast_surface(context, region, rv3d, coord, target=None)"
+          in picking_text)
+    check("an object-restricted cast exists",
+          "def ray_cast_object(" in picking_text)
+    check("the reason is documented",
+          "COINCIDENT" in picking_text, "the coincident-copy hazard")
+    check("the pick operator passes a target",
+          "target=target" in ops_gate)
+    check("and derives it from the active object",
+          "_pick_target" in ops_gate)
+    check("provenance never redirects the solver",
+          "informational" in ops_gate.lower())
+    check("the solver target is logged",
+          "def log_solver_target(" in ops_gate)
+    check("and logged at all three entry points",
+          ops_gate.count("log_solver_target(") == 4,
+          str(ops_gate.count("log_solver_target(")))
     check("the gate is applied at exactly three solver entry points",
           len(finder.hits) == 3, str(finder.hits))
     for expected in ("BSMT_OT_calculate_surface_distance",

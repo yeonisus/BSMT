@@ -133,12 +133,18 @@ class BSMT_OT_pick_point(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         rv3d = self._space.region_3d
-        hit = picking.ray_cast_surface(context, self._region, rv3d, coord)
+        # Restrict the cast to the active object. A measurement copy sits at
+        # the same transform as its source, so a scene-wide cast can return
+        # the original instead and record the landmark against the wrong mesh.
+        target = self._pick_target(context)
+        hit = picking.ray_cast_surface(context, self._region, rv3d, coord,
+                                       target=target)
         if hit is None:
             self.report(
                 {'WARNING'},
-                "BSMT: no mesh surface under the cursor - click on the mesh "
-                "(ESC or right click to cancel)",
+                "BSMT: no mesh surface under the cursor%s - click on the mesh "
+                "(ESC or right click to cancel)"
+                % ("" if target is None else " of '%s'" % target.name),
             )
             return {'RUNNING_MODAL'}
 
@@ -148,6 +154,8 @@ class BSMT_OT_pick_point(bpy.types.Operator):
             self._restore(context)
             self.report({'ERROR'}, "BSMT: add-on properties are not registered")
             return {'CANCELLED'}
+
+        self._warn_if_source_has_copy(self, obj)
 
         if self.target == 'LANDMARK':
             return self._pick_landmark(context, props, obj, coord, location)
@@ -229,6 +237,42 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         )
         return {'FINISHED'}
 
+    @staticmethod
+    def _pick_target(context):
+        """The object a click should land on: the active mesh, if there is one.
+
+        Selection is the researcher's statement of intent, and it is the only
+        thing that can separate two coincident objects. When there is no
+        usable active mesh the cast falls back to the whole scene.
+        """
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            return None
+        if visualization.is_helper(obj):
+            return None
+        return obj
+
+    @staticmethod
+    def _warn_if_source_has_copy(operator, obj):
+        """Say so when a landmark is being placed on an ORIGINAL scan.
+
+        Not a refusal - measuring the original is a legitimate choice - but it
+        is almost always a mistake when a prepared copy exists, and it is the
+        exact situation that produced a measurement against the wrong mesh.
+        """
+        provenance = getattr(obj, "bsmt_scan", None)
+        if provenance is not None and provenance.is_measurement_copy:
+            return ""
+        copy = scancopy.find_measurement_copy(obj)
+        if copy is None:
+            return ""
+        message = ("picked on the ORIGINAL scan '%s'; its measurement copy "
+                   "'%s' exists. Select the copy if you meant to measure on it."
+                   % (obj.name, copy.name))
+        print("[BSMT] " + message)
+        operator.report({'WARNING'}, "BSMT: " + message)
+        return message
+
     def _attach_surface_point(self, context, props, obj, coord, point):
         """Capture the canonical surface location for this click into `point`.
 
@@ -256,6 +300,8 @@ class BSMT_OT_pick_point(bpy.types.Operator):
 
         rv3d = self._space.region_3d
         origin, direction = picking.world_ray(self._region, rv3d, coord)
+        # `obj` here is the object the surface ray actually hit, so the
+        # canonical cast and the SurfacePoint agree by construction.
         result = meshcache.ray_cast_local(
             canonical,
             canonical.matrix_world,
@@ -458,10 +504,24 @@ class BSMT_OT_calculate_surface_distance(bpy.types.Operator):
             self.report({'ERROR'}, "BSMT: " + message)
             return {'CANCELLED'}
 
-        # Safety gate BEFORE any solver construction (sect. 9).
+        # Ownership is settled BEFORE anything is logged as the solver
+        # target, so the log can never name a mesh the measurement was then
+        # refused on.
+        if props.surface_a.source_object != props.surface_b.source_object:
+            message = solve.failure_message(
+                'DIFFERENT_OBJECTS',
+                "A on '%s', B on '%s'" % (props.surface_a.source_object,
+                                          props.surface_b.source_object))
+            state.set_surface_failure(props, message)
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        # Safety gate BEFORE any solver construction (sect. 9), on the mesh
+        # the A/B SurfacePoints were actually picked on.
+        log_solver_target("A/B surface distance", obj, canonical)
         gate = solver_preflight(props, canonical)
         if not gate["allowed"]:
-            message = _report_preflight(self, gate, " (A/B)")
+            message = _report_preflight(self, gate, " (A/B)", obj.name)
             state.set_surface_failure(props, message)
             self.report({'ERROR'}, "BSMT: " + message)
             return {'CANCELLED'}
@@ -1989,10 +2049,11 @@ def _measure_one(context, props, item, report_lines=None):
             item.status_detail = message
             return False, message
 
+        log_solver_target("measurement %s" % item.protocol_id, obj, canonical)
         gate = solver_preflight(props, canonical)
         if not gate["allowed"]:
             message = _report_preflight(None, gate,
-                                        " (%s)" % item.protocol_id)
+                                        " (%s)" % item.protocol_id, obj.name)
             state.clear_measurement_result(item)
             item.status = measurements.STATUS_FAILED
             item.status_detail = message
@@ -2708,9 +2769,10 @@ class BSMT_OT_compute_surface_path(bpy.types.Operator):
             self.report({'ERROR'}, "BSMT: " + message)
             return {'CANCELLED'}
 
+        log_solver_target("surface path", obj, canonical)
         gate = solver_preflight(props, canonical)
         if not gate["allowed"]:
-            message = _report_preflight(self, gate, " (path)")
+            message = _report_preflight(self, gate, " (path)", obj.name)
             props.viz_status = message
             self.report({'ERROR'}, "BSMT: " + message)
             return {'CANCELLED'}
@@ -2886,6 +2948,31 @@ class BSMT_OT_clear_all_visualizations(bpy.types.Operator):
 # ---------------------------------------------------------------------------
 
 
+def log_solver_target(label, obj, canonical):
+    """Print exactly which mesh is about to be solved on.
+
+    Deliberately unconditional developer logging. A measurement once ran
+    against the ORIGINAL scan instead of its measurement copy - the two are
+    coincident, so a scene-wide pick had recorded the wrong owner - and
+    nothing in the output said which mesh the numbers belonged to. These four
+    lines make that class of mistake visible immediately.
+    """
+    print("[BSMT] solver target (%s)" % label)
+    print("[BSMT]   object    : %s" % (obj.name if obj is not None else "?"))
+    print("[BSMT]   mesh      : %s"
+          % (obj.data.name if obj is not None and obj.data else "?"))
+    print("[BSMT]   triangles : %s"
+          % "{:,}".format(canonical.triangle_count))
+    print("[BSMT]   geom hash : %s" % canonical.geometry_hash)
+    provenance = getattr(obj, "bsmt_scan", None) if obj is not None else None
+    if provenance is not None and provenance.is_measurement_copy:
+        # Informational ONLY. Provenance never redirects a measurement back
+        # to the source scan; the authoritative object is the one the
+        # SurfacePoints were picked on.
+        print("[BSMT]   note      : measurement copy of '%s' (informational)"
+              % provenance.source_name)
+
+
 def solver_preflight(props, canonical):
     """Gate every route to the native solver. Returns the preflight dict.
 
@@ -2902,8 +2989,14 @@ def solver_preflight(props, canonical):
     )
 
 
-def _report_preflight(operator, result, label=""):
-    """Print the refusals and warnings, and return the message to display."""
+def _report_preflight(operator, result, label="", object_name=""):
+    """Print the refusals and warnings, and return the message to display.
+
+    The object name is included so a refusal can never be misread as being
+    about a different mesh than the one it was measured on.
+    """
+    if object_name:
+        label = "%s on '%s'" % (label, object_name)
     for line in result["refusals"]:
         print("[BSMT] REFUSED%s: %s" % (label, line))
     for line in result["warnings"]:
