@@ -142,6 +142,48 @@ Verified externally on 2026-09-01: `pygeodesic` 0.1.11 publishes cp311 wheels fo
 macOS arm64 and x86_64, manylinux x86_64 and win_amd64. Blender 4.5's bundled Python version
 must be confirmed as 3.11 in-session before relying on this (Milestone 2.2).
 
+**Measured behaviour (2026-09-01, `tools/check_geodesic_env.py`).** Run in a throwaway venv on
+macOS arm64 with **Python 3.12 / numpy 2.5.2 — NOT Blender's interpreter**, so it validates the
+library and the test procedure, not the target environment. Milestone 2.2 is satisfied only when
+the same script passes inside Blender's own Python.
+
+| Test | Result |
+|---|---|
+| Planar mesh, 800 triangles | relative error **0.000e+00** — exact, as an exact polyhedral method must be |
+| Icosphere R=100 mm, h=29.8 mm | 310.632 vs analytic 314.159, rel err 1.12e-02 |
+| h=15.0 mm | rel err 2.90e-03, error shrank 3.9x — observed order **1.97** |
+| h=7.5 mm | rel err 7.31e-04, error shrank 4.0x — observed order **1.99** |
+
+This is the §4.4 prediction confirmed by measurement rather than assumed: the algorithmic error
+term is zero (the plane result), and what remains is discretisation error converging at
+**~O(h²)**, underestimating because chords cut corners. The observed order must still be
+re-measured on the full analytic suite of §9.4; it is not to be quoted from this table as a
+general claim.
+
+**API surface, from runtime introspection (do not assume beyond this):**
+
+```
+pygeodesic.geodesic.PyGeodesicAlgorithmExact(points, faces)
+    .geodesicDistance(sourceIndex, targetIndex)  -> (float, ndarray path (n,3))
+    .geodesicDistances(source_indices[, target_indices]) -> (distances, best_source)
+```
+
+- Endpoints are **vertex indices only**. There is no face+barycentric entry point, which is
+  precisely why Milestone 2.1's `insert_points()` exists: A and B are inserted as real vertices
+  of a scratch mesh, and the exact method is then exact for arbitrary in-face locations.
+- `geodesicDistance` returns the **path polyline** directly, which Milestone 2.4 will draw.
+- `target_indices` is optional, so one-to-all works — useful later for landmark fields.
+- Faces are accepted as int32 or int64 and vertices as float32 or float64. BSMT will pass float64
+  vertices and int32 faces explicitly rather than rely on coercion.
+
+**Performance concern to carry into Milestone 2.3.** One query on an 81,920-triangle icosphere
+took **1.88 s** (construction only 0.04 s). 21_M_3400E has 314,086 triangles, 3.8x larger, so a
+single A-B measurement is likely to take **several seconds at best**, since MMP window
+propagation grows faster than linearly. Milestone 2.3 must therefore not appear frozen while it
+runs, must measure the real cost on the real scan, and must not assume a batch or all-pairs
+workflow is affordable. If it proves too slow the options are early termination, the VTP variant,
+or the edge-flip solver — all changes of backend, not of architecture.
+
 ### 5.2 No approximate production fallback in Phase 2
 
 If the exact backend is unavailable, fails, or the problem is ill-posed, BSMT returns a
@@ -803,6 +845,10 @@ internal detail of the solver-space array.
 
 **Create:** `tools/check_geodesic_env.py` (a standalone script, not part of the add-on)
 **Change:** none in the add-on
+
+**Status 2026-09-01:** the script is written and validated against real pygeodesic 0.1.11
+outside Blender (see §5.1). The Blender-side run is outstanding and is what actually closes
+this milestone.
 
 **Success criteria**
 - `sys.version` inside Blender 4.5.13 confirmed (expected 3.11); architecture confirmed arm64.
