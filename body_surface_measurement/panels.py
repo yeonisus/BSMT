@@ -2,8 +2,8 @@
 
 import bpy
 
-from . import (geodesic, landmarks, measurement, measurements, state,
-               visualization)
+from . import (geodesic, landmarks, measurement, measurements, preprocess,
+               scancopy, state, visualization)
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
@@ -1057,6 +1057,115 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
                 status.label(text=line)
 
 
+class BSMT_PT_preprocessing(bpy.types.Panel):
+    """Turn a dense textured scan into a lighter TEXTURED measurement copy.
+
+    The source scan is never modified. Nothing is welded and no hole is
+    filled: on a human scan those silently fuse anatomically distinct
+    surfaces that happen to touch, and a fused surface produces a
+    confidently wrong, systematically short geodesic.
+    """
+
+    bl_label = "Scan Preprocessing"
+    bl_idname = "BSMT_PT_preprocessing"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "BSMT"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        props = state.get_props(context)
+        if props is None:
+            layout.label(text="Add-on state unavailable", icon='ERROR')
+            return
+
+        obj = context.active_object
+        info = scancopy.describe(obj) if obj is not None else None
+
+        box = layout.box()
+        if info is None:
+            box.label(text="Select a mesh scan", icon='INFO')
+        else:
+            column = box.column(align=True)
+            column.scale_y = 0.75
+            column.label(text="Active: %s" % info["name"])
+            column.label(text="Vertices:  {:,}".format(info["vertex_count"]))
+            column.label(text="Triangles: {:,}".format(info["triangle_count"]))
+            column.label(
+                text="UV map: %s" % (", ".join(info["uv_layers"])
+                                     if info["has_uv"] else "NONE"),
+                icon='CHECKMARK' if info["has_uv"] else 'ERROR',
+            )
+            column.label(
+                text="Materials: %s" % (", ".join(info["material_slots"])
+                                        if info["has_material"] else "NONE"),
+                icon='CHECKMARK' if info["has_material"] else 'ERROR',
+            )
+            column.label(
+                text="Image texture: %s" % (", ".join(info["images"])
+                                            if info["has_image"] else "NONE"),
+                icon='CHECKMARK' if info["has_image"] else 'ERROR',
+            )
+            provenance = getattr(obj, "bsmt_scan", None)
+            if provenance is not None and provenance.is_measurement_copy:
+                column.separator()
+                column.label(text="This IS a measurement copy of '%s'"
+                                  % provenance.source_name, icon='DUPLICATE')
+                column.label(text=provenance.representation
+                                  or preprocess.REPRESENTATION)
+
+            if info["triangle_count"] > props.dense_threshold_triangles:
+                warn = box.column(align=True)
+                warn.scale_y = 0.75
+                warn.alert = True
+                for line in _wrap(preprocess.WARN_DENSE % (
+                    "{:,}".format(info["triangle_count"]),
+                    "{:,}".format(props.dense_threshold_triangles)), 44
+                ):
+                    warn.label(text=line)
+
+        layout.prop(props, "preprocess_preset", text="Preset")
+        layout.prop(props, "preprocess_target_triangles", text="Target")
+        if info is not None and info["triangle_count"] > 0:
+            try:
+                step = preprocess.plan(props.preprocess_target_triangles,
+                                       info["triangle_count"])
+                hint = layout.column(align=True)
+                hint.scale_y = 0.7
+                hint.enabled = False
+                for line in _wrap(step["summary"], 46):
+                    hint.label(text=line)
+            except preprocess.PreprocessError:
+                pass
+
+        layout.operator("bsmt.create_measurement_copy", icon='MOD_DECIM')
+        layout.operator("bsmt.toggle_measurement_copy", icon='HIDE_OFF')
+
+        safety = layout.box()
+        safety.label(text="Solver Safety Gate")
+        safety.prop(props, "dense_threshold_triangles", text="Threshold")
+        safety.prop(props, "guard_dense_solve")
+        note = safety.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        note.label(text="Non-manifold edges always refuse exact")
+        note.label(text="geodesic computation.")
+
+        if props.preprocess_valid and props.preprocess_report:
+            layout.separator()
+            row = layout.row(align=True)
+            row.label(text="Report")
+            row.operator("bsmt.clear_preprocess_report", text="", icon='X')
+            column = layout.box().column(align=True)
+            column.scale_y = 0.7
+            for line in props.preprocess_report.split("\n"):
+                if line.strip():
+                    column.label(text=line)
+                else:
+                    column.separator()
+
+
 classes = (
     BSMT_PT_body_measurement,
     BSMT_PT_diagnostics,
@@ -1066,6 +1175,7 @@ classes = (
     BSMT_UL_measurements,
     BSMT_PT_measurements,
     BSMT_PT_measurement_visualization,
+    BSMT_PT_preprocessing,
 )
 
 

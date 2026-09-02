@@ -284,6 +284,8 @@ def test_fresh_import():
     check("fresh: landmarks module loaded", hasattr(bsmt, "landmarks"))
     check("fresh: measurements module loaded", hasattr(bsmt, "measurements"))
     check("fresh: viz module loaded", hasattr(bsmt, "viz"))
+    check("fresh: preprocess module loaded", hasattr(bsmt, "preprocess"))
+    check("fresh: scancopy module loaded", hasattr(bsmt, "scancopy"))
     check("fresh: protocol module loaded", hasattr(bsmt, "protocol"))
     check("fresh: register/unregister present",
           callable(bsmt.register) and callable(bsmt.unregister))
@@ -816,7 +818,7 @@ def test_landmark_modules_are_pure(bsmt):
     print("\nMilestone 3.0 modules are importable without Blender")
     import ast as _ast
     import os as _os
-    for name in ("landmarks", "protocol", "measurements"):
+    for name in ("landmarks", "protocol", "measurements", "preprocess"):
         path = _os.path.join(ROOT, "body_surface_measurement", name + ".py")
         tree = _ast.parse(open(path).read())
         imported = set()
@@ -859,6 +861,46 @@ def test_landmark_modules_are_pure(bsmt):
               "surface_path(" not in text, path)
     ops_text = open(_os.path.join(ROOT, "body_surface_measurement",
                                   "operators.py")).read()
+    # Milestone 3.3: every route to the native solver passes the gate first.
+    ops_gate = open(_os.path.join(ROOT, "body_surface_measurement",
+                                  "operators.py")).read()
+    check("the safety gate exists once", ops_gate.count("def solver_preflight") == 1)
+    # Three CALL sites - A/B, the measurement manager and the path solve -
+    # counted by parsing rather than by grepping, so the `def` line does not
+    # inflate the count.
+    import ast as _ast
+
+    class _CallFinder(_ast.NodeVisitor):
+        def __init__(self):
+            self.stack = []
+            self.hits = []
+
+        def visit_ClassDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node):
+            if isinstance(node.func, _ast.Name) \
+                    and node.func.id == "solver_preflight":
+                self.hits.append(" > ".join(self.stack))
+            self.generic_visit(node)
+
+    finder = _CallFinder()
+    finder.visit(_ast.parse(ops_gate))
+    check("the gate is applied at exactly three solver entry points",
+          len(finder.hits) == 3, str(finder.hits))
+    for expected in ("BSMT_OT_calculate_surface_distance",
+                     "_measure_one",
+                     "BSMT_OT_compute_surface_path"):
+        check("the gate guards %s" % expected,
+              any(expected in where for where in finder.hits),
+              str(finder.hits))
     check("only one place calls the path solve",
           ops_text.count("solve.surface_path(") == 1,
           str(ops_text.count("solve.surface_path(")))

@@ -7,8 +7,8 @@
 bundled Python 3.11.15, numpy 1.26.4 — **all detected at runtime, 2026-09-02** (§5.1a)
 **Status:** Phase 1 complete and validated on a real human-body scan. Milestones 2.0, 2.0a,
 2.1, 2.2, 2.3, 3.0 (Landmark Manager), 3.1 (Measurement Manager) and
-**3.2 (Measurement Visualisation)** implemented and validated in Blender. Real-scan acceptance
-testing of 2.3, 3.0, 3.1 and 3.2 is outstanding.
+3.2 (Measurement Visualisation) and **3.3 (Scan Preprocessing)** implemented and validated in
+Blender. Real-scan acceptance testing of 2.3, 3.0, 3.1, 3.2 and 3.3 is outstanding.
 
 > Note on this document's history: no `PROJECT_SPEC.md` existed in the project before this
 > revision. Phase 1 was specified conversationally and implemented from that specification.
@@ -28,7 +28,8 @@ on textured OBJ human-body scans.
 | 3.0 | Named research landmark manager: protocols, guided picking, Validate All | **Done** (v0.8.0) |
 | 3.1 | User-defined measurement manager: definitions, batch calculation, templates | **Done** (v0.9.0) |
 | 3.2 | Measurement visualisation: straight chords and exact geodesic paths | **Done** (v0.10.0) |
-| 3.3+ | CSV/XLSX export, alignment, automatic landmark detection | Not designed |
+| 3.3 | Scan preprocessing: textured measurement copy + solver safety gate | **Done** (v0.11.0) |
+| 3.4+ | CSV/XLSX export, alignment, automatic landmark detection | Not designed |
 | Future | Anatomical scan alignment (§13) | Requirement recorded, not designed |
 
 Non-goals for Phase 2, explicitly: automatic landmark detection, mesh repair as a measurement
@@ -1813,6 +1814,109 @@ results and the scan.
 **Outstanding: real-scan acceptance on 21_M_3400E** (§15 of the milestone brief), in particular
 the true path timing on a 314k-triangle mesh — the synthetic acceptance ran on a 2k-triangle
 sphere where the path took 0.014 s.
+
+---
+
+## 11e. Milestone 3.3 — Scan preprocessing and the solver safety gate (v0.11.0, 2026-09-02)
+
+Turns a dense textured OBJ into a lighter **textured** measurement copy, and stops an unsafe
+mesh reaching the native solver.
+
+### 11e.1 Why the gate exists
+
+A real Design X textured OBJ arrives at 1,391,542 vertices / 2,783,068 triangles with 2
+components, 15 boundary edges and **7 non-manifold edges**, and handing it to pygeodesic has
+already crashed Blender with **SIGSEGV**. A crash takes the whole unsaved session, so the mesh is
+checked *before* the C++ library is constructed.
+
+`preprocess.preflight()` reads the canonical mesh's existing topology report — computed at build
+time, so the check costs nothing — and is applied at **exactly three** solver entry points,
+verified by parsing `operators.py`:
+
+| Entry point | |
+|---|---|
+| `BSMT_OT_calculate_surface_distance._solve` | A/B surface distance |
+| `_measure_one` | Measurement Manager |
+| `BSMT_OT_compute_surface_path._solve` | on-demand path |
+
+| Condition | Behaviour |
+|---|---|
+| Non-manifold edges > 0 | **Refused, unconditionally.** This is the condition that crashed Blender, and the density override cannot lift it. |
+| Triangles > threshold (default 1,000,000) | **Refused while the guard is on** (default), warned when off. |
+| Components > 1 | Warns. Measurement is still allowed; a cross-component *pair* is refused individually (§7.4). |
+| Boundary edges > 0 | Warns — a geodesic near a hole can take a plausible-looking detour that is an artefact. |
+| Degenerate triangles > 0 | Warns. |
+
+**On the density default.** The brief asked for a warning. It is implemented as a *guarded
+refusal* that defaults to blocking, with a visible "Block Solving Above Threshold" checkbox to
+turn it back into a warning. A warning that proceeds still lets the session die, and losing
+unsaved work is worse than being asked to make a measurement copy first. The threshold remains
+**operational, not mathematical** — it says nothing about what MMP can represent.
+
+### 11e.2 Non-destructive copy
+
+`<source>_BSMT`, created by `obj.copy()` **plus `obj.data.copy()`** — sharing the mesh datablock
+would mean decimating the copy decimated the original. Materials are deliberately *shared*, since
+the copy must show the same texture. Verified after every run: the source's triangle count,
+vertex count, mesh datablock name, UV layers and materials are unchanged, and the operator
+refuses to report success if they are not.
+
+### 11e.3 Target count, not a raw ratio
+
+The researcher gives a triangle count; `ratio = target / current`, clamped to (0, 1]. A target at
+or above the current count copies **without decimating** rather than running a modifier that
+would do nothing. Presets (High 500k / Standard 350k / Light 200k) write the target, which stays
+editable.
+
+Decimation is `DECIMATE` in `COLLAPSE` mode with `use_collapse_triangulate`, baked through the
+depsgraph with `bpy.data.meshes.new_from_object(..., preserve_all_data_layers=True)` rather than
+`bpy.ops.object.modifier_apply` — no operator context, works headless, and `preserve_all_data_layers`
+is what carries the UV layers across.
+
+### 11e.4 Texture preservation is a pass/fail gate
+
+UV layer names, material slots, image datablocks and image file paths are recorded before and
+compared after. A lost UV layer, material or image reference marks preprocessing **FAILED** and
+the copy is *not* presented as measurement-ready — a copy the researcher cannot visually register
+against the original is useless for landmarking. Measured on a textured sphere: UV layer,
+material, image and filepath all preserved, the material datablock shared with the source, and
+the UV data non-degenerate across every loop.
+
+### 11e.5 Nothing is welded and no hole is filled
+
+No merge-by-distance, no `remove_doubles`, no hole filling — asserted by a test that greps both
+modules. On a human scan those silently fuse anatomically distinct surfaces that happen to touch
+(arm↔torso, finger↔finger, garment↔skin), and a fused surface produces a confidently wrong,
+**systematically short** geodesic. Diagnose and report; the researcher decides.
+
+### 11e.6 Provenance
+
+Stored on the generated object as `Object.bsmt_scan`, so it travels with the .blend. Identity is a
+real Blender **object pointer**, which survives a rename (verified); the source name string is a
+human-readable fallback only. Records original / target / actual triangle counts, method, ratio,
+BSMT version, timestamp, and the representation note.
+
+### 11e.7 The copy is not the original surface
+
+Decimation changes the polyhedral surface, so the copy's geodesic distances are **not** identical
+to the original's. The provenance records `"decimated measurement representation"`, and a test
+asserts the phrase "same exact surface" appears nowhere. Quantifying surface-distance sensitivity
+to mesh density is a separate exercise that must be **measured**, not assumed — it is not done
+here.
+
+### 11e.8 Verified in Blender 4.5.13
+
+Textured sphere, 19,042 verts / 38,080 tris, `UVMap` + `ScanMaterial` + `scan_texture.jpg`.
+Target 4,760 → copy landed on **4,760 triangles (0.0% error)** in 0.16 s, UV/material/image all
+preserved, source completely unchanged. Gate: clean copy allowed; 7 non-manifold refused;
+2,783,068 triangles refused while guarded and warned when unguarded; 2 components + 15 boundary
+warned without refusing. Through the real operator, a 38,080-triangle mesh against a 10,000
+threshold was **blocked with no number stored**, and proceeded to a VALID result once unguarded.
+Toggle showed one object at a time without deleting either.
+
+**Outstanding: real-scan acceptance on the 2.78M-triangle textured OBJ** (§15 of the brief) — in
+particular the decimation time at that scale and whether the post-check still reports non-manifold
+edges, in which case exact geodesic must not be run.
 
 ---
 

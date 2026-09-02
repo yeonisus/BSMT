@@ -17,7 +17,8 @@ from bpy.props import (
     StringProperty,
 )
 
-from . import geodesic, landmarks, measurement, measurements, visualization
+from . import (geodesic, landmarks, measurement, measurements, preprocess,
+               visualization)
 
 
 def _on_display_changed(self, context):
@@ -310,6 +311,13 @@ def _on_target_picker(self, context):
     _adopt_landmark(self, context, "target", self.target_picker)
 
 
+def _on_preprocess_preset_changed(self, context):
+    """A preset writes the target count; the count itself stays editable."""
+    target = preprocess.PRESET_TARGETS.get(self.preprocess_preset, 0)
+    if target:
+        self.preprocess_target_triangles = target
+
+
 def _on_visualization_style_changed(self, context):
     """Colour or thickness changed. Cosmetic: no rebuild, no recomputation."""
     try:
@@ -452,6 +460,39 @@ class BSMT_Measurement(bpy.types.PropertyGroup):
     @property
     def has_result(self):
         return bool(self.straight_valid or self.surface_valid)
+
+
+class BSMT_ScanProvenance(bpy.types.PropertyGroup):
+    """Provenance stored ON a generated measurement copy (sect. 11).
+
+    `source` is a real Blender object POINTER, so it keeps pointing at the
+    right scan after a rename and cannot be confused by two objects that
+    briefly share a name. `source_name` is kept alongside purely as a
+    human-readable fallback for when the pointer cannot be followed - for
+    instance after the source has been deleted, when naming the loss is more
+    useful than a null.
+    """
+
+    is_measurement_copy: BoolProperty(default=False)
+    source: PointerProperty(
+        name="Source Scan", type=bpy.types.Object,
+        description="The scan this measurement copy was generated from",
+    )
+    source_name: StringProperty(default="")
+    source_mesh_name: StringProperty(default="")
+    original_triangles: IntProperty(default=0)
+    target_triangles: IntProperty(default=0)
+    actual_triangles: IntProperty(default=0)
+    method: StringProperty(default="")
+    ratio: FloatProperty(default=0.0)
+    bsmt_version: StringProperty(default="")
+    created: StringProperty(default="")
+    representation: StringProperty(
+        default="",
+        description="What this object IS. Decimation changes the polyhedral "
+                    "surface, so it is a representation of the scan, not the "
+                    "same exact surface",
+    )
 
 
 class BSMT_ComponentInfo(bpy.types.PropertyGroup):
@@ -765,6 +806,45 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         name="Details", description="Show the selected measurement's detail",
         default=True,
     )
+    # ------------------------------------------------------------------
+    # Milestone 3.3 - scan preprocessing and the solver safety gate.
+    # ------------------------------------------------------------------
+    preprocess_preset: EnumProperty(
+        name="Preset",
+        items=[(name, label, desc) for name, label, desc, _t in preprocess.PRESETS],
+        default='STANDARD',
+        update=_on_preprocess_preset_changed,
+    )
+    preprocess_target_triangles: IntProperty(
+        name="Target Triangles",
+        description="Approximate triangle count for the measurement copy. "
+                    "Collapse decimation lands near it, not exactly on it",
+        default=preprocess.DEFAULT_TARGET_TRIANGLES,
+        min=1000, max=20000000,
+    )
+    preprocess_report: StringProperty(name="Preprocessing Report", default="")
+    preprocess_valid: BoolProperty(default=False)
+    preprocess_copy_name: StringProperty(default="")
+    preprocess_running: BoolProperty(default=False, options={'SKIP_SAVE'})
+
+    dense_threshold_triangles: IntProperty(
+        name="Dense Mesh Threshold",
+        description="Triangle count above which exact geodesic computation is "
+                    "treated as unsafe. An operational threshold, not a "
+                    "mathematical limit",
+        default=preprocess.DEFAULT_DENSE_THRESHOLD,
+        min=10000, max=50000000,
+    )
+    guard_dense_solve: BoolProperty(
+        name="Block Solving Above Threshold",
+        description="Refuse exact geodesic computation on a mesh above the "
+                    "density threshold. A dense scan has crashed Blender with "
+                    "SIGSEGV, and a crash loses the session, so this defaults "
+                    "on. Untick to warn instead of refusing",
+        default=True,
+    )
+    show_preprocessing: BoolProperty(name="Scan Preprocessing", default=False)
+
     # ------------------------------------------------------------------
     # Milestone 3.2 - measurement visualisation. Display only: nothing here
     # can change a distance, a path or a measurement's validity.
@@ -1700,6 +1780,7 @@ classes = (
     BSMT_SurfacePoint,
     BSMT_Landmark,
     BSMT_Measurement,
+    BSMT_ScanProvenance,
     BSMT_ComponentInfo,
     BSMT_Properties,
 )
@@ -1712,9 +1793,14 @@ def register():
     # Scene-level, as specified in the Milestone 3.0 brief.
     bpy.types.Scene.bsmt_landmarks = CollectionProperty(type=BSMT_Landmark)
     bpy.types.Scene.bsmt_measurements = CollectionProperty(type=BSMT_Measurement)
+    # Provenance lives on the generated object itself, so it travels with the
+    # .blend and cannot drift from the object it describes.
+    bpy.types.Object.bsmt_scan = PointerProperty(type=BSMT_ScanProvenance)
 
 
 def unregister():
+    if hasattr(bpy.types.Object, "bsmt_scan"):
+        del bpy.types.Object.bsmt_scan
     if hasattr(bpy.types.Scene, "bsmt_measurements"):
         del bpy.types.Scene.bsmt_measurements
     if hasattr(bpy.types.Scene, "bsmt_landmarks"):

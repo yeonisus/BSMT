@@ -9,7 +9,13 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 
 from . import (attach, geodesic, landmarks, measurement, measurements,
-               picking, protocol, state, visualization, viz)
+               picking, preprocess, protocol, scancopy, state,
+               visualization, viz)
+
+def _addon_version():
+    from . import bl_info
+    return ".".join(str(part) for part in bl_info["version"])
+
 
 # Events that must keep working while the modal picker is active, so the user
 # can orbit / zoom / change the view before committing to a click.
@@ -451,6 +457,16 @@ class BSMT_OT_calculate_surface_distance(bpy.types.Operator):
             state.set_surface_failure(props, message)
             self.report({'ERROR'}, "BSMT: " + message)
             return {'CANCELLED'}
+
+        # Safety gate BEFORE any solver construction (sect. 9).
+        gate = solver_preflight(props, canonical)
+        if not gate["allowed"]:
+            message = _report_preflight(self, gate, " (A/B)")
+            state.set_surface_failure(props, message)
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+        for line in gate["warnings"]:
+            print("[BSMT] warning (A/B): %s" % line)
 
         specs = []
         for slot in ('A', 'B'):
@@ -1973,6 +1989,17 @@ def _measure_one(context, props, item, report_lines=None):
             item.status_detail = message
             return False, message
 
+        gate = solver_preflight(props, canonical)
+        if not gate["allowed"]:
+            message = _report_preflight(None, gate,
+                                        " (%s)" % item.protocol_id)
+            state.clear_measurement_result(item)
+            item.status = measurements.STATUS_FAILED
+            item.status_detail = message
+            return False, message
+        for line in gate["warnings"]:
+            print("[BSMT] warning (%s): %s" % (item.protocol_id, line))
+
         specs = []
         for point in (source_point, target_point):
             specs.append(solve.PointSpec(
@@ -2681,6 +2708,15 @@ class BSMT_OT_compute_surface_path(bpy.types.Operator):
             self.report({'ERROR'}, "BSMT: " + message)
             return {'CANCELLED'}
 
+        gate = solver_preflight(props, canonical)
+        if not gate["allowed"]:
+            message = _report_preflight(self, gate, " (path)")
+            props.viz_status = message
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+        for line in gate["warnings"]:
+            print("[BSMT] warning (path): %s" % line)
+
         specs = []
         for landmark in (source, target):
             point = landmark.surface_point
@@ -2845,6 +2881,305 @@ class BSMT_OT_clear_all_visualizations(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Scan preprocessing and the solver safety gate (Milestone 3.3)
+# ---------------------------------------------------------------------------
+
+
+def solver_preflight(props, canonical):
+    """Gate every route to the native solver. Returns the preflight dict.
+
+    A dense Design X OBJ with non-manifold edges has crashed Blender with
+    SIGSEGV, and a crash takes the whole session with it. The canonical mesh
+    already carries its topology report from build time, so this costs
+    nothing and runs before pygeodesic is ever constructed.
+    """
+    report = getattr(canonical, "topology", None) or {}
+    return preprocess.preflight(
+        report,
+        dense_threshold=props.dense_threshold_triangles,
+        guard_dense=props.guard_dense_solve,
+    )
+
+
+def _report_preflight(operator, result, label=""):
+    """Print the refusals and warnings, and return the message to display."""
+    for line in result["refusals"]:
+        print("[BSMT] REFUSED%s: %s" % (label, line))
+    for line in result["warnings"]:
+        print("[BSMT] warning%s: %s" % (label, line))
+    if result["refusals"]:
+        return " ".join(result["refusals"])
+    return " ".join(result["warnings"])
+
+
+class BSMT_OT_create_measurement_copy(bpy.types.Operator):
+    """Create a lighter TEXTURED measurement copy of the active scan.
+
+    The source scan, its mesh, UVs, materials and image textures are never
+    modified. Nothing is welded and no hole is filled
+    """
+
+    bl_idname = "bsmt.create_measurement_copy"
+    bl_label = "Create Measurement Copy"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        obj = context.active_object
+        if props is None or props.preprocess_running:
+            return False
+        return (obj is not None and obj.type == 'MESH'
+                and not visualization.is_helper(obj))
+
+    def execute(self, context):
+        import datetime
+
+        props = state.get_props(context)
+        source = context.active_object
+        if props is None or source is None or source.type != 'MESH':
+            self.report({'ERROR'}, "BSMT: select a mesh scan first")
+            return {'CANCELLED'}
+        if visualization.is_helper(source):
+            self.report({'ERROR'},
+                        "BSMT: '%s' is a BSMT helper, not a scan" % source.name)
+            return {'CANCELLED'}
+        if getattr(source, "bsmt_scan", None) is not None \
+                and source.bsmt_scan.is_measurement_copy:
+            self.report({'ERROR'},
+                        "BSMT: '%s' is already a measurement copy. Select the "
+                        "original scan." % source.name)
+            return {'CANCELLED'}
+
+        unavailable = geodesic.ensure_loaded()
+        if unavailable:
+            self.report({'ERROR'}, "BSMT: " + unavailable)
+            return {'CANCELLED'}
+
+        props.preprocess_running = True
+        try:
+            return self._run(context, props, source, datetime)
+        finally:
+            props.preprocess_running = False
+
+    def _run(self, context, props, source, datetime):
+        lines = []
+        source_facts = scancopy.audit_object(source)
+        source_triangles = scancopy.triangle_count(source.data)
+        source_mesh_name = source.data.name
+        source_vertex_count = len(source.data.vertices)
+
+        # --- precheck on the ORIGINAL (sect. 5) ---------------------------
+        started = time.perf_counter()
+        try:
+            before_report = self._diagnose(context, props, source)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'},
+                        "BSMT: topology precheck failed (%s)" % exc)
+            return {'CANCELLED'}
+        precheck_seconds = time.perf_counter() - started
+        # Topology warnings never block preprocessing - preprocessing is what
+        # the researcher runs BECAUSE the input has warnings.
+
+        try:
+            step = preprocess.plan(props.preprocess_target_triangles,
+                                   source_triangles)
+        except preprocess.PreprocessError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        lines.append("Plan: %s" % step["summary"])
+        print("[BSMT] measurement copy of '%s': %s"
+              % (source.name, step["summary"]))
+
+        # --- duplicate, then decimate the COPY ----------------------------
+        existing = scancopy.find_measurement_copy(source)
+        if existing is not None:
+            lines.append("Replaced the previous copy '%s'." % existing.name)
+            bpy.data.objects.remove(existing, do_unlink=True)
+
+        copy = scancopy.duplicate(source)
+        decimate_seconds = 0.0
+        if step["method"] == preprocess.METHOD_DECIMATE:
+            try:
+                decimate_seconds = scancopy.apply_decimation(
+                    context, copy, step["ratio"]
+                )
+            except Exception as exc:                  # noqa: BLE001
+                traceback.print_exc()
+                bpy.data.objects.remove(copy, do_unlink=True)
+                self.report({'ERROR'}, "BSMT: decimation failed (%s)" % exc)
+                return {'CANCELLED'}
+
+        actual_triangles = scancopy.triangle_count(copy.data)
+
+        # --- texture / UV verification (sect. 4) --------------------------
+        copy_facts = scancopy.audit_object(copy)
+        texture_ok, problems, notes = preprocess.compare_texture(
+            source_facts, copy_facts
+        )
+
+        # --- postcheck on the COPY (sect. 6) ------------------------------
+        started = time.perf_counter()
+        try:
+            after_report = self._diagnose(context, props, copy)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            after_report = {}
+            problems.append("topology postcheck failed (%s)" % exc)
+        postcheck_seconds = time.perf_counter() - started
+
+        record = {
+            "source_name": source.name,
+            "source_mesh_name": source_mesh_name,
+            "original_triangles": source_triangles,
+            "target_triangles": int(props.preprocess_target_triangles),
+            "actual_triangles": actual_triangles,
+            "method": step["method"],
+            "ratio": step["ratio"],
+            "bsmt_version": _addon_version(),
+            "created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        scancopy.write_provenance(copy, source, record)
+
+        # --- assemble the report ------------------------------------------
+        accuracy, within = preprocess.accuracy_note(
+            actual_triangles, props.preprocess_target_triangles
+        )
+        lines.append("Result: %s" % accuracy)
+        if not within and step["method"] == preprocess.METHOD_DECIMATE:
+            lines.append("  (collapse decimation is approximate)")
+        lines.append("")
+        lines.extend(preprocess.format_comparison(before_report, after_report))
+        lines.append("")
+        lines.append("Texture / UV")
+        for note in notes:
+            lines.append("  ok  %s" % note)
+        for problem in problems:
+            lines.append("  !!  %s" % problem)
+        lines.append("")
+        lines.extend(preprocess.provenance_lines(record))
+        lines.append("")
+        lines.append("Timing")
+        lines.append("  precheck   %.2f s" % precheck_seconds)
+        lines.append("  decimate   %.2f s" % decimate_seconds)
+        lines.append("  postcheck  %.2f s" % postcheck_seconds)
+
+        gate = preprocess.preflight(
+            after_report, props.dense_threshold_triangles,
+            props.guard_dense_solve,
+        )
+        lines.append("")
+        lines.append("Exact geodesic readiness")
+        if gate["allowed"]:
+            lines.append("  the copy passes the solver safety gate")
+        for line in gate["refusals"]:
+            lines.append("  REFUSED: %s" % line)
+        for line in gate["warnings"]:
+            lines.append("  warning: %s" % line)
+
+        props.preprocess_report = "\n".join(lines)
+        props.preprocess_valid = True
+        props.preprocess_copy_name = copy.name
+        print("\n[BSMT] Scan preprocessing\n" + props.preprocess_report + "\n")
+
+        if not texture_ok:
+            # sect. 4: a copy that lost its texture is NOT measurement-ready.
+            # It is kept so the researcher can see what happened, but it is
+            # reported as a failure rather than offered as usable.
+            self.report(
+                {'ERROR'},
+                "BSMT: preprocessing FAILED - %s. '%s' is not "
+                "measurement-ready." % ("; ".join(problems), copy.name),
+            )
+            return {'CANCELLED'}
+
+        source_unchanged = (
+            scancopy.triangle_count(source.data) == source_triangles
+            and len(source.data.vertices) == source_vertex_count
+            and source.data.name == source_mesh_name
+        )
+        if not source_unchanged:
+            # Should be impossible - everything ran on the duplicate - but the
+            # promise "the source is never modified" is worth verifying rather
+            # than asserting.
+            self.report({'ERROR'},
+                        "BSMT: the source scan changed during preprocessing. "
+                        "This is a bug; do not trust the copy.")
+            return {'CANCELLED'}
+
+        self.report(
+            {'WARNING'} if gate["refusals"] else {'INFO'},
+            "BSMT: created '%s' - %s. %s"
+            % (copy.name, accuracy,
+               "Still not solver-safe: " + " ".join(gate["refusals"])
+               if gate["refusals"] else "Passes the solver safety gate."),
+        )
+        return {'FINISHED'}
+
+    @staticmethod
+    def _diagnose(context, props, obj):
+        canonical = geodesic.meshcache.get(context, obj, props.unit,
+                                           rebuild=True)
+        return dict(canonical.topology or {})
+
+
+class BSMT_OT_toggle_measurement_copy(bpy.types.Operator):
+    """Show the original scan or its measurement copy, one at a time.
+
+    Visibility only. Neither object is deleted, and nothing is irreversible
+    """
+
+    bl_idname = "bsmt.toggle_measurement_copy"
+    bl_label = "Toggle Original / Measurement Copy"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            return False
+        return (scancopy.resolve_source(obj) is not None
+                or scancopy.find_measurement_copy(obj) is not None)
+
+    def execute(self, context):
+        obj = context.active_object
+        source = scancopy.resolve_source(obj)
+        if source is not None:
+            copy = obj
+        else:
+            source = obj
+            copy = scancopy.find_measurement_copy(obj)
+        if source is None or copy is None:
+            self.report({'ERROR'}, "BSMT: no original/copy pair found")
+            return {'CANCELLED'}
+
+        showing_copy = not copy.hide_viewport
+        copy.hide_viewport = showing_copy
+        source.hide_viewport = not showing_copy
+        now = source.name if showing_copy else copy.name
+        self.report({'INFO'}, "BSMT: showing '%s'" % now)
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_preprocess_report(bpy.types.Operator):
+    """Clear the preprocessing report. Objects are not touched"""
+
+    bl_idname = "bsmt.clear_preprocess_report"
+    bl_label = "Clear Report"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        if props is not None:
+            props.preprocess_report = ""
+            props.preprocess_valid = False
+            props.preprocess_copy_name = ""
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_topology(bpy.types.Operator):
     """Clear the topology diagnostics report"""
 
@@ -2900,6 +3235,9 @@ classes = (
     BSMT_OT_refresh_visualization,
     BSMT_OT_clear_visualization,
     BSMT_OT_clear_all_visualizations,
+    BSMT_OT_create_measurement_copy,
+    BSMT_OT_toggle_measurement_copy,
+    BSMT_OT_clear_preprocess_report,
 )
 
 
