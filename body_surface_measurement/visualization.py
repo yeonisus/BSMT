@@ -23,6 +23,8 @@ MEASUREMENT_PREFIX = "BSMT_Measurement_"
 REPAIR_PREFIX = "BSMT_Repair_"
 REPAIR_NON_MANIFOLD = REPAIR_PREFIX + "NonManifold"
 REPAIR_BOUNDARY = REPAIR_PREFIX + "Boundary"
+REPAIR_DEGENERATE = REPAIR_PREFIX + "Degenerate"
+REPAIR_DEGENERATE_ACTIVE = REPAIR_PREFIX + "DegenerateActive"
 ALIGN_PREFIX = "BSMT_Align_"
 ALIGN_AXES = ALIGN_PREFIX + "Axes"
 STRAIGHT_SUFFIX = "_Straight"
@@ -47,6 +49,12 @@ LANDMARK_UNVERIFIED_COLOR = (0.75, 0.75, 0.2, 1.0)  # dull yellow
 # to draw them.
 REPAIR_NON_MANIFOLD_COLOR = (1.0, 0.05, 0.35, 1.0)   # magenta-red
 REPAIR_BOUNDARY_COLOR = (0.15, 0.6, 1.0, 1.0)        # blue
+# A zero-area triangle is invisible at any zoom - it has no area to see - so
+# the highlight is what makes it findable at all. The selected one is
+# distinguished from the rest, because stepping through defects is only
+# useful if you can tell which one you are on.
+REPAIR_DEGENERATE_COLOR = (1.0, 0.75, 0.0, 1.0)      # amber
+REPAIR_DEGENERATE_ACTIVE_COLOR = (1.0, 1.0, 1.0, 1.0)  # white
 
 # Marker spheres are built once at radius 1.0 and resized with object scale, so
 # changing "Marker Size" never rebuilds geometry.
@@ -685,6 +693,47 @@ def show_repair_edges(context, props, name, points_local, edges, matrix_world,
     obj = new_helper_object(context, name, mesh, color)
     obj.show_in_front = True          # a defect hidden inside the scan is
     obj.display_type = 'WIRE'         # exactly the one you need to see
+    obj.matrix_world = matrix_world
+    return obj
+
+
+def show_repair_markers(context, name, points_local, size, matrix_world,
+                        color):
+    """Draw a 3D cross at each location. Returns the helper object, or None.
+
+    Degenerate triangles need this rather than `show_repair_edges`: a
+    zero-area triangle has no area to draw and, when its vertices are
+    coincident, no edge length either - highlighting its outline would draw
+    nothing at all. A cross of a fixed size at the defect's centroid is what
+    makes an invisible defect findable on a body.
+
+    Wire, drawn in front, never selectable, and in the BSMT helper
+    collection like every other helper, so it cannot be mistaken for the scan
+    or reach canonical mesh construction (sect. 18).
+    """
+    existing = _existing_helper(name)
+    if existing is not None:
+        remove_object(existing)
+    points = [tuple(float(v) for v in point) for point in points_local]
+    if not points or size <= 0.0:
+        return None
+
+    vertices = []
+    edges = []
+    for point in points:
+        base = len(vertices)
+        for axis in range(3):
+            for direction in (-1.0, 1.0):
+                offset = [0.0, 0.0, 0.0]
+                offset[axis] = direction * float(size)
+                vertices.append((point[0] + offset[0], point[1] + offset[1],
+                                 point[2] + offset[2]))
+            edges.append((base + axis * 2, base + axis * 2 + 1))
+
+    mesh = _edge_mesh(name + "_Mesh", vertices, edges)
+    obj = new_helper_object(context, name, mesh, color)
+    obj.show_in_front = True
+    obj.display_type = 'WIRE'
     obj.matrix_world = matrix_world
     return obj
 

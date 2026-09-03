@@ -76,8 +76,16 @@ stepped through, so any panel can be opened at any time.
    checks, and the one-line verdict — `MEASUREMENT READY`, `WARNING` or
    `NOT READY`. Use *Source* / *Measurement* / *Both* to compare the two by
    eye: silhouette, landmark regions, texture and colour registration.
-5. **Scan Preprocessing → Mesh Repair** → *Analyze Mesh*, then *Repair Local
-   Defects* if the verdict reports non-manifold edges.
+5. **Scan Preprocessing → Mesh Repair** → *Analyze Mesh*. If the verdict is
+   `NOT READY`, this is where you fix it:
+   - **Degenerate triangles** block exact measurement. *Show Degenerate
+     Triangles* marks them, *Defect i / N* steps through them, *Focus* frames
+     the view on one, *Preview Repair* says exactly what would change, and
+     *Apply Repair* merges only the exactly coincident vertices inside those
+     triangles. Re-analysis and the verdict update automatically.
+   - **Non-manifold edges** likewise block; *Repair Local Defects* handles
+     small localised artefacts, and anything larger is reported for manual
+     inspection.
 6. **Alignment** → align the scan, if the study needs a common frame.
 7. **Landmark Manager** → add landmarks, pick each one on the surface.
    **Do this on the measurement mesh**, after preprocessing — see below.
@@ -139,6 +147,19 @@ Backend (Developer)**. Both are closed by default.
   On a human scan those silently fuse anatomically distinct surfaces that
   happen to touch — arm to torso, finger to finger, garment to skin — and a
   fused surface produces a confidently wrong, systematically short geodesic.
+- **Mesh Repair v1 does not perform global welding or automatic hole
+  filling.** It merges only vertices that are at bit-identically the same
+  position *and* sit inside a degenerate triangle you have selected. There is
+  no distance tolerance, for the reason above. Near-coincident vertices are
+  reported and never merged; boundary edges can be shown and are never
+  filled; non-manifold geometry beyond small local artefacts is reported for
+  manual inspection.
+- **A repair invalidates landmarks on that mesh.** They go STALE and must be
+  re-picked; BSMT never re-projects them, because a stored triangle index
+  does not name the same point on a changed surface.
+- **"Degenerate" means exactly flat.** A triangle counts as degenerate when
+  its area is at or below `(1e-9 × bounding-box diagonal)²`. A merely thin
+  sliver is not flagged.
 - **The 1,000,000-triangle density limit is operational, not mathematical.**
   It is where the exact solver becomes slow and has been observed to be
   unstable on real scans; it says nothing about what the MMP algorithm can

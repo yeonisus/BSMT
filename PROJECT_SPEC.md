@@ -4019,6 +4019,131 @@ package installs on a clean Blender config and applies the unified policy.
 
 ---
 
+## 11w. Milestone 3.19 — Mesh Repair v1 (v0.24.0, 2026-09-03)
+
+Since 0.23.0 a degenerate triangle hard-blocks exact surface measurement. That is correct, and it
+left a real scan stuck: ~351,220 triangles, 1 connected component, 0 boundary edges, 0 non-manifold
+edges — measurable in every respect except that a handful of collapsed vertices had produced
+zero-area triangles. This milestone gives that scan a way forward without welding anything the
+researcher did not ask for.
+
+### 11w.1 What was already there
+
+Mesh Repair is not new. Milestones 3.4 and 3.5 shipped non-manifold region classification, boundary
+loop detection, component removal, local non-manifold repair, backups, and the edge highlight
+helpers, all in an existing **Mesh Repair** panel. None of it was rebuilt. What was missing was
+anything at all about DEGENERATE triangles — the one defect that now blocks measurement.
+
+### 11w.2 Detection: one rule, now with indices
+
+`topology.analyse` counted degenerate triangles but did not say which they were. Rather than
+re-deriving the rule in a repair module, the rule moved into two shared helpers —
+`topology.degenerate_area_threshold` and `topology.degenerate_triangles` — and `analyse` now calls
+them for its own count. The count in the diagnostics and the set a repair acts on are the same set
+by construction. `topology.exact_duplicate_groups` does the same for coincident vertices: the
+existing count function said *how many*, and repair needs *which*.
+
+### 11w.3 Two kinds of degenerate triangle, and only one is repairable
+
+| Kind | Meaning | v1 |
+|---|---|---|
+| **COINCIDENT** | two or more corners at bit-identically the same position | **locally repairable** |
+| **SLIVER** | three distinct positions that happen to be collinear | **refused** |
+
+A sliver is refused because fixing one means moving a vertex or deleting a face that is part of the
+real surface, and neither is a decision an automatic repair may take on a research scan. The
+refusal is explicit: *"Automatic local repair is not safe for this defect. Its three vertices are
+at distinct positions, so removing it would delete part of the real surface. Inspect manually."*
+
+### 11w.4 The repair, and why it cannot weld a finger to a finger
+
+`bmesh.ops.weld_verts` with an explicit targetmap built from the chosen defects' own corners.
+**There is no distance tolerance anywhere in the repair path** — not in the pure planner, not in
+the Blender applier, not as a UI setting. `remove_doubles` is never called there. Asserted by tests
+that strip comments and docstrings before matching, because the first version of those checks fired
+on prose that names the very operators it promises not to call.
+
+A duplicate is only ever welded onto a survivor at bit-identically the same coordinates, so **no
+vertex moves**: faces that referenced the duplicate come to reference the survivor, and faces that
+lose a corner disappear because they no longer bound any area.
+
+### 11w.5 The validity guard earned its place immediately
+
+The first acceptance fixture collapsed 14 adjacent vertices onto a single point. Applying the plan
+would have produced **2 non-manifold edges** — a fan collapse is genuinely unrepairable by a local
+merge. The guard caught it, restored the mesh from its backup and said why, before anything was
+committed.
+
+That case is now a test of its own (`K`), and the motivating fixture was rebuilt to match the real
+scan instead: **seven isolated edge collapses**, giving 14 exactly coincident vertices and 14
+degenerate triangles on a closed, manifold, single-component mesh — the reported profile. It
+repairs cleanly:
+
+| | Before | After |
+|---|---|---|
+| Degenerate triangles | 14 | **0** |
+| Non-manifold edges | 0 | 0 |
+| Boundary edges | 0 | 0 |
+| Connected components | 1 | 1 |
+| Verdict | **NOT READY** | **READY** |
+
+A repair that raises non-manifold edges, boundary edges, components or degenerate triangles, or
+that loses appearance data, is reverted rather than reported as a success with a caveat.
+
+### 11w.6 Locating an invisible defect
+
+A zero-area triangle has no outline to draw, so the existing `show_repair_edges` would have drawn
+nothing. `show_repair_markers` draws a 3D cross at each defect's centroid, sized at 0.5% of the
+mesh diagonal, with a second larger white marker on the selected one. Helpers live in the BSMT
+helper collection, are unselectable, are drawn in front, never reach canonical mesh construction,
+and are removed by the existing Clear Highlights.
+
+*Defect i / N* with Previous / Next, and **Focus Selected Defect**, which writes only
+`region_3d.view_location` and `view_distance` — the **view** moves, the scan never does, asserted
+by comparing `matrix_world` across the operation.
+
+### 11w.7 After a repair
+
+Nothing keeps a pre-repair state. The canonical cache is rebuilt; `state.invalidate_for_geometry_change`
+re-classifies landmarks on that mesh through the existing `refresh_landmark_status` rules (STALE,
+**never** re-projected — a stored triangle index does not name the same point on a changed
+surface); measurement results and cached paths on that mesh are invalidated by the existing
+machinery; diagnostics re-run; and the verdict is re-derived by the same
+`blocking_defects` → `classify_ready` / `preflight` policy. **No Repair-specific readiness rule
+exists** (sect. 16). The panel warns *before* repairing, naming how many landmarks will need
+re-picking.
+
+Provenance is **appended** to the preprocessing record, never replacing it: a repaired mesh is
+still a decimated copy of a particular scan, and losing that would lose where the measurements came
+from.
+
+### 11w.8 A threshold worth stating
+
+BSMT calls a triangle degenerate when its area is at or below `(1e-9 × bounding-box diagonal)²`.
+Building the sliver fixture made the consequence concrete: a triangle formed from two sphere
+vertices and their midpoint has an area of about **7e-09** and is correctly **not** flagged. The
+rule catches triangles that are *exactly* flat, not merely thin. It is unchanged by this milestone;
+it is simply now written down.
+
+### 11w.9 What is verified
+
+`tests/test_repair.py` 182 → 238 offline checks: detection and classification, the local repair
+leaving coordinates untouched, slivers refused, a coincident vertex outside any degenerate face
+left alone, near-coincident vertices never merged, every branch of the validity guard, and the
+absence of any global weld or tolerance in the repair path.
+
+`tests/test_mesh_repair_blender.py` (new, 76 checks under Blender): the motivating fixture through
+the whole workflow, the source scan byte-for-byte unchanged, provenance appended, landmarks going
+STALE without re-projection, coincident-only and sliver meshes refused, highlights created and
+cleared, and the validity guard reverting a fan collapse.
+
+Regression: 2,516 offline checks across twenty-one suites, plus 76 mesh-repair, 35
+degenerate-policy, 89 workflow-UI, 110 preprocessing and 90 path-visualisation checks in Blender.
+0 failures. The 0.24.0 extension package installs on a clean Blender config with every repair
+operator registered.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~

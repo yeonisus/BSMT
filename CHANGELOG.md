@@ -4,6 +4,72 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.24.0 — Mesh Repair v1: bounded local repair of degenerate triangles
+
+Since 0.23.0 a degenerate triangle hard-blocks exact surface measurement,
+which is correct and left a real scan stuck: ~351,220 triangles, 1 component,
+0 boundary edges, 0 non-manifold edges — measurable in every respect except
+that a handful of collapsed vertices had produced zero-area triangles. This
+milestone gives that scan a way forward without welding anything the
+researcher did not ask for.
+
+**Detect → locate → inspect → preview → repair → re-analyze**, all in the
+existing **Mesh Repair** panel, on the **measurement mesh** only.
+
+- **Analyze Mesh now lists degenerate triangles**, classified as either a
+  *collapse* (two or more corners at bit-identically the same position, so a
+  local merge fixes it) or a *sliver* (three distinct positions, which no
+  automatic repair may touch). The list comes from the existing Analyze pass,
+  not a second operator.
+- **Show Degenerate Triangles** marks each one with a 3D cross, because a
+  zero-area triangle has no outline to draw — highlighting it as edges would
+  draw nothing. The selected defect gets a second, larger white marker.
+  Helpers live in the BSMT helper collection, are unselectable, and are
+  removed by Clear Highlights.
+- **Defect i / N with Previous / Next**, and **Focus Selected Defect**, which
+  moves the *view* only — the scan is never moved, rotated or scaled.
+- **Preview Repair** states exactly what will happen — "Repair will merge 2
+  exact coincident vertices and remove 1 zero-area face." — and changes
+  nothing. When there is no safe local repair it says so instead of guessing.
+- **Apply Repair** merges *only* the exactly coincident vertices inside the
+  chosen degenerate triangles, using `bmesh.ops.weld_verts` with an explicit
+  targetmap. **There is no distance tolerance anywhere in the repair path**,
+  and no global merge-by-distance — asserted by tests against the code with
+  comments and docstrings stripped. A vertex is only ever welded onto one at
+  bit-identically the same coordinates, so no surface point moves.
+- **Validity guard (this earned its place).** The first fixture — 14 adjacent
+  vertices collapsed onto one point — would have introduced 2 non-manifold
+  edges. The guard caught it, restored the mesh from its backup, and reported
+  why. A repair that raises non-manifold edges, boundary edges, components or
+  degenerate triangles, or that loses appearance data, is reverted rather
+  than reported as a success with a caveat.
+- **After a repair**: the canonical cache is rebuilt, landmarks on that mesh
+  are re-classified by the existing status rules (STALE, **never**
+  re-projected), measurement results and cached paths on that mesh are
+  invalidated, diagnostics re-run, and the verdict is re-derived by the same
+  `blocking_defects` → `classify_ready` / `preflight` policy. No
+  Repair-specific readiness rule exists.
+- **Landmark warning before repairing**, in the panel, naming how many will
+  need re-picking.
+- **Provenance is appended**, never overwritten: repair applied, type,
+  degenerate before/after, vertices merged, faces removed, version and
+  timestamp sit alongside the preprocessing record.
+- Not in v1, deliberately: global welding, tolerance-based near-coincident
+  merging, hole filling, remeshing, smoothing. Boundary edges and non-manifold
+  edges can still be *shown* by the existing buttons and are not auto-repaired
+  here.
+
+**A threshold worth knowing.** BSMT calls a triangle degenerate when its area
+is at or below `(1e-9 × bounding-box diagonal)²`. That catches triangles that
+are *exactly* flat, not merely thin: a sliver of area ~7e-09 on a metre-scale
+mesh is not flagged. The rule is unchanged — this is what it has always
+meant, now stated.
+- Tests: `tests/test_repair.py` 182 → 238 offline; new
+  `tests/test_mesh_repair_blender.py`, 76 checks in Blender. 2,516 offline
+  checks across twenty-one suites, 0 failures; degenerate-policy 35/35,
+  workflow-UI 89/89, preprocessing 110/110 and path visualization 90/90
+  unchanged.
+
 ## 0.23.0 — one degenerate-triangle policy
 
 Closes the divergence recorded as an open item in 0.22.1: the sidebar said

@@ -567,6 +567,19 @@ class BSMT_ScanProvenance(bpy.types.PropertyGroup):
                     "same exact surface",
     )
 
+    # Milestone 3.19 - repair provenance, APPENDED to the preprocessing
+    # record above rather than replacing it: a repaired mesh is still a
+    # decimated copy of a particular scan, and losing that would lose where
+    # the measurements came from.
+    repair_applied: BoolProperty(default=False)
+    repair_type: StringProperty(default="")
+    repair_degenerate_before: IntProperty(default=0)
+    repair_degenerate_after: IntProperty(default=0)
+    repair_merged_vertices: IntProperty(default=0)
+    repair_removed_faces: IntProperty(default=0)
+    repair_version: StringProperty(default="")
+    repair_created: StringProperty(default="")
+
 
 class BSMT_BoundaryLoop(bpy.types.PropertyGroup):
     """One detected boundary loop, for the repair list. Display only."""
@@ -592,6 +605,23 @@ class BSMT_RepairComponent(bpy.types.PropertyGroup):
     is_small: BoolProperty(default=False)
     is_largest: BoolProperty(default=False)
     label: StringProperty(default="")
+
+
+class BSMT_DegenerateDefect(bpy.types.PropertyGroup):
+    """One degenerate triangle, for the repair list. Display only.
+
+    Holds no geometry: the triangle index addresses the CANONICAL array the
+    diagnostics were computed from, and the centroid is carried only so the
+    viewport can be framed on it without re-reading the mesh.
+    """
+
+    triangle_index: IntProperty(default=-1)
+    kind: StringProperty(default="")
+    label: StringProperty(default="")
+    repairable: BoolProperty(default=False)
+    centroid: FloatVectorProperty(size=3, default=(0.0,) * 3)
+    area: FloatProperty(default=0.0)
+    merge_count: IntProperty(default=0)
 
 
 class BSMT_ComponentInfo(bpy.types.PropertyGroup):
@@ -1070,6 +1100,28 @@ class BSMT_Properties(bpy.types.PropertyGroup):
     boundary_loop_index: IntProperty(default=0, min=0)
     repair_components: CollectionProperty(type=BSMT_RepairComponent)
     repair_component_index: IntProperty(default=0, min=0)
+
+    # Milestone 3.19 - degenerate triangles, the one blocking defect Mesh
+    # Repair v1 can fix. The list is what Analyze Repair Issues produced; it
+    # is never recomputed by a redraw.
+    repair_degenerates: CollectionProperty(type=BSMT_DegenerateDefect)
+    repair_degenerate_index: IntProperty(
+        name="Defect", default=0, min=0,
+        description="Which degenerate triangle is selected for inspection",
+    )
+    repair_degenerate_preview: StringProperty(default="")
+    repair_degenerate_scope: EnumProperty(
+        name="Repair",
+        description="How much to repair in one action",
+        items=(
+            ('SELECTED', "Selected Defect",
+             "Repair only the degenerate triangle selected above"),
+            ('ALL_SAFE', "All Repairable",
+             "Repair every degenerate triangle whose vertices are exactly "
+             "coincident. Slivers are left alone"),
+        ),
+        default='ALL_SAFE',
+    )
 
     repair_weld_distance_mm: FloatProperty(
         name="Local Weld Distance (mm)",
@@ -1614,6 +1666,58 @@ def refresh_landmark_status(item, canonical=None, object_exists=None):
     )
     set_landmark_status(item, status, detail)
     return status
+
+
+def invalidate_for_geometry_change(context, object_name, props=None):
+    """Re-state every dependency after this object's geometry was edited.
+
+    A repair changes the polyhedral surface, so the geometry hash changes and
+    a stored triangle index no longer names the same point. Nothing is
+    re-projected - that would move a researcher's landmark silently - and
+    nothing is silently kept VALID. Existing machinery does the deciding:
+    `refresh_landmark_status` classifies each landmark against the new
+    canonical mesh, and the existing measurement invalidation drops results
+    and cached paths that were computed on the old geometry.
+
+    Returns a dict of what changed.
+    """
+    if props is None:
+        props = get_props(context)
+    canonical = None
+    if geodesic.MESHCACHE_AVAILABLE:
+        obj = bpy.data.objects.get(object_name)
+        canonical = (geodesic.meshcache.peek_current(obj)
+                     if obj is not None else None)
+
+    stale = 0
+    collection = get_landmarks(context) or ()
+    for item in collection:
+        point = item.surface_point
+        if not point.valid or point.source_object != object_name:
+            continue
+        before = item.status
+        refresh_landmark_status(item, canonical)
+        if item.status != before:
+            stale += 1
+
+    measurements_hit = 0
+    measurement_collection = get_measurements(context) or ()
+    for item in measurement_collection:
+        touched = (item.result_object == object_name
+                   or item.path_object == object_name)
+        if not touched:
+            continue
+        invalidate_measurement_result(item, "the mesh geometry was repaired")
+        measurements_hit += 1
+
+    # A/B is Phase 1 state on the same mesh and must not outlive the edit.
+    if props is not None and props.surface_object == object_name:
+        clear_surface_result(props)
+
+    return {
+        "landmarks_restated": stale,
+        "measurements_invalidated": measurements_hit,
+    }
 
 
 def picked_landmarks(collection):
@@ -2662,9 +2766,25 @@ def flat_to_rows(flat):
     return [values[0:4], values[4:8], values[8:12], values[12:16]]
 
 
+def degenerate_defect_rows(props):
+    """The stored degenerate defects, as a plain list. Display only."""
+    return list(props.repair_degenerates)
+
+
+def active_degenerate_defect(props):
+    """The selected degenerate defect, or None."""
+    index = props.repair_degenerate_index
+    if 0 <= index < len(props.repair_degenerates):
+        return props.repair_degenerates[index]
+    return None
+
+
 def clear_repair_lists(props):
     props.boundary_loops.clear()
     props.repair_components.clear()
+    props.repair_degenerates.clear()
+    props.repair_degenerate_index = 0
+    props.repair_degenerate_preview = ""
     props.boundary_loop_index = 0
     props.repair_component_index = 0
 
@@ -2887,6 +3007,7 @@ classes = (
     BSMT_ScanProvenance,
     BSMT_BoundaryLoop,
     BSMT_RepairComponent,
+    BSMT_DegenerateDefect,
     BSMT_ComponentInfo,
     BSMT_Properties,
 )

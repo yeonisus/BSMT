@@ -6,7 +6,7 @@ import traceback
 import numpy as np
 
 import bpy
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        IntProperty, StringProperty)
 
@@ -3787,6 +3787,26 @@ def _analyse_repair(context, props, obj):
         entry.is_largest = row["is_largest"]
         entry.label = repair.describe_component(row)
 
+    # Milestone 3.19: the one blocking defect this milestone can repair.
+    # Collected by the same Analyze pass rather than by a second operator,
+    # so the lists can never describe different states of the mesh.
+    defects = repair.degenerate_defects(
+        canonical.vertices_solver, canonical.triangles,
+        duplicate_groups=geodesic.topology.exact_duplicate_groups(
+            canonical.vertices_solver),
+    )
+    for defect in defects:
+        entry = props.repair_degenerates.add()
+        entry.triangle_index = defect["index"]
+        entry.kind = defect["kind"]
+        entry.label = repair.describe_degenerate(defect)
+        entry.repairable = defect["kind"] == repair.DEGENERATE_COINCIDENT
+        entry.centroid = defect["centroid"]
+        entry.area = defect["area"]
+        entry.merge_count = sum(len(drops) for _root, drops in defect["merges"])
+    props.repair_degenerate_index = 0
+    props.repair_degenerate_preview = ""
+
     verdict = repair.readiness(report)
     props.repair_readiness = "\n".join(repair.readiness_lines(verdict))
     props.repair_object = obj.name
@@ -4004,6 +4024,406 @@ class BSMT_OT_show_boundary_loop(bpy.types.Operator):
                     % (loop["loop_id"], loop["edge_count"],
                        loop["perimeter_mm"]))
         return {'FINISHED'}
+
+
+def _degenerate_defect_objects(context, props, obj):
+    """Rebuild the pure defect records for the CURRENT canonical mesh.
+
+    The stored list is display state; a repair has to act on defects derived
+    from the mesh as it is now, so this re-derives them rather than trusting
+    property rows that may predate an edit.
+    """
+    canonical = geodesic.meshcache.get(context, obj, props.unit)
+    return canonical, repair.degenerate_defects(
+        canonical.vertices_solver, canonical.triangles,
+        duplicate_groups=geodesic.topology.exact_duplicate_groups(
+            canonical.vertices_solver),
+    )
+
+
+def _chosen_defects(props, defects):
+    """The defects the current scope selects. Empty means nothing to do."""
+    if props.repair_degenerate_scope == 'SELECTED':
+        entry = state.active_degenerate_defect(props)
+        if entry is None:
+            return []
+        return [defect for defect in defects
+                if defect["index"] == entry.triangle_index]
+    return list(defects)
+
+
+def _defect_marker_size(canonical):
+    """Marker size for a defect cross: small against the body, still visible."""
+    report = canonical.topology or {}
+    diagonal = float(report.get("bbox_diagonal", 0.0) or 0.0)
+    return max(diagonal * 0.005, 1.0)
+
+
+class BSMT_OT_show_degenerate_triangles(bpy.types.Operator):
+    """Mark every degenerate triangle in the viewport.
+
+    Overlay only: the mesh is never modified, nothing is selected, and the
+    markers are removed by Clear Highlights
+    """
+
+    bl_idname = "bsmt.show_degenerate_triangles"
+    bl_label = "Show Degenerate Triangles"
+    bl_description = ("Mark the degenerate triangles in the viewport. A"
+                      " zero-area triangle has nothing to see, so each one is"
+                      " marked with a cross. Overlay only")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        try:
+            canonical, defects = _degenerate_defect_objects(context, props, obj)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: analysis failed (%s)" % exc)
+            return {'CANCELLED'}
+        if not defects:
+            visualization.clear_repair_highlights()
+            self.report({'INFO'}, "BSMT: no degenerate triangles on '%s'"
+                        % obj.name)
+            return {'FINISHED'}
+
+        size = _defect_marker_size(canonical)
+        locals_all = [
+            viz.solver_to_local(canonical, [defect["centroid"]])[0]
+            for defect in defects
+        ]
+        visualization.show_repair_markers(
+            context, visualization.REPAIR_DEGENERATE, locals_all, size,
+            obj.matrix_world, visualization.REPAIR_DEGENERATE_COLOR,
+        )
+        self._mark_active(context, props, canonical, defects, obj, size)
+        self.report({'INFO'}, "BSMT: marked %d degenerate triangle(s)"
+                    % len(defects))
+        return {'FINISHED'}
+
+    @staticmethod
+    def _mark_active(context, props, canonical, defects, obj, size):
+        """A second, larger, white marker on the selected defect."""
+        entry = state.active_degenerate_defect(props)
+        if entry is None:
+            return
+        chosen = [defect for defect in defects
+                  if defect["index"] == entry.triangle_index]
+        if not chosen:
+            return
+        point = viz.solver_to_local(canonical, [chosen[0]["centroid"]])[0]
+        visualization.show_repair_markers(
+            context, visualization.REPAIR_DEGENERATE_ACTIVE, [point],
+            size * 2.0, obj.matrix_world,
+            visualization.REPAIR_DEGENERATE_ACTIVE_COLOR,
+        )
+
+
+class BSMT_OT_step_degenerate_defect(bpy.types.Operator):
+    """Step to the previous or next degenerate triangle.
+
+    Selection only: the mesh is not modified and the view is not moved
+    """
+
+    bl_idname = "bsmt.step_degenerate_defect"
+    bl_label = "Step Defect"
+    bl_description = "Select the previous or next degenerate triangle"
+    bl_options = {'REGISTER'}
+
+    direction: EnumProperty(
+        name="Direction",
+        items=(('PREV', "Previous", "Select the previous defect"),
+               ('NEXT', "Next", "Select the next defect")),
+        default='NEXT',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return props is not None and len(props.repair_degenerates) > 1
+
+    def execute(self, context):
+        props = state.get_props(context)
+        total = len(props.repair_degenerates)
+        if not total:
+            return {'CANCELLED'}
+        step = 1 if self.direction == 'NEXT' else -1
+        props.repair_degenerate_index = (
+            (props.repair_degenerate_index + step) % total
+        )
+        entry = state.active_degenerate_defect(props)
+        props.repair_degenerate_preview = ""
+        self.report({'INFO'}, "BSMT: defect %d / %d - %s"
+                    % (props.repair_degenerate_index + 1, total,
+                       entry.label if entry else "?"))
+        return {'FINISHED'}
+
+
+class BSMT_OT_focus_degenerate_defect(bpy.types.Operator):
+    """Frame the viewport on the selected degenerate triangle.
+
+    Moves the VIEW only. The scan is never moved, rotated or scaled
+    """
+
+    bl_idname = "bsmt.focus_degenerate_defect"
+    bl_label = "Focus Selected Defect"
+    bl_description = ("Point the 3D view at the selected degenerate triangle."
+                      " The scan itself is never moved")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return (props is not None
+                and state.active_degenerate_defect(props) is not None)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        entry = state.active_degenerate_defect(props)
+        if obj is None or entry is None:
+            self.report({'ERROR'}, "BSMT: " + (reason or "no defect selected"))
+            return {'CANCELLED'}
+        try:
+            canonical = geodesic.meshcache.get(context, obj, props.unit)
+        except Exception as exc:                      # noqa: BLE001
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        local = viz.solver_to_local(canonical, [tuple(entry.centroid)])[0]
+        world = obj.matrix_world @ Vector(
+            (float(local[0]), float(local[1]), float(local[2]))
+        )
+        moved = 0
+        for area in getattr(context.screen, "areas", ()) or ():
+            if area.type != 'VIEW_3D':
+                continue
+            for space in area.spaces:
+                if space.type != 'VIEW_3D' or space.region_3d is None:
+                    continue
+                # Only the view's own pivot and zoom. Nothing on the object.
+                space.region_3d.view_location = world
+                space.region_3d.view_distance = max(
+                    _defect_marker_size(canonical) * 20.0, 1.0
+                )
+                moved += 1
+            area.tag_redraw()
+        if not moved:
+            self.report({'WARNING'},
+                        "BSMT: no 3D viewport to focus; the defect is at "
+                        "(%.1f, %.1f, %.1f) mm" % tuple(entry.centroid))
+            return {'CANCELLED'}
+        self.report({'INFO'}, "BSMT: focused defect %d / %d"
+                    % (props.repair_degenerate_index + 1,
+                       len(props.repair_degenerates)))
+        return {'FINISHED'}
+
+
+class BSMT_OT_preview_degenerate_repair(bpy.types.Operator):
+    """Say exactly what a local repair would do. Changes nothing.
+
+    If no safe local repair exists it says so rather than guessing
+    """
+
+    bl_idname = "bsmt.preview_degenerate_repair"
+    bl_label = "Preview Repair"
+    bl_description = ("Describe exactly what a local repair would merge and"
+                      " remove. Nothing is modified")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        try:
+            _canonical, defects = _degenerate_defect_objects(context, props, obj)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: analysis failed (%s)" % exc)
+            return {'CANCELLED'}
+
+        chosen = _chosen_defects(props, defects)
+        plan = repair.plan_degenerate_repair(
+            _canonical.vertices_solver, _canonical.triangles, chosen
+        )
+        message = plan["summary"] if plan["safe"] else plan["reason"]
+        props.repair_degenerate_preview = message
+        print("[BSMT] repair preview on '%s': %s" % (obj.name, message))
+        self.report({'INFO'} if plan["safe"] else {'WARNING'},
+                    "BSMT: " + message)
+        return {'FINISHED'}
+
+
+class BSMT_OT_repair_degenerate_local(bpy.types.Operator):
+    """Merge the exactly coincident vertices behind degenerate triangles.
+
+    Strictly local: only vertices inside the chosen degenerate triangles are
+    merged, and only when they sit at bit-identically the same position.
+    There is no distance tolerance, and no global weld
+    """
+
+    bl_idname = "bsmt.repair_degenerate_local"
+    bl_label = "Apply Repair"
+    bl_description = ("Merge only the exactly coincident vertices inside the"
+                      " chosen degenerate triangles, and drop the faces that"
+                      " lose their area. No global weld, no tolerance")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or props.repair_running:
+            return False
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+
+        props.repair_running = True
+        try:
+            return self._run(context, props, obj)
+        finally:
+            props.repair_running = False
+
+    def _run(self, context, props, obj):
+        import datetime
+
+        try:
+            canonical, defects = _degenerate_defect_objects(context, props, obj)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: analysis failed (%s)" % exc)
+            return {'CANCELLED'}
+
+        before = dict(canonical.topology or {})
+        chosen = _chosen_defects(props, defects)
+        plan = repair.plan_degenerate_repair(
+            canonical.vertices_solver, canonical.triangles, chosen
+        )
+        if not plan["safe"]:
+            props.repair_degenerate_preview = plan["reason"]
+            self.report({'WARNING'}, "BSMT: " + plan["reason"])
+            return {'CANCELLED'}
+
+        landmark_count = _landmarks_on_object(context, obj.name)
+        backup = meshrepair.make_backup(obj)
+        texture_before = scancopy.audit_object(obj)
+
+        try:
+            applied = meshrepair.apply_degenerate_plan(obj, plan)
+        except meshrepair.RepairAborted as exc:
+            meshrepair.restore_backup(obj, backup)
+            meshrepair.discard_backup(backup)
+            self.report({'ERROR'}, "BSMT: repair aborted - %s" % exc)
+            return {'CANCELLED'}
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            meshrepair.restore_backup(obj, backup)
+            meshrepair.discard_backup(backup)
+            self.report({'ERROR'}, "BSMT: repair failed (%s)" % exc)
+            return {'CANCELLED'}
+
+        # --- sect. 17: the mesh must not have got worse -------------------
+        try:
+            after_canonical = geodesic.meshcache.get(context, obj, props.unit,
+                                                     rebuild=True)
+            after = dict(after_canonical.topology or {})
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            meshrepair.restore_backup(obj, backup)
+            meshrepair.discard_backup(backup)
+            self.report({'ERROR'},
+                        "BSMT: the repaired mesh could not be re-analyzed "
+                        "(%s); the mesh has been restored" % exc)
+            return {'CANCELLED'}
+
+        ok, problems = repair.verify_degenerate_repair(before, after)
+        texture_ok, texture_problems, _notes = preprocess.compare_texture(
+            texture_before, scancopy.audit_object(obj)
+        )
+        if not texture_ok:
+            ok = False
+            problems.extend(texture_problems)
+
+        if not ok:
+            meshrepair.restore_backup(obj, backup)
+            meshrepair.discard_backup(backup)
+            geodesic.meshcache.get(context, obj, props.unit, rebuild=True)
+            message = ("the repair made the topology worse (%s); the mesh has "
+                       "been restored" % "; ".join(problems))
+            props.repair_degenerate_preview = message
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        meshrepair.discard_backup(backup)
+
+        # --- sect. 12: nothing may keep a pre-repair verdict --------------
+        stale = state.invalidate_for_geometry_change(context, obj.name)
+        _analyse_repair(context, props, obj)
+
+        _record_repair_provenance(obj, plan, applied, before, after,
+                                  datetime.datetime.now())
+
+        verdict, reasons = preprocess.classify_ready(after)
+        summary = (
+            "merged %d coincident vertex/vertices, removed %d face(s); "
+            "degenerate %d -> %d; verdict %s"
+            % (applied["merged_vertices"], applied["removed_faces"],
+               int(before.get("degenerate_triangle_count", 0) or 0),
+               int(after.get("degenerate_triangle_count", 0) or 0),
+               preprocess.READY_LABELS.get(verdict, verdict))
+        )
+        props.repair_degenerate_preview = summary
+        note = ""
+        if landmark_count:
+            note = (" %d landmark(s) on this mesh are now STALE and must be "
+                    "re-picked." % landmark_count)
+        print("[BSMT] repair on '%s': %s%s" % (obj.name, summary, note))
+        if reasons:
+            print("[BSMT]   remaining: %s" % "; ".join(reasons[:3]))
+        self.report({'INFO'}, "BSMT: " + summary + note)
+        return {'FINISHED'}
+
+
+def _record_repair_provenance(obj, plan, applied, before, after, when):
+    """Append repair facts to the mesh's existing provenance (sect. 15).
+
+    Appended, never overwritten: the preprocessing record says where this
+    mesh came from and must survive, because a repaired mesh is still a
+    decimated copy of a particular scan.
+    """
+    provenance = getattr(obj, "bsmt_scan", None)
+    if provenance is None:
+        return None
+    provenance.repair_applied = True
+    provenance.repair_type = repair.DEGENERATE_COINCIDENT
+    provenance.repair_degenerate_before = int(
+        before.get("degenerate_triangle_count", 0) or 0)
+    provenance.repair_degenerate_after = int(
+        after.get("degenerate_triangle_count", 0) or 0)
+    provenance.repair_merged_vertices = int(applied["merged_vertices"])
+    provenance.repair_removed_faces = int(applied["removed_faces"])
+    provenance.repair_version = _addon_version()
+    provenance.repair_created = when.strftime("%Y-%m-%d %H:%M:%S")
+    return provenance
 
 
 class BSMT_OT_clear_repair_highlight(bpy.types.Operator):
@@ -5407,6 +5827,11 @@ classes = (
     BSMT_OT_flip_front_back,
     BSMT_OT_reset_alignment,
     BSMT_OT_analyse_repair,
+    BSMT_OT_show_degenerate_triangles,
+    BSMT_OT_step_degenerate_defect,
+    BSMT_OT_focus_degenerate_defect,
+    BSMT_OT_preview_degenerate_repair,
+    BSMT_OT_repair_degenerate_local,
     BSMT_OT_show_non_manifold,
     BSMT_OT_show_boundary_loop,
     BSMT_OT_clear_repair_highlight,

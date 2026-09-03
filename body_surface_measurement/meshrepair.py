@@ -367,3 +367,77 @@ def verify_texture(obj, before_facts):
     after = scancopy.audit_object(obj)
     ok, problems, _notes = preprocess.compare_texture(before_facts, after)
     return ok, problems, after
+
+
+# ---------------------------------------------------------------------------
+# degenerate triangle repair (Milestone 3.19, Mesh Repair v1)
+# ---------------------------------------------------------------------------
+
+def apply_degenerate_plan(obj, plan):
+    """Apply a `repair.plan_degenerate_repair` plan to a real mesh.
+
+    ``bmesh.ops.weld_verts`` with an explicit targetmap, and deliberately
+    NOT ``remove_doubles``: weld_verts merges exactly the vertices it is
+    handed and nothing else, so the operation is bounded by the plan rather
+    than by a distance. There is no tolerance anywhere in this function -
+    which is what makes it impossible for it to weld a finger to a finger.
+
+    The duplicates being welded sit at bit-identically the same coordinates
+    as their survivor, so no vertex MOVES; the faces that referenced a
+    duplicate simply come to reference the survivor, and the faces that had
+    no area disappear because they no longer have three distinct corners.
+
+    Returns a dict of what actually happened. Raises RepairAborted if the
+    plan cannot be applied, leaving the mesh untouched.
+    """
+    if not plan.get("safe") or not plan.get("merges"):
+        raise RepairAborted("there is no safe local repair to apply")
+
+    before_verts = len(obj.data.vertices)
+    obj.data.calc_loop_triangles()
+    before_tris = len(obj.data.loop_triangles)
+
+    bm = _open(obj)
+    try:
+        targetmap = {}
+        for drop, root in plan["merges"].items():
+            if not (0 <= int(drop) < len(bm.verts)
+                    and 0 <= int(root) < len(bm.verts)):
+                raise RepairAborted(
+                    "the plan refers to vertex %d, which this mesh does not "
+                    "have - re-analyze before repairing" % int(drop)
+                )
+            targetmap[bm.verts[int(drop)]] = bm.verts[int(root)]
+
+        # Guarded rather than assumed: welding vertices that are not actually
+        # coincident would MOVE the surface, which this repair never does.
+        for drop, root in targetmap.items():
+            if (drop.co - root.co).length != 0.0:
+                raise RepairAborted(
+                    "vertices %d and %d are not exactly coincident; a local "
+                    "merge would move the surface"
+                    % (drop.index, root.index)
+                )
+
+        bmesh.ops.weld_verts(bm, targetmap=targetmap)
+        # weld_verts drops the faces that lose a corner, so nothing else has
+        # to be deleted; anything still present is a real face.
+        _commit(obj, bm)
+    except RepairAborted:
+        bm.free()
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        bm.free()
+        raise RepairAborted("local merge failed (%s: %s)"
+                            % (type(exc).__name__, exc))
+
+    obj.data.calc_loop_triangles()
+    after_tris = len(obj.data.loop_triangles)
+    return {
+        "merged_vertices": before_verts - len(obj.data.vertices),
+        "removed_faces": before_tris - after_tris,
+        "vertices_before": before_verts,
+        "vertices_after": len(obj.data.vertices),
+        "triangles_before": before_tris,
+        "triangles_after": after_tris,
+    }

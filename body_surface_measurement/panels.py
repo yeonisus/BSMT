@@ -1934,6 +1934,7 @@ class BSMT_PT_repair(bpy.types.Panel):
             note.label(text=line)
 
         self._draw_diagnostics(layout, props)
+        self._draw_degenerate(context, layout, props)
         self._draw_non_manifold(layout, props)
         self._draw_boundaries(layout, props)
         self._draw_components(layout, props)
@@ -2038,6 +2039,97 @@ class BSMT_PT_repair(bpy.types.Panel):
         for line in _wrap("Nothing is removed automatically. Hair, a garment "
                           "or an accessory can be a legitimate component.",
                           44):
+            note.label(text=line)
+
+
+    @staticmethod
+    def _draw_degenerate(context, layout, props):
+        """The one blocking defect Mesh Repair v1 can fix (Milestone 3.19).
+
+        Deliberately not a list of everything that could be tidied. A
+        degenerate triangle is what BLOCKS exact measurement; boundary edges
+        and coincident vertices are reported elsewhere in this panel and are
+        not presented as things that must be repaired.
+        """
+        total = len(props.repair_degenerates)
+        box = layout.box()
+        header = box.row()
+        header.alert = total > 0
+        header.label(text="Degenerate Triangles: %d" % total,
+                     icon='ERROR' if total else 'CHECKMARK')
+        if not total:
+            note = box.column(align=True)
+            note.scale_y = 0.7
+            note.enabled = False
+            note.label(text="Nothing here blocks exact measurement.")
+            return
+
+        repairable = sum(1 for entry in props.repair_degenerates
+                         if entry.repairable)
+        summary = box.column(align=True)
+        summary.scale_y = 0.75
+        summary.label(text="Locally repairable: %d" % repairable)
+        if repairable < total:
+            row = summary.row()
+            row.alert = True
+            row.label(text="Slivers (manual): %d" % (total - repairable))
+
+        index = min(props.repair_degenerate_index, total - 1)
+        entry = props.repair_degenerates[index]
+        step = box.row(align=True)
+        step.operator("bsmt.step_degenerate_defect", text="",
+                      icon='TRIA_LEFT').direction = 'PREV'
+        label = step.row()
+        label.alignment = 'CENTER'
+        label.label(text="Defect %d / %d" % (index + 1, total))
+        step.operator("bsmt.step_degenerate_defect", text="",
+                      icon='TRIA_RIGHT').direction = 'NEXT'
+
+        detail = box.column(align=True)
+        detail.scale_y = 0.7
+        detail.enabled = False
+        for line in _wrap(entry.label, 44):
+            detail.label(text=line)
+
+        locate = box.row(align=True)
+        locate.operator("bsmt.show_degenerate_triangles", text="Show All",
+                        icon='HIDE_OFF')
+        locate.operator("bsmt.focus_degenerate_defect", text="Focus",
+                        icon='ZOOM_SELECTED')
+
+        box.prop(props, "repair_degenerate_scope", text="")
+        action = box.row(align=True)
+        action.operator("bsmt.preview_degenerate_repair", icon='VIEWZOOM')
+        action.operator("bsmt.repair_degenerate_local", icon='MODIFIER')
+
+        if props.repair_degenerate_preview:
+            preview = box.column(align=True)
+            preview.scale_y = 0.7
+            for line in _wrap(props.repair_degenerate_preview, 44):
+                preview.label(text=line)
+
+        # sect. 13: say it BEFORE the repair, not after.
+        landmarks_here = sum(
+            1 for item in (state.get_landmarks(context) or ())
+            if item.surface_point.valid
+            and item.surface_point.source_object == props.repair_object
+        )
+        if landmarks_here:
+            warn = box.column(align=True)
+            warn.alert = True
+            warn.scale_y = 0.75
+            for line in _wrap("Geometry repair will invalidate existing "
+                              "landmark positions. %d landmark(s) on this "
+                              "mesh will need re-picking."
+                              % landmarks_here, 44):
+                warn.label(text=line)
+
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("Only exactly coincident vertices inside these "
+                          "triangles are merged. No global weld, no distance "
+                          "tolerance, no hole filling.", 44):
             note.label(text=line)
 
 

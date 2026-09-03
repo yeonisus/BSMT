@@ -1010,3 +1010,268 @@ def fillable_boundary_loops(vertices, faces, loops):
             continue
         good.append(loop)
     return good, rejected
+
+
+# ---------------------------------------------------------------------------
+# degenerate triangle repair (Milestone 3.19, Mesh Repair v1)
+# ---------------------------------------------------------------------------
+#
+# The one class of blocking defect this milestone repairs, and the narrowest
+# possible way to repair it.
+#
+# A zero-area triangle makes barycentric reconstruction ill-defined at the
+# point a landmark lands on it, so since 0.23.0 it hard-blocks exact surface
+# measurement. On a real scan the usual cause is a handful of vertices that
+# occupy bit-identically the same position - a collapse the exporter or an
+# earlier tool left behind - and the triangles between them have no area.
+#
+# What is repairable here, and nothing else:
+#
+#   a degenerate triangle at least two of whose vertices are EXACTLY
+#   coincident, merged by moving the duplicates onto one survivor.
+#
+# What is deliberately refused:
+#
+#   * a SLIVER - three distinct positions that happen to be collinear or
+#     near-collinear. Fixing one means moving a vertex or deleting a face
+#     that is part of the real surface, and neither is a decision an
+#     automatic repair may take on a research scan.
+#   * anything needing a tolerance. Merging "near enough" vertices is how a
+#     finger welds to a finger and a geodesic takes a shortcut through the
+#     body. There is no tolerance parameter in this module on purpose.
+#   * anything outside the faces the chosen defects already touch.
+
+DEGENERATE_COINCIDENT = 'COINCIDENT'
+DEGENERATE_SLIVER = 'SLIVER'
+
+DEGENERATE_LABELS = {
+    DEGENERATE_COINCIDENT: "collapsed (exactly coincident vertices)",
+    DEGENERATE_SLIVER: "sliver (distinct but collinear vertices)",
+}
+
+#: Refusal wording for a defect this milestone will not touch.
+UNSAFE_SLIVER = (
+    "Automatic local repair is not safe for this defect. Its three vertices "
+    "are at distinct positions, so removing it would delete part of the real "
+    "surface. Inspect manually."
+)
+UNSAFE_NONE_SELECTED = "No degenerate triangle is selected."
+UNSAFE_NOTHING_TO_DO = "This mesh has no degenerate triangles to repair."
+
+
+def degenerate_defects(vertices, faces, duplicate_groups=None,
+                       threshold=None, limit=512):
+    """Every degenerate triangle, classified and located.
+
+    Pure numpy. `duplicate_groups` is the exact-coincident grouping from
+    `topology.exact_duplicate_groups`; it is passed in rather than recomputed
+    so detection and repair cannot disagree about what "coincident" means.
+
+    Returns a list of dicts:
+        index       triangle index into `faces`
+        triangle    (a, b, c) vertex indices
+        kind        DEGENERATE_COINCIDENT or DEGENERATE_SLIVER
+        merges      [(survivor, [duplicate, ...])] for a coincident defect
+        centroid    (x, y, z) of the triangle, for framing the view
+        area        its area
+    """
+    import numpy as _np
+
+    vertices = _np.asarray(vertices, dtype=_np.float64)
+    faces = _np.asarray(faces, dtype=_np.int64)
+    if faces.size == 0:
+        return []
+
+    from .geodesic import topology as _topology
+    indices, areas, _threshold = _topology.degenerate_triangles(
+        vertices, faces, threshold=threshold
+    )
+    if duplicate_groups is None:
+        duplicate_groups = _topology.exact_duplicate_groups(vertices)
+
+    # vertex -> the survivor its exact-coincident group elects. The survivor
+    # is the lowest index in the group, so the choice is deterministic and a
+    # repeated run plans the same repair.
+    survivor = {}
+    for group in duplicate_groups:
+        ordered = sorted(int(value) for value in group)
+        for member in ordered[1:]:
+            survivor[member] = ordered[0]
+
+    defects = []
+    for triangle_index in indices[:int(limit)]:
+        corners = [int(value) for value in faces[triangle_index]]
+        # Group this triangle's own corners by the survivor they map to. Two
+        # corners that resolve to the same survivor are the same point.
+        buckets = {}
+        for corner in corners:
+            buckets.setdefault(survivor.get(corner, corner), []).append(corner)
+        merges = [
+            (root, sorted(set(members) - {root}))
+            for root, members in sorted(buckets.items())
+            if len(set(members)) > 1 or any(m != root for m in members)
+        ]
+        merges = [(root, drops) for root, drops in merges if drops]
+
+        kind = DEGENERATE_COINCIDENT if merges else DEGENERATE_SLIVER
+        defects.append({
+            "index": int(triangle_index),
+            "triangle": tuple(corners),
+            "kind": kind,
+            "merges": merges,
+            "centroid": tuple(
+                float(value) for value in vertices[corners].mean(axis=0)
+            ),
+            "area": float(areas[triangle_index]),
+        })
+    return defects
+
+
+def describe_degenerate(defect):
+    """One line naming a defect and where it is."""
+    centroid = defect["centroid"]
+    return "Triangle %d - %s at (%.1f, %.1f, %.1f) mm" % (
+        defect["index"],
+        DEGENERATE_LABELS.get(defect["kind"], defect["kind"]),
+        centroid[0], centroid[1], centroid[2],
+    )
+
+
+def plan_degenerate_repair(vertices, faces, defects):
+    """What a local repair of `defects` would do. Never modifies anything.
+
+    Returns a dict with `safe`, `reason`, `summary`, `merges`
+    (survivor -> duplicates, across every chosen defect), `merge_count`,
+    `defect_count` and `refused` (the defects it will not touch).
+
+    A plan is only ever built from vertices the chosen defects already
+    contain. Nothing tolerance-based, nothing global, and no vertex outside
+    those triangles is moved.
+    """
+    if not defects:
+        return {
+            "safe": False, "reason": UNSAFE_NOTHING_TO_DO, "summary": "",
+            "merges": {}, "merge_count": 0, "defect_count": 0, "refused": [],
+        }
+
+    targetmap = {}
+    repairable = []
+    refused = []
+    for defect in defects:
+        if defect["kind"] != DEGENERATE_COINCIDENT:
+            refused.append(defect)
+            continue
+        repairable.append(defect)
+        for root, drops in defect["merges"]:
+            for drop in drops:
+                targetmap[int(drop)] = int(root)
+
+    if not repairable:
+        return {
+            "safe": False, "reason": UNSAFE_SLIVER, "summary": "",
+            "merges": {}, "merge_count": 0,
+            "defect_count": len(defects), "refused": refused,
+        }
+
+    # Every face that will collapse to nothing once the merge is applied.
+    removed = _faces_collapsed_by(faces, targetmap)
+
+    summary = (
+        "Repair will merge %d exact coincident vertex/vertices and remove "
+        "%d zero-area face(s)." % (len(targetmap), len(removed))
+    )
+    if refused:
+        summary += (" %d defect(s) are slivers and will be left alone."
+                    % len(refused))
+
+    return {
+        "safe": True,
+        "reason": "",
+        "summary": summary,
+        "merges": dict(targetmap),
+        "merge_count": len(targetmap),
+        "removed_faces": [int(value) for value in removed],
+        "removed_count": len(removed),
+        "defect_count": len(repairable),
+        "refused": refused,
+    }
+
+
+def _faces_collapsed_by(faces, targetmap):
+    """Face indices that become degenerate once `targetmap` is applied.
+
+    A face whose corners stop being three distinct vertices is not a surface
+    any more, and removing it is the whole point of the merge rather than an
+    extra liberty taken on top of it.
+    """
+    import numpy as _np
+
+    faces = _np.asarray(faces, dtype=_np.int64)
+    if faces.size == 0 or not targetmap:
+        return []
+    remapped = faces.copy()
+    for drop, root in targetmap.items():
+        remapped[remapped == int(drop)] = int(root)
+    collapsed = (
+        (remapped[:, 0] == remapped[:, 1])
+        | (remapped[:, 1] == remapped[:, 2])
+        | (remapped[:, 0] == remapped[:, 2])
+    )
+    return [int(value) for value in _np.flatnonzero(collapsed)]
+
+
+def apply_degenerate_plan(vertices, faces, plan):
+    """Apply a plan to plain arrays. Pure, and used by the offline tests.
+
+    The Blender side does the same thing with bmesh so the researcher gets
+    one undo step; this exists so the arithmetic can be checked without a
+    viewport. Returns (vertices, faces) - vertices are returned unchanged,
+    because a merge only ever REPOINTS a face at a survivor that already sits
+    at exactly the same position. No coordinate moves.
+    """
+    import numpy as _np
+
+    vertices = _np.asarray(vertices, dtype=_np.float64)
+    faces = _np.asarray(faces, dtype=_np.int64)
+    if not plan.get("safe") or not plan.get("merges"):
+        return vertices, faces
+
+    remapped = faces.copy()
+    for drop, root in plan["merges"].items():
+        remapped[remapped == int(drop)] = int(root)
+    keep = ~(
+        (remapped[:, 0] == remapped[:, 1])
+        | (remapped[:, 1] == remapped[:, 2])
+        | (remapped[:, 0] == remapped[:, 2])
+    )
+    return vertices, remapped[keep]
+
+
+#: What a repair is allowed to change for the better, and never for the worse.
+_GUARDED_KEYS = (
+    ("nonmanifold_edge_count", "non-manifold edge(s)"),
+    ("degenerate_triangle_count", "degenerate triangle(s)"),
+    ("boundary_edge_count", "boundary edge(s)"),
+    ("component_count", "connected component(s)"),
+)
+
+
+def verify_degenerate_repair(before, after):
+    """(ok, problems) comparing topology before and after a repair.
+
+    Sect. 17: removing degenerate geometry must not introduce non-manifold
+    edges, new boundary loops, new components or new degenerate triangles. A
+    repair that makes any of those worse is rejected rather than reported as
+    a success with a caveat - a mesh that got worse is not a repaired mesh.
+    """
+    problems = []
+    for key, label in _GUARDED_KEYS:
+        was = int(before.get(key, 0) or 0)
+        now = int(after.get(key, 0) or 0)
+        if now > was:
+            problems.append("%s rose from %d to %d" % (label, was, now))
+
+    if int(after.get("triangle_count", 0) or 0) <= 0:
+        problems.append("the repair left no triangles")
+
+    return (not problems), problems

@@ -55,6 +55,26 @@ def _load():
 repair, topology = _load()
 
 
+def strip_prose(source):
+    """Source with comments and docstrings removed. See test_readiness.py."""
+    out = []
+    in_doc = False
+    for line in source.splitlines():
+        stripped = line.strip()
+        fences = stripped.count('"' * 3) + stripped.count("'" * 3)
+        if in_doc:
+            if fences:
+                in_doc = False
+            continue
+        if fences == 1:
+            in_doc = True
+            continue
+        if fences >= 2 or stripped.startswith("#"):
+            continue
+        out.append(line.split("  #")[0])
+    return "\n".join(out)
+
+
 def grid(n=4, spacing=10.0):
     """A flat n x n triangulated patch: one component, one boundary loop."""
     xs = np.arange(n + 1, dtype=np.float64) * spacing
@@ -797,11 +817,204 @@ def test_dangling_preference():
     check("only one face is removed", len(plan["remove_faces"]) == 1)
 
 
+# ---------------------------------------------------------------------------
+# degenerate triangle repair (Milestone 3.19, Mesh Repair v1)
+# ---------------------------------------------------------------------------
+
+def collapsed_tetra():
+    """A closed tetra plus a duplicate vertex, making one zero-area face."""
+    vertices = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0],
+                         [0.0, 0.0, 10.0], [0.0, 0.0, 0.0]])
+    faces = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3], [0, 4, 1]])
+    return vertices, faces
+
+
+def test_degenerate_detection():
+    print("\n[degenerate] a collapsed vertex is found and classified")
+    vertices, faces = collapsed_tetra()
+    before = topology.analyse(vertices, faces)
+    check("the mesh reports a degenerate triangle",
+          before["degenerate_triangle_count"] == 1,
+          before["degenerate_triangle_count"])
+    check("and an exactly coincident vertex",
+          before["duplicate_vertex_count"] == 1)
+
+    groups = topology.exact_duplicate_groups(vertices)
+    check("the duplicate group names both vertices", groups == [[0, 4]], groups)
+
+    defects = repair.degenerate_defects(vertices, faces)
+    check("one defect is reported", len(defects) == 1, defects)
+    check("it names the right triangle", defects[0]["index"] == 4,
+          defects[0]["index"])
+    check("classified as a collapse, not a sliver",
+          defects[0]["kind"] == repair.DEGENERATE_COINCIDENT,
+          defects[0]["kind"])
+    check("with a merge that keeps the lower index",
+          defects[0]["merges"] == [(0, [4])], defects[0]["merges"])
+    check("and a centroid to frame the view on",
+          len(defects[0]["centroid"]) == 3)
+    check("the description is readable",
+          "Triangle 4" in repair.describe_degenerate(defects[0]),
+          repair.describe_degenerate(defects[0]))
+
+
+def test_degenerate_local_repair():
+    print("\n[degenerate] the local repair removes it and nothing else")
+    vertices, faces = collapsed_tetra()
+    before = topology.analyse(vertices, faces)
+    defects = repair.degenerate_defects(vertices, faces)
+    plan = repair.plan_degenerate_repair(vertices, faces, defects)
+
+    check("the plan is safe", plan["safe"], plan["reason"])
+    check("it merges exactly one vertex", plan["merge_count"] == 1,
+          plan["merge_count"])
+    check("and removes exactly one face", plan["removed_count"] == 1,
+          plan["removed_count"])
+    check("the summary says so in words",
+          "merge 1 exact coincident" in plan["summary"]
+          and "remove 1 zero-area face" in plan["summary"], plan["summary"])
+
+    after_vertices, after_faces = repair.apply_degenerate_plan(
+        vertices, faces, plan)
+    after = topology.analyse(after_vertices, after_faces)
+    check("no degenerate triangles remain",
+          after["degenerate_triangle_count"] == 0,
+          after["degenerate_triangle_count"])
+    check("one face was removed",
+          after["triangle_count"] == before["triangle_count"] - 1,
+          (before["triangle_count"], after["triangle_count"]))
+    check("no vertex COORDINATE was moved",
+          np.array_equal(after_vertices, vertices))
+    check("no new non-manifold edges",
+          after["nonmanifold_edge_count"] <= before["nonmanifold_edge_count"])
+    check("no new boundary edges",
+          after["boundary_edge_count"] <= before["boundary_edge_count"])
+    ok, problems = repair.verify_degenerate_repair(before, after)
+    check("the validity guard accepts it", ok, problems)
+
+
+def test_sliver_is_refused():
+    print("\n[degenerate] a sliver is refused, never guessed at")
+    vertices = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [5.0, 0.0, 0.0],
+                         [0.0, 10.0, 0.0]])
+    faces = np.array([[0, 1, 2], [0, 1, 3]])
+    defects = repair.degenerate_defects(vertices, faces)
+    check("the sliver is detected", len(defects) == 1, defects)
+    check("and classified as a sliver",
+          defects[0]["kind"] == repair.DEGENERATE_SLIVER, defects[0]["kind"])
+    check("with no merge to make", defects[0]["merges"] == [])
+
+    plan = repair.plan_degenerate_repair(vertices, faces, defects)
+    check("the plan refuses", not plan["safe"])
+    check("saying it is not safe",
+          "not safe" in plan["reason"], plan["reason"])
+    check("and telling the researcher to inspect manually",
+          "Inspect manually" in plan["reason"], plan["reason"])
+    check("the defect is listed as refused", plan["refused"] == defects)
+
+    unchanged_v, unchanged_f = repair.apply_degenerate_plan(
+        vertices, faces, plan)
+    check("applying a refused plan changes nothing",
+          np.array_equal(unchanged_f, faces))
+
+
+def test_coincident_not_in_a_face_is_left_alone():
+    print("\n[degenerate] a coincident vertex outside a degenerate face")
+    vertices = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0],
+                         [0.0, 0.0, 10.0], [10.0, 0.0, 0.0]])
+    faces = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
+    report = topology.analyse(vertices, faces)
+    check("it is reported as coincident",
+          report["duplicate_vertex_count"] == 1)
+    check("but there is no degenerate triangle",
+          report["degenerate_triangle_count"] == 0)
+    defects = repair.degenerate_defects(vertices, faces)
+    check("so no defect is planned", defects == [], defects)
+    plan = repair.plan_degenerate_repair(vertices, faces, defects)
+    check("and the planner refuses to invent one", not plan["safe"])
+    check("saying there is nothing to repair",
+          "no degenerate" in plan["reason"].lower(), plan["reason"])
+
+
+def test_near_coincident_is_never_merged():
+    print("\n[degenerate] near-coincident vertices are never touched")
+    # Two vertices a hair apart - NOT bit-identical.
+    vertices = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0],
+                         [0.0, 0.0, 10.0], [1e-7, 0.0, 0.0]])
+    faces = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3], [0, 4, 1]])
+    check("they are NOT exact duplicates",
+          topology.exact_duplicate_groups(vertices) == [],
+          topology.exact_duplicate_groups(vertices))
+    defects = repair.degenerate_defects(vertices, faces)
+    for defect in defects:
+        check("a near-coincident defect is a sliver, never a merge",
+              defect["kind"] == repair.DEGENERATE_SLIVER, defect["kind"])
+        check("  and offers no merge", defect["merges"] == [])
+    plan = repair.plan_degenerate_repair(vertices, faces, defects)
+    check("so no repair is offered", not plan["safe"], plan)
+
+    source = open(os.path.join(PACKAGE, "repair.py")).read()
+    start = source.index("def plan_degenerate_repair")
+    body = source[start:source.index("def _faces_collapsed_by")]
+    check("the planner takes no tolerance argument",
+          "tolerance" not in strip_prose(body)
+          and "dist=" not in strip_prose(body), strip_prose(body)[:160])
+
+
+def test_validity_guard_rejects_a_worse_mesh():
+    print("\n[degenerate] a repair that makes topology worse is rejected")
+    before = {"triangle_count": 100, "nonmanifold_edge_count": 0,
+              "degenerate_triangle_count": 4, "boundary_edge_count": 0,
+              "component_count": 1}
+    ok, problems = repair.verify_degenerate_repair(
+        before, dict(before, degenerate_triangle_count=0))
+    check("removing degeneracy alone is accepted", ok, problems)
+
+    for key, label in (("nonmanifold_edge_count", "non-manifold"),
+                       ("boundary_edge_count", "boundary"),
+                       ("component_count", "component"),
+                       ("degenerate_triangle_count", "degenerate")):
+        worse = dict(before, degenerate_triangle_count=0)
+        worse[key] = int(before.get(key, 0)) + 2
+        ok, problems = repair.verify_degenerate_repair(before, worse)
+        check("a rise in %s is rejected" % label, not ok, problems)
+        check("  and named", any(label.split()[0] in p for p in problems),
+              problems)
+
+    ok, problems = repair.verify_degenerate_repair(
+        before, dict(before, triangle_count=0, degenerate_triangle_count=0))
+    check("a repair that empties the mesh is rejected", not ok, problems)
+
+
+def test_no_global_weld_anywhere():
+    print("\n[degenerate] nothing in the repair path welds globally")
+    source = open(os.path.join(PACKAGE, "meshrepair.py")).read()
+    start = source.index("def apply_degenerate_plan")
+    body = strip_prose(source[start:])
+    for forbidden in ("remove_doubles", "automerge", "dissolve_degenerate",
+                      "holes_fill", "fill_holes", "triangle_fill"):
+        check("apply_degenerate_plan never calls %s" % forbidden,
+              forbidden not in body, body[:120])
+    check("it uses an explicit weld targetmap", "weld_verts" in body)
+    check("and no distance argument", "dist=" not in body, body[:120])
+
+    planner = strip_prose(
+        open(os.path.join(PACKAGE, "repair.py")).read())
+    check("the planner never imports bpy", "import bpy" not in planner)
+
+
 def main():
     print("BSMT Milestone 3.4 - mesh repair tests")
     print("  python : %s" % sys.version.split()[0])
     print("  numpy  : %s" % np.__version__)
     for test in (
+        test_degenerate_detection,
+        test_degenerate_local_repair,
+        test_sliver_is_refused,
+        test_coincident_not_in_a_face_is_left_alone,
+        test_near_coincident_is_never_merged,
+        test_validity_guard_rejects_a_worse_mesh,
+        test_no_global_weld_anywhere,
         test_edge_classification,
         test_duplicate_faces,
         test_boundary_loops,

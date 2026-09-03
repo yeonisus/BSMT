@@ -346,6 +346,65 @@ def exact_duplicate_positions(vertices):
     return surplus, groups
 
 
+def exact_duplicate_groups(vertices):
+    """Index groups of bit-identically positioned vertices.
+
+    The same rule `exact_duplicate_positions` counts, returning WHICH
+    vertices rather than how many - which is what a local repair needs in
+    order to be local. Reporting and repair therefore cannot disagree about
+    what "exactly coincident" means.
+
+    Returns a list of index lists, each with two or more entries, sorted.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    if vertices.size == 0:
+        return []
+    _unique, inverse, counts = np.unique(
+        vertices, axis=0, return_inverse=True, return_counts=True
+    )
+    inverse = np.asarray(inverse).reshape(-1)
+    groups = []
+    for slot in np.flatnonzero(counts > 1):
+        members = np.flatnonzero(inverse == slot)
+        groups.append([int(index) for index in members])
+    return groups
+
+
+def degenerate_area_threshold(vertices):
+    """The area at or below which a triangle counts as degenerate.
+
+    Scale free: a fraction of the bounding-box diagonal, squared. Defined
+    here once so the count in `analyse`, the indices in
+    `degenerate_triangles` and any repair that acts on them are all judging
+    the same thing.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    if vertices.size == 0:
+        return 0.0
+    dimensions = vertices.max(axis=0) - vertices.min(axis=0)
+    diagonal = float(np.linalg.norm(dimensions))
+    return float((DEGENERATE_EDGE_FRACTION * diagonal) ** 2)
+
+
+def degenerate_triangles(vertices, faces, threshold=None):
+    """(indices, areas, threshold) for every degenerate triangle.
+
+    `indices` is an int64 array of triangle indices into `faces`, in order.
+    The rule is `degenerate_area_threshold`, so this is exactly the set that
+    `analyse` counts - never a second opinion about which triangles are bad.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.size == 0:
+        return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64),
+                0.0)
+    if threshold is None:
+        threshold = degenerate_area_threshold(vertices)
+    areas = triangle_areas(vertices, faces)
+    indices = np.flatnonzero(areas <= threshold).astype(np.int64)
+    return indices, areas, float(threshold)
+
+
 def near_coincident_estimate(vertices, tolerance):
     """Lower-bound count of vertices within `tolerance` of another vertex.
 
@@ -458,10 +517,12 @@ def analyse(vertices, faces, near_tolerance=0.0):
     report["bbox_dimensions"] = [float(v) for v in dimensions]
     report["bbox_diagonal"] = diagonal
 
-    areas = triangle_areas(vertices, faces)
-    area_threshold = (DEGENERATE_EDGE_FRACTION * diagonal) ** 2
+    # One rule for the count here and for the indices a repair acts on.
+    degenerate_indices, areas, area_threshold = degenerate_triangles(
+        vertices, faces, threshold=(DEGENERATE_EDGE_FRACTION * diagonal) ** 2
+    )
     report["degenerate_area_threshold"] = float(area_threshold)
-    report["degenerate_triangle_count"] = int(np.count_nonzero(areas <= area_threshold))
+    report["degenerate_triangle_count"] = int(degenerate_indices.size)
     report["zero_area_triangle_count"] = int(np.count_nonzero(areas == 0.0))
     report["min_triangle_area"] = float(areas.min())
 
