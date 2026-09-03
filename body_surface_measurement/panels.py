@@ -38,11 +38,12 @@ from . import (alignment, export, geodesic, landmarks, measurement,
 STAGE_ORDER = {
     readiness.STAGE_SCAN: 10,
     readiness.STAGE_PREPROCESS: 20,
-    readiness.STAGE_ALIGNMENT: 30,
-    readiness.STAGE_LANDMARKS: 40,
-    readiness.STAGE_MEASUREMENTS: 50,
-    readiness.STAGE_VISUALIZATION: 60,
-    readiness.STAGE_EXPORT: 70,
+    readiness.STAGE_REPAIR: 30,
+    readiness.STAGE_ALIGNMENT: 40,
+    readiness.STAGE_LANDMARKS: 50,
+    readiness.STAGE_MEASUREMENTS: 60,
+    readiness.STAGE_VISUALIZATION: 70,
+    readiness.STAGE_EXPORT: 80,
 }
 
 
@@ -1879,9 +1880,15 @@ class BSMT_PT_repair(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "BSMT"
-    bl_parent_id = "BSMT_PT_preprocessing"
     bl_options = {'DEFAULT_CLOSED'}
-    bl_order = 10
+    # A TOP-LEVEL workflow stage, between Scan Preprocessing and Alignment.
+    #
+    # It was a child of Scan Preprocessing from 0.22.0 to 0.24.0, which put
+    # the only route to unblocking a scan inside a panel that is closed by
+    # default - so a researcher whose mesh reported NOT READY had no visible
+    # way to act on it. Repair is a step of the workflow, not a detail of
+    # preprocessing, and the sidebar has to say so.
+    bl_order = STAGE_ORDER[readiness.STAGE_REPAIR]
 
     def draw(self, context):
         layout = self.layout
@@ -1889,6 +1896,8 @@ class BSMT_PT_repair(bpy.types.Panel):
         if props is None:
             layout.label(text="BSMT is not registered", icon='ERROR')
             return
+
+        _draw_hint(context, layout, readiness.STAGE_REPAIR, props)
 
         obj = context.active_object
         provenance = getattr(obj, "bsmt_scan", None) if obj is not None else None
@@ -2328,22 +2337,23 @@ classes = (
     BSMT_PT_diagnostics,
     BSMT_PT_body_measurement,
     BSMT_PT_geodesic_backend,
-    # stage 2 - Scan Preprocessing, with Mesh Repair under it
+    # stage 2 - Scan Preprocessing
     BSMT_PT_preprocessing,
+    # stage 3 - Mesh Repair
     BSMT_UL_boundary_loops,
     BSMT_UL_repair_components,
     BSMT_PT_repair,
-    # stage 3 - Alignment
+    # stage 4 - Alignment
     BSMT_PT_alignment,
-    # stage 4 - Landmarks
+    # stage 5 - Landmarks
     BSMT_UL_landmarks,
     BSMT_PT_landmarks,
-    # stage 5 - Measurements
+    # stage 6 - Measurements
     BSMT_UL_measurements,
     BSMT_PT_measurements,
-    # stage 6 - Measurement Visualization
+    # stage 7 - Measurement Visualization
     BSMT_PT_measurement_visualization,
-    # stage 7 - Results and Export
+    # stage 8 - Results and Export
     BSMT_PT_session,
 )
 

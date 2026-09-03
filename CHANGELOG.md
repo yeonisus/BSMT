@@ -4,6 +4,55 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.24.1 — Mesh Repair is a workflow stage again
+
+**The Mesh Repair panel was invisible.** Reported against a confirmed 0.24.0
+install, and reproduced on a clean Blender config from the shipped ZIP: the
+BSMT sidebar showed seven panels and Mesh Repair was not among them.
+
+**Root cause — a design mistake made in 0.22.0, not a packaging or
+registration failure.** The panel class existed, was in the registration
+tuple, was registered by `panels.register()`, was present in
+`bsmt-0.24.0.zip`, and Blender had it registered with the right category,
+space and region. It carried:
+
+    bl_parent_id = "BSMT_PT_preprocessing"
+    bl_options = {'DEFAULT_CLOSED'}
+
+so it was a **sub-panel of Scan Preprocessing**, which is itself closed by
+default. It therefore never appeared as a workflow stage, and a researcher
+whose mesh reported `NOT READY` had no visible route to the one panel that
+could act on it. 0.19.0's Mesh Repair v1 made that considerably worse.
+
+The nesting was introduced by the 0.22.0 sidebar reorganisation to keep the
+top level to exactly the seven stages that milestone listed. That was the
+wrong call: repair is a step of the research workflow, not a detail of
+preprocessing.
+
+- **Mesh Repair is now a top-level panel**, `bl_order` 30, between Scan
+  Preprocessing (20) and Alignment (40). Stage numbers renumbered to keep
+  gaps of ten.
+- `readiness.STAGE_REPAIR` added so the panel order and the stage vocabulary
+  stay in step, with a stage hint — *"Repair the blocking defects, then
+  re-analyze."* — shown only when the mesh verdict is `NOT_READY`.
+- **New regression test that would have caught this.** Reading
+  `panels.classes` never could: the class was always there. The test now
+  enumerates what **Blender itself** has registered in the BSMT category,
+  requires the eight top-level labels in workflow order, and asserts Mesh
+  Repair specifically is top level, in the BSMT category, with matching space
+  and region, and with no `poll()` or `draw_header()` that could suppress it.
+
+Final order: Scan Setup → Scan Preprocessing → **Mesh Repair** → Alignment →
+Landmark Manager → Measurement Manager → Measurement Visualization → Results
+and Export.
+
+No repair behaviour, repair algorithm or readiness policy was changed.
+
+2,525 offline checks across twenty-one suites, 0 failures; workflow-UI 89 →
+98, mesh-repair 76/76, degenerate-policy 35/35, preprocessing 110/110 and
+path visualization 90/90 unchanged. Verified visible from a clean-config
+install of `bsmt-0.24.1.zip`.
+
 ## 0.24.0 — Mesh Repair v1: bounded local repair of degenerate triangles
 
 Since 0.23.0 a degenerate triangle hard-blocks exact surface measurement,

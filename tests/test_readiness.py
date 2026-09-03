@@ -437,6 +437,31 @@ def test_not_ready_mesh_is_named():
               readiness.stage_hint(readiness.STAGE_PREPROCESS, **facts) == "")
 
 
+def test_repair_stage_hint():
+    print("\n[stages] Mesh Repair names the action when the mesh is blocked")
+    facts = dict(has_mesh=True, analysed=True, copy_status='NOT_READY',
+                 landmark_total=0, landmarks_picked=0,
+                 measurements_defined=0, results_available=0)
+    check("a blocked mesh is told to repair and re-analyze",
+          readiness.stage_hint(readiness.STAGE_REPAIR, **facts)
+          == "Repair the blocking defects, then re-analyze.",
+          readiness.stage_hint(readiness.STAGE_REPAIR, **facts))
+    for state_name in ("READY", "WARNING", ""):
+        facts["copy_status"] = state_name
+        check("a %r mesh is not nagged to repair" % state_name,
+              readiness.stage_hint(readiness.STAGE_REPAIR, **facts) == "",
+              readiness.stage_hint(readiness.STAGE_REPAIR, **facts))
+    check("Mesh Repair is a stage in its own right",
+          readiness.STAGE_REPAIR in readiness.STAGE_ORDER)
+    check("named as the panel is named",
+          readiness.STAGE_TITLES[readiness.STAGE_REPAIR] == "Mesh Repair")
+    order = list(readiness.STAGE_ORDER)
+    check("and it sits between preprocessing and alignment",
+          order.index(readiness.STAGE_PREPROCESS)
+          < order.index(readiness.STAGE_REPAIR)
+          < order.index(readiness.STAGE_ALIGNMENT), order)
+
+
 def test_alignment_never_demands():
     print("\n[stages] alignment is optional by design")
     for analysed in (True, False):
@@ -643,6 +668,7 @@ def main():
         test_stage_hints,
         test_stage_hint_sequence,
         test_not_ready_mesh_is_named,
+        test_repair_stage_hint,
         test_alignment_never_demands,
         test_hints_are_short,
         test_unknown_stage_is_silent,

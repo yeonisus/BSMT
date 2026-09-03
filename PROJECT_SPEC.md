@@ -4144,6 +4144,87 @@ operator registered.
 
 ---
 
+## 11x. Milestone 3.20 — Mesh Repair is a workflow stage (v0.24.1, 2026-09-03)
+
+A defect report worth a section because the diagnosis is the interesting part: everything about the
+panel was correct except where it was.
+
+### 11x.1 The report, and what it was not
+
+The Mesh Repair panel did not appear in the BSMT sidebar on a confirmed 0.24.0 install. Seven
+panels were visible; Mesh Repair was not one of them.
+
+Checked, in order, before changing anything:
+
+| Check | Result |
+|---|---|
+| Panel class exists in source | **yes**, `BSMT_PT_repair` |
+| In the registration tuple | **yes** |
+| Registered via `panels.register()` from `__init__` | **yes** |
+| `bl_category` | **BSMT** |
+| `bl_space_type` / `bl_region_type` | **VIEW_3D / UI**, same as every other panel |
+| `poll()` or `draw_header()` that could hide it | **neither exists** |
+| Present in `bsmt-0.24.0.zip` | **yes** |
+| Registered by Blender after a clean-config install of that ZIP | **yes** |
+
+So it was not a packaging failure, not a registration failure, and not a visibility guard.
+
+### 11x.2 Root cause: it was a sub-panel of a collapsed panel
+
+    bl_parent_id = "BSMT_PT_preprocessing"
+    bl_options = {'DEFAULT_CLOSED'}
+
+Mesh Repair was a **child of Scan Preprocessing**, which is itself closed by default. Enumerating
+what Blender had registered on the clean install showed it exactly:
+
+    Scan Preprocessing           order=20
+        -> Mesh Repair            (child, closed by default)
+
+It never appeared as a workflow stage, and a researcher whose mesh reported `NOT READY` had no
+visible route to the one panel that could act on it.
+
+**This was introduced by Milestone 3.16** (v0.22.0), which nested Mesh Repair under Scan
+Preprocessing to keep the top level to exactly the seven stages that milestone's brief listed. That
+was the wrong call — repair is a step of the research workflow, not a detail of preprocessing — and
+Milestone 3.19 made the consequence much worse by putting the primary route to unblocking a scan
+behind it.
+
+### 11x.3 The fix, and the stage vocabulary
+
+`BSMT_PT_repair` loses its `bl_parent_id` and takes `bl_order` 30, between Scan Preprocessing (20)
+and Alignment (40); the remaining stages renumber to keep gaps of ten.
+`readiness.STAGE_REPAIR` is added so the panel order and the stage vocabulary stay in step —
+`test_panel_order.py` already asserted the two agree — with a stage hint, *"Repair the blocking
+defects, then re-analyze."*, shown only when the mesh verdict is `NOT_READY`. The verdict itself is
+unchanged: the hint reads the existing policy and decides nothing.
+
+Final order:
+
+    Scan Setup -> Scan Preprocessing -> Mesh Repair -> Alignment ->
+    Landmark Manager -> Measurement Manager -> Measurement Visualization ->
+    Results and Export
+
+### 11x.4 Why the existing tests missed it, and what now catches it
+
+`test_panel_order.py` and `test_workflow_ui.py` both asserted the top-level order — and both
+**passed** throughout, because both encoded the seven-stage list as correct. A test written from
+the same mistaken assumption as the code cannot catch that mistake.
+
+What was missing was a check against something neither the source nor I decided:
+`test_workflow_ui.py` now enumerates the panels **Blender itself** has registered in the BSMT
+category, requires the eight top-level labels in workflow order, and asserts Mesh Repair
+specifically is top level, in the BSMT category, with matching space and region, and with no
+`poll()` or `draw_header()` that could suppress it. Reading `panels.classes` could never have
+caught this defect: the class was always there.
+
+No repair behaviour, repair algorithm or readiness policy changed.
+
+Regression: 2,525 offline checks across twenty-one suites, plus 98 workflow-UI, 76 mesh-repair, 35
+degenerate-policy, 110 preprocessing and 90 path-visualisation checks in Blender. 0 failures, and
+the panel is confirmed visible from a clean-config install of the rebuilt ZIP.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~

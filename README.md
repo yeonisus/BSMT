@@ -57,12 +57,13 @@ stepped through, so any panel can be opened at any time.
 | # | Sidebar panel | Stage |
 |---|---|---|
 | 1 | **Scan Setup** | which scan is being worked on; *Analyze Scan* |
-| 2 | **Scan Preprocessing** | build and check the measurement mesh (*Mesh Repair* nested here) |
-| 3 | **Alignment** | rigid anatomical frame, if the study needs one |
-| 4 | **Landmark Manager** | define and pick landmarks |
-| 5 | **Measurement Manager** | define pairs, calculate |
-| 6 | **Measurement Visualization** | draw chords and cached surface paths |
-| 7 | **Results and Export** | session metadata, CSV, protocols |
+| 2 | **Scan Preprocessing** | build and check the measurement mesh |
+| 3 | **Mesh Repair** | locate and fix the defects that block measurement |
+| 4 | **Alignment** | rigid anatomical frame, if the study needs one |
+| 5 | **Landmark Manager** | define and pick landmarks |
+| 6 | **Measurement Manager** | define pairs, calculate |
+| 7 | **Measurement Visualization** | draw chords and cached surface paths |
+| 8 | **Results and Export** | session metadata, CSV, protocols |
 
 
 1. Import the scan (PLY, textured OBJ, or whatever your scanner writes).
@@ -76,7 +77,7 @@ stepped through, so any panel can be opened at any time.
    checks, and the one-line verdict — `MEASUREMENT READY`, `WARNING` or
    `NOT READY`. Use *Source* / *Measurement* / *Both* to compare the two by
    eye: silhouette, landmark regions, texture and colour registration.
-5. **Scan Preprocessing → Mesh Repair** → *Analyze Mesh*. If the verdict is
+5. **Mesh Repair** → *Analyze Mesh*. If the verdict is
    `NOT READY`, this is where you fix it:
    - **Degenerate triangles** block exact measurement. *Show Degenerate
      Triangles* marks them, *Defect i / N* steps through them, *Focus* frames

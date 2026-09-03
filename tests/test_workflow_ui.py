@@ -118,6 +118,7 @@ def main():
     expected = [
         "Scan Setup",
         "Scan Preprocessing",
+        "Mesh Repair",
         "Alignment",
         "Landmark Manager",
         "Measurement Manager",
@@ -133,6 +134,58 @@ def main():
           [c.bl_order for c in top_level]
           == sorted(c.bl_order for c in top_level),
           [c.bl_order for c in top_level])
+
+    print("\n   Blender's OWN registry, not just the source classes")
+    # This is the check that would have caught the 0.22.0-0.24.0 defect:
+    # Mesh Repair was declared, registered and packaged correctly, and was
+    # still invisible - because it was a CHILD of a panel that is closed by
+    # default. Reading panels.classes could never have seen that; reading
+    # what Blender has, and asking what appears at top level, does.
+    registered = []
+    for name in dir(bpy.types):
+        candidate = getattr(bpy.types, name, None)
+        if (isinstance(candidate, type)
+                and issubclass(candidate, bpy.types.Panel)
+                and getattr(candidate, "bl_category", "") == "BSMT"):
+            registered.append(candidate)
+    check("Blender has BSMT panels registered", bool(registered))
+
+    registered_top = sorted(
+        (cls for cls in registered if not getattr(cls, "bl_parent_id", "")),
+        key=lambda cls: getattr(cls, "bl_order", 0),
+    )
+    check("what Blender shows top level IS the workflow",
+          [cls.bl_label for cls in registered_top] == expected,
+          [cls.bl_label for cls in registered_top])
+
+    by_label = {cls.bl_label: cls for cls in registered}
+    check("Mesh Repair is registered with Blender", "Mesh Repair" in by_label,
+          sorted(by_label))
+    repair_panel = by_label.get("Mesh Repair")
+    check("it is a TOP-LEVEL panel, not nested inside another",
+          repair_panel is not None
+          and not getattr(repair_panel, "bl_parent_id", ""),
+          getattr(repair_panel, "bl_parent_id", "") if repair_panel else None)
+    check("it is in the BSMT sidebar category",
+          repair_panel is not None and repair_panel.bl_category == "BSMT")
+    check("with the same space and region as every other stage",
+          repair_panel is not None
+          and repair_panel.bl_space_type == 'VIEW_3D'
+          and repair_panel.bl_region_type == 'UI',
+          (repair_panel.bl_space_type, repair_panel.bl_region_type)
+          if repair_panel else None)
+    check("it has no poll() that could hide the whole panel",
+          repair_panel is not None and "poll" not in repair_panel.__dict__,
+          sorted(repair_panel.__dict__) if repair_panel else None)
+    check("nor a draw_header that could suppress it",
+          repair_panel is not None
+          and "draw_header" not in repair_panel.__dict__)
+    order = {cls.bl_label: cls.bl_order for cls in registered_top}
+    check("and it sits after Scan Preprocessing",
+          order.get("Mesh Repair", 0) > order.get("Scan Preprocessing", 0),
+          order)
+    check("and before Alignment",
+          order.get("Mesh Repair", 0) < order.get("Alignment", 0), order)
 
     print("\n   nesting is one level deep, never more")
     by_id = {cls.bl_idname: cls for cls in ordered}
@@ -168,6 +221,9 @@ def main():
     landmarks_text = texts(draw_panel(panels.BSMT_PT_landmarks, context))
     check("sect. 11: the Landmark Manager is still inspectable with no scan",
           bool(landmarks_text), landmarks_text)
+    repair_text = texts(draw_panel(panels.BSMT_PT_repair, context))
+    check("Mesh Repair draws standalone, with nothing selected",
+          bool(repair_text), repair_text)
 
     # --------------------------------------------------------- raw scan ---
     print("\nB. raw scan selected but not analysed")

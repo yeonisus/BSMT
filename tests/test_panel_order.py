@@ -45,6 +45,7 @@ readiness = bsmt.readiness
 EXPECTED_STAGES = (
     "Scan Setup",
     "Scan Preprocessing",
+    "Mesh Repair",
     "Alignment",
     "Landmark Manager",
     "Measurement Manager",

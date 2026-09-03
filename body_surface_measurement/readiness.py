@@ -60,6 +60,7 @@ PANEL_FOR_REASON = {
 
 STAGE_SCAN = 'SCAN'
 STAGE_PREPROCESS = 'PREPROCESS'
+STAGE_REPAIR = 'REPAIR'
 STAGE_ALIGNMENT = 'ALIGNMENT'
 STAGE_LANDMARKS = 'LANDMARKS'
 STAGE_MEASUREMENTS = 'MEASUREMENTS'
@@ -71,6 +72,7 @@ STAGE_EXPORT = 'EXPORT'
 STAGE_ORDER = (
     STAGE_SCAN,
     STAGE_PREPROCESS,
+    STAGE_REPAIR,
     STAGE_ALIGNMENT,
     STAGE_LANDMARKS,
     STAGE_MEASUREMENTS,
@@ -81,6 +83,7 @@ STAGE_ORDER = (
 STAGE_TITLES = {
     STAGE_SCAN: "Scan Setup",
     STAGE_PREPROCESS: "Scan Preprocessing",
+    STAGE_REPAIR: "Mesh Repair",
     STAGE_ALIGNMENT: "Alignment",
     STAGE_LANDMARKS: "Landmark Manager",
     STAGE_MEASUREMENTS: "Measurement Manager",
@@ -115,6 +118,14 @@ def stage_hint(stage, has_mesh=True, analysed=True, copy_status="",
             return "Analyze the scan first."
         if copy_status == 'NOT_READY':
             return "Resolve critical mesh issues before exact surface measurement."
+        return ""
+
+    if stage == STAGE_REPAIR:
+        # Repair is where a blocking defect is ACTED on, so this names the
+        # action; the preprocessing stage names the consequence. Both read
+        # the same verdict - neither decides anything.
+        if copy_status == 'NOT_READY':
+            return "Repair the blocking defects, then re-analyze."
         return ""
 
     if stage == STAGE_ALIGNMENT:
