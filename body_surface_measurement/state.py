@@ -2414,6 +2414,62 @@ def measurement_target(context, props=None):
     return None, "no mesh selected"
 
 
+def workflow_facts(context, props=None):
+    """The handful of numbers the per-stage guidance needs (sect. 10).
+
+    Safe from a panel draw by construction: it reads stored properties and
+    peeks at the canonical mesh cache, so it never builds one and never
+    touches the solver. A scan that has not been analysed reports
+    ``analysed=False`` rather than an invented topology.
+    """
+    if props is None:
+        props = get_props(context)
+    if props is None:
+        return {
+            "has_mesh": False, "analysed": False, "copy_status": "",
+            "landmark_total": 0, "landmarks_picked": 0,
+            "measurements_defined": 0, "results_available": 0,
+            "non_manifold": 0,
+        }
+
+    obj, _reason = measurement_target(context, props)
+    analysed = False
+    non_manifold = 0
+    if obj is not None and geodesic.MESHCACHE_AVAILABLE:
+        cached = geodesic.meshcache.peek(obj.name)
+        if cached is not None:
+            analysed = True
+            non_manifold = int(
+                (cached.topology or {}).get("nonmanifold_edge_count", 0) or 0
+            )
+
+    landmark_collection = get_landmarks(context) or ()
+    picked = sum(1 for item in landmark_collection
+                 if item.surface_point.valid)
+
+    measurement_collection = get_measurements(context) or ()
+    defined = defined_measurements(measurement_collection)
+    results = sum(1 for item in defined if result_is_displayable(item))
+
+    return {
+        "has_mesh": obj is not None,
+        "analysed": analysed,
+        # The verdict from the LAST preprocessing run, not a fresh one: a
+        # panel draw must never re-classify anything.
+        "copy_status": props.preprocess_status if props.preprocess_valid else "",
+        "landmark_total": len(landmark_collection),
+        "landmarks_picked": picked,
+        "measurements_defined": len(defined),
+        "results_available": results,
+        "non_manifold": non_manifold,
+    }
+
+
+def stage_hint(context, stage, props=None):
+    """The one-line hint for a workflow stage, or "". Panel-draw safe."""
+    return readiness.stage_hint(stage, **workflow_facts(context, props))
+
+
 def readiness_snapshot(context, props=None):
     """The compact "can I measure yet" answer (sect. 13).
 

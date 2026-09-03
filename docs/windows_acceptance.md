@@ -3,7 +3,7 @@
 **Status: READY FOR MANUAL WINDOWS VALIDATION. Nothing below has been run on
 Windows.**
 
-BSMT 0.21.0 is packaged for Windows x64 and audited for platform assumptions
+BSMT 0.22.0 is packaged for Windows x64 and audited for platform assumptions
 from macOS. That is not the same as working. This checklist is what a real
 Windows machine has to confirm before anyone should call Windows *supported*.
 
@@ -30,7 +30,7 @@ Blender version and machine.
 ### Install
 
 - [ ] Clean Blender 4.5.13 x64 installed from blender.org
-- [ ] `bsmt-0.21.0.zip` downloaded **without the browser unzipping it**
+- [ ] `bsmt-0.22.0.zip` downloaded **without the browser unzipping it**
 - [ ] Preferences → Get Extensions → ▾ → Install from Disk succeeds
 - [ ] BSMT appears and is enabled
 - [ ] No error in **Window → Toggle System Console**
@@ -38,7 +38,7 @@ Blender version and machine.
 
 ### Dependency
 
-- [ ] *Session and Export → About BSMT* reports `Windows x64`
+- [ ] *Results and Export → About BSMT* reports `Windows x64`
 - [ ] It reports `Python 3.11.x` and `NumPy 1.26.4`
 - [ ] It reports **`Exact Geodesic: Available (pygeodesic 0.1.11)`**
 - [ ] NumPy is still Blender's own — no second NumPy was installed
@@ -99,7 +99,7 @@ Blender version and machine.
 
 ### Failure behaviour
 
-- [ ] Uninstall the extension, install `body_surface_measurement-0.21.0.zip`
+- [ ] Uninstall the extension, install `body_surface_measurement-0.22.0.zip`
       (no solver) instead
 - [ ] BSMT still enables
 - [ ] *About BSMT* reports `Exact Geodesic: Unavailable` with a reason

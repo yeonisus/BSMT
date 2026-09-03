@@ -35,7 +35,7 @@ In the sidebar: **Measurement Manager → Session and Export → About BSMT**.
 You should see something like:
 
 ```
-BSMT 0.21.0
+BSMT 0.22.0
 Blender 4.5.13 LTS
 Windows x64
 Python 3.11.15

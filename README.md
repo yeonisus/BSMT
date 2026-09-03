@@ -50,8 +50,23 @@ No Terminal or PowerShell is needed.
 
 ## Typical workflow
 
+The BSMT sidebar is ordered as this workflow runs, top to bottom. Each stage
+says in one short line what it still needs; nothing is hidden and nothing is
+stepped through, so any panel can be opened at any time.
+
+| # | Sidebar panel | Stage |
+|---|---|---|
+| 1 | **Scan Setup** | which scan is being worked on; *Analyze Scan* |
+| 2 | **Scan Preprocessing** | build and check the measurement mesh (*Mesh Repair* nested here) |
+| 3 | **Alignment** | rigid anatomical frame, if the study needs one |
+| 4 | **Landmark Manager** | define and pick landmarks |
+| 5 | **Measurement Manager** | define pairs, calculate |
+| 6 | **Measurement Visualization** | draw chords and cached surface paths |
+| 7 | **Results and Export** | session metadata, CSV, protocols |
+
+
 1. Import the scan (PLY, textured OBJ, or whatever your scanner writes).
-2. **Scan Preprocessing** → *Analyze Scan*. Read the vertex and triangle
+2. **Scan Setup** → *Analyze Scan*. Then in **Scan Preprocessing**, read the vertex and triangle
    counts, the connected components, the boundary and non-manifold edge
    counts, and which appearance data the scan carries — UV maps, colour
    attributes, materials, image textures.
@@ -61,8 +76,8 @@ No Terminal or PowerShell is needed.
    checks, and the one-line verdict — `MEASUREMENT READY`, `WARNING` or
    `NOT READY`. Use *Source* / *Measurement* / *Both* to compare the two by
    eye: silhouette, landmark regions, texture and colour registration.
-5. **Mesh Repair** → *Analyze Mesh*, then *Repair Local Defects* if the
-   verdict reports non-manifold edges.
+5. **Scan Preprocessing → Mesh Repair** → *Analyze Mesh*, then *Repair Local
+   Defects* if the verdict reports non-manifold edges.
 6. **Alignment** → align the scan, if the study needs a common frame.
 7. **Landmark Manager** → add landmarks, pick each one on the surface.
    **Do this on the measurement mesh**, after preprocessing — see below.
@@ -70,7 +85,7 @@ No Terminal or PowerShell is needed.
    *Calculate All*.
 9. **Surface paths only when you need one.** They are computed on request and
    then cached, so showing, hiding or restyling one never re-solves.
-10. **Session and Export** → fill in Subject ID / Condition / Scan ID, then
+10. **Results and Export** → fill in Subject ID / Condition / Scan ID, then
     *Measurements CSV* and *Landmarks CSV*.
 11. *Save Protocol* once, and load it for every later subject.
 
@@ -81,9 +96,14 @@ measurement mesh and never re-projects them — doing either would move a
 researcher's landmark silently. If the source already carries landmarks, the
 preprocessing report says so and asks you to re-pick them on the copy.
 
-The top of the sidebar shows a single readiness line — `READY FOR MEASUREMENT`
-or `NOT READY: <reason>` — which is the fastest way to find out what is
-missing.
+**Scan Setup** shows a single readiness line — `READY FOR MEASUREMENT` or
+`NOT READY: <reason>` — which is the fastest way to find out what is missing.
+It appears once, at the top, and is not repeated per panel.
+
+Two panels sit under Scan Setup rather than in the workflow itself:
+**Quick Measure (A to B)**, a Phase 1 spot check between two picked points
+that stores nothing in the landmark or measurement lists, and **Geodesic
+Backend (Developer)**. Both are closed by default.
 
 ## Limitations
 
@@ -128,7 +148,7 @@ wheel per platform.
 
 If the solver is missing, BSMT still enables and everything except surface
 distance and surface paths keeps working; those report a clear dependency
-error. The *About BSMT* section of *Session and Export* says which state you
+error. The *About BSMT* section of *Results and Export* says which state you
 are in.
 
 ## Licensing

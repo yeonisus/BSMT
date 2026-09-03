@@ -23,16 +23,49 @@ import math
 import bpy
 
 from . import (alignment, export, geodesic, landmarks, measurement,
-               measurements, overlay, preprocess, repair, scancopy, state,
-               timing, visualization, viz)
+               measurements, overlay, preprocess, readiness, repair, scancopy,
+               state, timing, visualization, viz)
 
 
-class BSMT_PT_body_measurement(bpy.types.Panel):
-    bl_label = "Quick Measure (A to B)"
-    bl_idname = "BSMT_PT_body_measurement"
+#: Panel order, one number per workflow stage. Explicit `bl_order` rather
+#: than registration order: registration order is incidental - it changes if
+#: anyone reorders the `classes` tuple - and Blender documents bl_order as
+#: "panels with lower numbers are default ordered before panels with higher
+#: numbers". Verified on 4.5.13: panels registered third/first/second with
+#: bl_order 30/10/20 order as first/second/third.
+#:
+#: Gaps of ten so a stage can be inserted later without renumbering.
+STAGE_ORDER = {
+    readiness.STAGE_SCAN: 10,
+    readiness.STAGE_PREPROCESS: 20,
+    readiness.STAGE_ALIGNMENT: 30,
+    readiness.STAGE_LANDMARKS: 40,
+    readiness.STAGE_MEASUREMENTS: 50,
+    readiness.STAGE_VISUALIZATION: 60,
+    readiness.STAGE_EXPORT: 70,
+}
+
+
+class BSMT_PT_scan_setup(bpy.types.Panel):
+    """Stage 1: which scan is being worked on, and is it understood yet.
+
+    The sidebar is ordered as the research workflow actually runs - scan,
+    preprocess, align, landmark, measure, visualise, export - and this is
+    where a first-time user starts. It establishes the measurement target
+    and offers the one thing that has to happen before anything else is
+    meaningful: analysing the mesh.
+
+    It defines no diagnostics of its own. Analyze Scan is the existing
+    `bsmt.diagnose_topology` operator, and every number shown here is read
+    from the canonical mesh cache with peek(), which never builds one.
+    """
+
+    bl_label = "Scan Setup"
+    bl_idname = "BSMT_PT_scan_setup"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "BSMT"
+    bl_order = STAGE_ORDER[readiness.STAGE_SCAN]
 
     def draw(self, context):
         layout = self.layout
@@ -41,9 +74,50 @@ class BSMT_PT_body_measurement(bpy.types.Panel):
             layout.label(text="BSMT is not registered", icon='ERROR')
             return
 
+        # The single readiness line lives here and nowhere else: one status,
+        # at the top of the workflow, not repeated per panel (sect. 14).
         _draw_readiness(context, layout, props)
+        _draw_measurement_target(context, layout, props)
+        _draw_hint(context, layout, readiness.STAGE_SCAN, props)
 
         layout.prop(props, "unit")
+        layout.operator("bsmt.diagnose_topology", text="Analyze Scan",
+                        icon='VIEWZOOM')
+
+
+class BSMT_PT_body_measurement(bpy.types.Panel):
+    """A two-point ruler, kept from Phase 1.
+
+    Deliberately a CHILD of Scan Setup and closed by default. It measures a
+    single ad-hoc A-to-B pair and stores nothing in the landmark or
+    measurement lists, so it is a spot check rather than a step of the
+    research workflow - which is what the Landmark and Measurement Managers
+    are for.
+    """
+
+    bl_label = "Quick Measure (A to B)"
+    bl_idname = "BSMT_PT_body_measurement"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "BSMT"
+    bl_parent_id = "BSMT_PT_scan_setup"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 20
+
+    def draw(self, context):
+        layout = self.layout
+        props = state.get_props(context)
+        if props is None:
+            layout.label(text="BSMT is not registered", icon='ERROR')
+            return
+
+        note = layout.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("A spot check between two picked points. Nothing "
+                          "here is stored as a landmark or a measurement.",
+                          44):
+            note.label(text=line)
 
         display = layout.box()
         display.prop(props, "marker_size_mm")
@@ -236,6 +310,21 @@ def _about_lines():
         return ["environment unavailable: %s" % exc]
 
 
+def _draw_hint(context, layout, stage, props=None):
+    """The stage's one-line "what next", if it has one (sect. 10).
+
+    Nothing is disabled and nothing is hidden by this - it is a sentence.
+    What may actually run is decided by each operator's poll() and by the
+    solver gate, neither of which this touches (sect. 11, sect. 12).
+    """
+    text = state.stage_hint(context, stage, props)
+    if not text:
+        return ""
+    row = layout.row()
+    row.label(text=text, icon='INFO')
+    return text
+
+
 def _draw_readiness(context, layout, props):
     """One compact line: can this scan be measured, and if not, why (sect. 13).
 
@@ -267,6 +356,23 @@ def _draw_readiness(context, layout, props):
                                   if entry["panel"] else ""),
                    icon='ERROR' if entry["blocking"] else 'DOT')
     return result
+
+
+def _draw_target_line(context, layout, props):
+    """One line naming the mesh measurements run on. Summary of the block
+    in `_draw_measurement_target`, for panels that must not repeat it."""
+    obj, reason = state.measurement_target(context, props)
+    row = layout.row()
+    row.enabled = obj is not None
+    row.alert = obj is None
+    if obj is None:
+        row.label(text="Measurement Mesh: %s" % reason, icon='ERROR')
+        return ""
+    provenance = getattr(obj, "bsmt_scan", None)
+    is_copy = bool(provenance is not None and provenance.is_measurement_copy)
+    row.label(text="Measuring on: %s" % obj.name,
+              icon='DUPLICATE' if is_copy else 'MESH_DATA')
+    return obj.name
 
 
 def _draw_measurement_target(context, layout, props):
@@ -333,8 +439,9 @@ class BSMT_PT_diagnostics(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "BSMT"
-    bl_parent_id = "BSMT_PT_body_measurement"
+    bl_parent_id = "BSMT_PT_scan_setup"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 10
 
     def draw(self, context):
         layout = self.layout
@@ -448,8 +555,9 @@ class BSMT_PT_geodesic_backend(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "BSMT"
-    bl_parent_id = "BSMT_PT_body_measurement"
+    bl_parent_id = "BSMT_PT_scan_setup"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 30
 
     def draw(self, context):
         layout = self.layout
@@ -583,6 +691,7 @@ class BSMT_PT_landmarks(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "BSMT"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = STAGE_ORDER[readiness.STAGE_LANDMARKS]
 
     def draw(self, context):
         layout = self.layout
@@ -591,6 +700,8 @@ class BSMT_PT_landmarks(bpy.types.Panel):
         if props is None or collection is None:
             layout.label(text="BSMT is not registered", icon='ERROR')
             return
+
+        _draw_hint(context, layout, readiness.STAGE_LANDMARKS, props)
 
         if props.protocol_name:
             row = layout.row()
@@ -871,6 +982,7 @@ class BSMT_PT_measurements(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "BSMT"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = STAGE_ORDER[readiness.STAGE_MEASUREMENTS]
 
     def draw(self, context):
         layout = self.layout
@@ -889,7 +1001,11 @@ class BSMT_PT_measurements(bpy.types.Panel):
             box = layout.box()
             box.label(text=props.measurement_progress, icon='TIME')
 
-        _draw_measurement_target(context, layout, props)
+        # One line, not the full block: which mesh a result belongs to still
+        # has to be visible where results are read, but the detail lives in
+        # Scan Setup and is not repeated here (sect. 14).
+        _draw_target_line(context, layout, props)
+        _draw_hint(context, layout, readiness.STAGE_MEASUREMENTS, props)
 
         layout.template_list(
             "BSMT_UL_measurements", "",
@@ -1174,13 +1290,13 @@ class BSMT_PT_session(bpy.types.Panel):
     between subjects. Nothing in this panel can change a number.
     """
 
-    bl_label = "Session and Export"
+    bl_label = "Results and Export"
     bl_idname = "BSMT_PT_session"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "BSMT"
-    bl_parent_id = "BSMT_PT_measurements"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = STAGE_ORDER[readiness.STAGE_EXPORT]
 
     def draw(self, context):
         layout = self.layout
@@ -1188,6 +1304,8 @@ class BSMT_PT_session(bpy.types.Panel):
         if props is None:
             layout.label(text="BSMT is not registered", icon='ERROR')
             return
+
+        _draw_hint(context, layout, readiness.STAGE_EXPORT, props)
 
         box = layout.box()
         box.label(text="Session Info")
@@ -1273,8 +1391,8 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "BSMT"
-    bl_parent_id = "BSMT_PT_measurements"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = STAGE_ORDER[readiness.STAGE_VISUALIZATION]
 
     def draw(self, context):
         layout = self.layout
@@ -1283,6 +1401,8 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
         if props is None or collection is None:
             layout.label(text="BSMT is not registered", icon='ERROR')
             return
+
+        _draw_hint(context, layout, readiness.STAGE_VISUALIZATION, props)
 
         item = state.active_measurement(context, props)
         box = layout.box()
@@ -1493,7 +1613,7 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
 
 
 class BSMT_PT_preprocessing(bpy.types.Panel):
-    """Turn a dense textured scan into a lighter TEXTURED measurement copy.
+    """Turn a dense textured scan into a lighter TEXTURED measurement mesh.
 
     The source scan is never modified. Nothing is welded and no hole is
     filled: on a human scan those silently fuse anatomically distinct
@@ -1507,6 +1627,7 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "BSMT"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = STAGE_ORDER[readiness.STAGE_PREPROCESS]
 
     def draw(self, context):
         layout = self.layout
@@ -1514,6 +1635,8 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
         if props is None:
             layout.label(text="BSMT is not registered", icon='ERROR')
             return
+
+        _draw_hint(context, layout, readiness.STAGE_PREPROCESS, props)
 
         obj = context.active_object
         info = scancopy.describe(obj) if obj is not None else None
@@ -1735,7 +1858,7 @@ class BSMT_UL_repair_components(bpy.types.UIList):
 
 
 class BSMT_PT_repair(bpy.types.Panel):
-    """Controlled repair of a measurement copy (Milestone 3.4).
+    """Controlled repair of a measurement mesh (Milestone 3.4).
 
     Runs only on a copy generated by Scan Preprocessing, so the source scan is
     never modified. Every repair is an explicit action on a region the
@@ -1749,7 +1872,9 @@ class BSMT_PT_repair(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "BSMT"
+    bl_parent_id = "BSMT_PT_preprocessing"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 10
 
     def draw(self, context):
         layout = self.layout
@@ -1922,6 +2047,7 @@ class BSMT_PT_alignment(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "BSMT"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = STAGE_ORDER[readiness.STAGE_ALIGNMENT]
 
     def draw(self, context):
         layout = self.layout
@@ -2092,22 +2218,66 @@ class BSMT_PT_alignment(bpy.types.Panel):
         note.label(text="   (UI guidance, not a validated threshold)")
 
 
+# Registration order is NOT the sidebar order. Every panel carries an
+# explicit `bl_order`, so the workflow reads top to bottom whatever order
+# these are registered in - and reordering this tuple cannot silently
+# reshuffle the UI. A parent must still be registered before its children,
+# which is the only constraint this ordering serves.
 classes = (
-    BSMT_PT_body_measurement,
+    # stage 1 - Scan Setup, and the developer/spot-check panels under it
+    BSMT_PT_scan_setup,
     BSMT_PT_diagnostics,
+    BSMT_PT_body_measurement,
     BSMT_PT_geodesic_backend,
-    BSMT_UL_landmarks,
-    BSMT_PT_landmarks,
-    BSMT_UL_measurements,
-    BSMT_PT_measurements,
-    BSMT_PT_session,
-    BSMT_PT_measurement_visualization,
+    # stage 2 - Scan Preprocessing, with Mesh Repair under it
     BSMT_PT_preprocessing,
-    BSMT_PT_alignment,
     BSMT_UL_boundary_loops,
     BSMT_UL_repair_components,
     BSMT_PT_repair,
+    # stage 3 - Alignment
+    BSMT_PT_alignment,
+    # stage 4 - Landmarks
+    BSMT_UL_landmarks,
+    BSMT_PT_landmarks,
+    # stage 5 - Measurements
+    BSMT_UL_measurements,
+    BSMT_PT_measurements,
+    # stage 6 - Measurement Visualization
+    BSMT_PT_measurement_visualization,
+    # stage 7 - Results and Export
+    BSMT_PT_session,
 )
+
+
+def workflow_panels():
+    """Every BSMT panel, in the order the sidebar shows them.
+
+    Sorted by (parent's order, own order) so a child always follows its
+    parent, exactly as Blender lays them out. This is what the tests read, so
+    "the sidebar reads as the workflow" is checked against the same numbers
+    Blender uses rather than against the registration tuple.
+    """
+    panels = [cls for cls in classes if issubclass(cls, bpy.types.Panel)]
+    by_id = {cls.bl_idname: cls for cls in panels}
+
+    def key(cls):
+        parent = by_id.get(getattr(cls, "bl_parent_id", ""))
+        if parent is None:
+            return (cls.bl_order, 0, cls.bl_label)
+        return (parent.bl_order, 1, cls.bl_order, cls.bl_label)
+
+    top = sorted((cls for cls in panels
+                  if not getattr(cls, "bl_parent_id", "")),
+                 key=lambda cls: cls.bl_order)
+    ordered = []
+    for parent in top:
+        ordered.append(parent)
+        ordered.extend(sorted(
+            (cls for cls in panels
+             if getattr(cls, "bl_parent_id", "") == parent.bl_idname),
+            key=lambda cls: cls.bl_order,
+        ))
+    return ordered
 
 
 def register():

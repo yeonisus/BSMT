@@ -33,8 +33,8 @@ REASON_NO_MEASUREMENTS = 'NO_MEASUREMENTS'
 #: Which panel explains a reason in full. Kept here so the wording of the
 #: pointer and the wording of the panel title cannot drift apart.
 PANEL_FOR_REASON = {
-    REASON_NO_MESH: "Scan Preprocessing",
-    REASON_NOT_ANALYSED: "Mesh Repair",
+    REASON_NO_MESH: "Scan Setup",
+    REASON_NOT_ANALYSED: "Scan Setup",
     REASON_NON_MANIFOLD: "Mesh Repair",
     REASON_DENSE: "Scan Preprocessing",
     REASON_NON_UNIFORM_SCALE: "Alignment",
@@ -43,6 +43,110 @@ PANEL_FOR_REASON = {
     REASON_LANDMARKS_STALE: "Landmark Manager",
     REASON_NO_MEASUREMENTS: "Measurement Manager",
 }
+
+
+# ---------------------------------------------------------------------------
+# per-stage guidance (Milestone 3.16)
+# ---------------------------------------------------------------------------
+#
+# The sidebar is ordered as the research workflow runs, and each stage says
+# in one short line what is missing before it can be useful. Deliberately NOT
+# a wizard: nothing is hidden, nothing is stepped through, and a stage with
+# nothing to say says nothing at all rather than nagging.
+#
+# This is guidance, never enforcement. What may actually RUN is decided by
+# each operator's own poll() and by `preprocess.preflight`, which this module
+# does not touch (sect. 11, sect. 12).
+
+STAGE_SCAN = 'SCAN'
+STAGE_PREPROCESS = 'PREPROCESS'
+STAGE_ALIGNMENT = 'ALIGNMENT'
+STAGE_LANDMARKS = 'LANDMARKS'
+STAGE_MEASUREMENTS = 'MEASUREMENTS'
+STAGE_VISUALIZATION = 'VISUALIZATION'
+STAGE_EXPORT = 'EXPORT'
+
+#: Stages in the order the sidebar shows them. The panel order is derived
+#: from this, so the two cannot drift apart.
+STAGE_ORDER = (
+    STAGE_SCAN,
+    STAGE_PREPROCESS,
+    STAGE_ALIGNMENT,
+    STAGE_LANDMARKS,
+    STAGE_MEASUREMENTS,
+    STAGE_VISUALIZATION,
+    STAGE_EXPORT,
+)
+
+STAGE_TITLES = {
+    STAGE_SCAN: "Scan Setup",
+    STAGE_PREPROCESS: "Scan Preprocessing",
+    STAGE_ALIGNMENT: "Alignment",
+    STAGE_LANDMARKS: "Landmark Manager",
+    STAGE_MEASUREMENTS: "Measurement Manager",
+    STAGE_VISUALIZATION: "Measurement Visualization",
+    STAGE_EXPORT: "Results and Export",
+}
+
+
+def stage_hint(stage, has_mesh=True, analysed=True, copy_status="",
+               landmark_total=0, landmarks_picked=0, measurements_defined=0,
+               results_available=0, non_manifold=0):
+    """One short line telling the researcher what this stage still needs.
+
+    Returns "" when the stage has nothing useful to say - which is the normal
+    case once the workflow is under way. Pure: every argument is a number or
+    a flag the add-on already holds, so this is safe from a panel draw and is
+    testable without Blender.
+    """
+    if not has_mesh:
+        # Every stage depends on there being a scan at all, and saying so
+        # once per panel is less confusing than each stage inventing its own
+        # way to be empty.
+        return "No scan selected."
+
+    if stage == STAGE_SCAN:
+        if not analysed:
+            return "Analyze the scan before preprocessing."
+        return ""
+
+    if stage == STAGE_PREPROCESS:
+        if not analysed:
+            return "Analyze the scan first."
+        if copy_status == 'NOT_READY':
+            return "Resolve critical mesh issues before exact surface measurement."
+        return ""
+
+    if stage == STAGE_ALIGNMENT:
+        # Optional by design: a study that does not need a common anatomical
+        # frame skips it entirely, so this stage never demands anything.
+        return ""
+
+    if stage == STAGE_LANDMARKS:
+        if landmark_total <= 0:
+            return "Create or load landmarks before defining measurements."
+        if landmarks_picked <= 0:
+            return "Pick each landmark on the scan surface."
+        return ""
+
+    if stage == STAGE_MEASUREMENTS:
+        if landmark_total <= 0:
+            return "Create landmarks first."
+        if measurements_defined <= 0:
+            return "Define landmark pairs before calculation."
+        return ""
+
+    if stage == STAGE_VISUALIZATION:
+        if measurements_defined <= 0:
+            return "Define a measurement to visualize."
+        return ""
+
+    if stage == STAGE_EXPORT:
+        if results_available <= 0:
+            return "Calculate measurements before exporting."
+        return ""
+
+    return ""
 
 
 def _plural(count, word):

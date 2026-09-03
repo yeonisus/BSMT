@@ -295,9 +295,146 @@ def test_panel_pointers_are_real_panel_titles():
               for name in dir(readiness) if name.startswith("REASON_")))
 
 
+def test_stage_hints():
+    print("\n[stages] each stage says what it still needs, in one line")
+    ready = dict(has_mesh=True, analysed=True, copy_status="",
+                 landmark_total=3, landmarks_picked=3,
+                 measurements_defined=2, results_available=2)
+
+    for stage in readiness.STAGE_ORDER:
+        check("%s is quiet when everything is done" % stage,
+              readiness.stage_hint(stage, **ready) == "",
+              readiness.stage_hint(stage, **ready))
+
+    # No scan at all: every stage says the same thing, once.
+    nothing = dict(ready, has_mesh=False)
+    for stage in readiness.STAGE_ORDER:
+        check("%s reports the missing scan" % stage,
+              readiness.stage_hint(stage, **nothing) == "No scan selected.",
+              readiness.stage_hint(stage, **nothing))
+
+
+def test_stage_hint_sequence():
+    print("\n[stages] the hints follow the workflow forward")
+    facts = dict(has_mesh=True, analysed=False, copy_status="",
+                 landmark_total=0, landmarks_picked=0,
+                 measurements_defined=0, results_available=0)
+
+    check("an unanalysed scan is asked to be analysed",
+          readiness.stage_hint(readiness.STAGE_SCAN, **facts)
+          == "Analyze the scan before preprocessing.")
+    check("and preprocessing says so too, in its own words",
+          readiness.stage_hint(readiness.STAGE_PREPROCESS, **facts)
+          == "Analyze the scan first.")
+
+    facts["analysed"] = True
+    check("once analysed, Scan Setup goes quiet",
+          readiness.stage_hint(readiness.STAGE_SCAN, **facts) == "")
+    check("landmarks are asked for",
+          readiness.stage_hint(readiness.STAGE_LANDMARKS, **facts)
+          == "Create or load landmarks before defining measurements.")
+    check("measurements ask for landmarks first",
+          readiness.stage_hint(readiness.STAGE_MEASUREMENTS, **facts)
+          == "Create landmarks first.")
+    check("visualization asks for a measurement",
+          readiness.stage_hint(readiness.STAGE_VISUALIZATION, **facts)
+          == "Define a measurement to visualize.")
+    check("export asks for a calculation",
+          readiness.stage_hint(readiness.STAGE_EXPORT, **facts)
+          == "Calculate measurements before exporting.")
+
+    facts["landmark_total"] = 4
+    check("defined but unpicked landmarks are asked to be picked",
+          readiness.stage_hint(readiness.STAGE_LANDMARKS, **facts)
+          == "Pick each landmark on the scan surface.")
+
+    facts["landmarks_picked"] = 4
+    check("picked landmarks end the landmark hint",
+          readiness.stage_hint(readiness.STAGE_LANDMARKS, **facts) == "")
+    check("and measurements now ask for pairs",
+          readiness.stage_hint(readiness.STAGE_MEASUREMENTS, **facts)
+          == "Define landmark pairs before calculation.")
+
+    facts["measurements_defined"] = 2
+    check("a defined measurement ends that hint",
+          readiness.stage_hint(readiness.STAGE_MEASUREMENTS, **facts) == "")
+    check("and visualization goes quiet too",
+          readiness.stage_hint(readiness.STAGE_VISUALIZATION, **facts) == "")
+    check("export still waits for a result",
+          readiness.stage_hint(readiness.STAGE_EXPORT, **facts)
+          == "Calculate measurements before exporting.")
+
+    facts["results_available"] = 2
+    check("and goes quiet once there is one",
+          readiness.stage_hint(readiness.STAGE_EXPORT, **facts) == "")
+
+
+def test_not_ready_mesh_is_named():
+    print("\n[stages] a NOT READY measurement mesh is called out")
+    facts = dict(has_mesh=True, analysed=True, copy_status='NOT_READY',
+                 landmark_total=2, landmarks_picked=2,
+                 measurements_defined=1, results_available=0)
+    check("preprocessing warns about surface measurement",
+          readiness.stage_hint(readiness.STAGE_PREPROCESS, **facts)
+          == "Resolve critical mesh issues before exact surface measurement.")
+    for state_name in ("READY", "WARNING", ""):
+        facts["copy_status"] = state_name
+        check("a %r verdict does not raise that warning" % state_name,
+              readiness.stage_hint(readiness.STAGE_PREPROCESS, **facts) == "")
+
+
+def test_alignment_never_demands():
+    print("\n[stages] alignment is optional by design")
+    for analysed in (True, False):
+        facts = dict(has_mesh=True, analysed=analysed, copy_status="",
+                     landmark_total=0, landmarks_picked=0,
+                     measurements_defined=0, results_available=0)
+        check("alignment asks for nothing (analysed=%s)" % analysed,
+              readiness.stage_hint(readiness.STAGE_ALIGNMENT, **facts) == "",
+              readiness.stage_hint(readiness.STAGE_ALIGNMENT, **facts))
+    source = open(os.path.join(PACKAGE, "readiness.py")).read()
+    check("and the source says why", "Optional by design" in source)
+
+
+def test_hints_are_short():
+    print("\n[stages] messages stay short (sect. 10)")
+    seen = set()
+    for stage in readiness.STAGE_ORDER:
+        for facts in (
+            dict(has_mesh=False, analysed=False, copy_status="",
+                 landmark_total=0, landmarks_picked=0,
+                 measurements_defined=0, results_available=0),
+            dict(has_mesh=True, analysed=False, copy_status='NOT_READY',
+                 landmark_total=0, landmarks_picked=0,
+                 measurements_defined=0, results_available=0),
+            dict(has_mesh=True, analysed=True, copy_status='NOT_READY',
+                 landmark_total=1, landmarks_picked=0,
+                 measurements_defined=0, results_available=0),
+        ):
+            hint = readiness.stage_hint(stage, **facts)
+            if hint:
+                seen.add(hint)
+    check("several distinct hints exist", len(seen) >= 6, sorted(seen))
+    for hint in seen:
+        check("%r is one short sentence" % hint,
+              len(hint) <= 70 and hint.endswith("."), len(hint))
+
+
+def test_unknown_stage_is_silent():
+    print("\n[stages] an unrecognised stage invents nothing")
+    check("an unknown stage returns no hint",
+          readiness.stage_hint('NOT_A_STAGE', has_mesh=True) == "")
+
+
 def main():
     print("BSMT Milestone 3.7 - draft and readiness tests")
     for test in (
+        test_stage_hints,
+        test_stage_hint_sequence,
+        test_not_ready_mesh_is_named,
+        test_alignment_never_demands,
+        test_hints_are_short,
+        test_unknown_stage_is_silent,
         test_what_counts_as_a_draft,
         test_a_draft_is_never_named,
         test_draft_status_is_reported_specifically,

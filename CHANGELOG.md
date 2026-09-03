@@ -4,6 +4,56 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.22.0 — workflow-ordered sidebar
+
+UI and workflow organisation only. No measurement, preprocessing, solver or
+caching behaviour changed, and no operator gained or lost a capability.
+
+**The sidebar used to open with the Phase 1 A-to-B ruler and put landmarks and
+measurements above preprocessing and alignment** — roughly the reverse of the
+order the research workflow runs in. A first-time user reading top to bottom
+was led through the steps backwards.
+
+- **Seven stages, in workflow order**: Scan Setup → Scan Preprocessing →
+  Alignment → Landmark Manager → Measurement Manager → Measurement
+  Visualization → Results and Export.
+- **New *Scan Setup* panel** at the top: the readiness line, which mesh is the
+  measurement target, the coordinate unit, and *Analyze Scan*. It defines no
+  diagnostics of its own — *Analyze Scan* is the existing
+  `bsmt.diagnose_topology` operator, and every number is read from the
+  canonical mesh cache with `peek()`, which never builds one.
+- **Quick Measure (A to B) is demoted** to a closed child of Scan Setup and
+  labelled as a spot check that stores nothing. Mesh Diagnostics and Geodesic
+  Backend (Developer) moved with it.
+- **Mesh Repair** is now a child of Scan Preprocessing — it is mesh-quality
+  work belonging to that stage. **Measurement Visualization** and **Results
+  and Export** were promoted out of Measurement Manager to top-level stages 6
+  and 7; *Session and Export* is renamed *Results and Export*.
+- **Ordering is explicit.** Every panel declares `bl_order`; registration
+  order no longer decides anything. Verified on Blender 4.5.13 that panels
+  registered third/first/second with `bl_order` 30/10/20 lay out first,
+  second, third — and a test reverses the registration tuple and asserts the
+  sidebar order is unchanged. Nesting is one level deep, asserted by test.
+- **Short per-stage guidance**, e.g. "Analyze the scan before preprocessing.",
+  "Create or load landmarks before defining measurements.", "Resolve critical
+  mesh issues before exact surface measurement." A stage with nothing to say
+  says nothing. This is guidance, not a wizard and not enforcement: **no panel
+  disables a later stage**, asserted by test. What may actually run is still
+  decided by each operator's `poll()` and by the solver gate, neither of which
+  this touched.
+- **Status is stated once.** The readiness line and the full measurement-target
+  block are each drawn in exactly one place; Measurement Manager keeps a single
+  "Measuring on: <mesh>" line so a result can still be tied to its mesh.
+- Alignment and CSV export were already implemented (0.14.0 and 0.18.0), so
+  both are real panels in their workflow positions — no placeholders were
+  added.
+- Fixed two docstrings that said "measurement copy", against the project's
+  single vocabulary; a test now enforces it in `panels.py` and `readiness.py`.
+- Tests: new `tests/test_panel_order.py` (49 offline) and
+  `tests/test_workflow_ui.py` (69 in Blender); `tests/test_readiness.py` grows
+  102 → 149. 2,378 offline checks across nineteen suites, 0 failures;
+  preprocessing 110/110 and path visualization 90/90 unchanged.
+
 ## 0.21.0 — scan preprocessing v1
 
 Builds on the preprocessing shipped in 0.11.0 rather than replacing it. The

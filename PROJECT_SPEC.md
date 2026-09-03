@@ -3672,6 +3672,131 @@ detection. Repair is the next milestone, deliberately after this one has been us
 
 ---
 
+## 11t. Milestone 3.16 — Workflow-ordered sidebar (v0.22.0, 2026-09-03)
+
+UI and workflow organisation only. No measurement, preprocessing, solver, caching or landmark
+behaviour changed; no operator gained or lost a capability; every gate is where it was.
+
+### 11t.1 The problem: the sidebar ran backwards
+
+Panels had no `bl_order`, so the sidebar was in **registration order** — an incidental property of
+the `classes` tuple. What a first-time researcher saw, top to bottom, was:
+
+| | Old order | |
+|---|---|---|
+| 1 | **Quick Measure (A to B)** | the Phase 1 two-point ruler |
+| | ├ Mesh Diagnostics | |
+| | └ Geodesic Backend (Developer) | |
+| 2 | **Landmark Manager** | |
+| 3 | **Measurement Manager** | |
+| | ├ Session and Export | |
+| | └ Measurement Visualization | |
+| 4 | **Scan Preprocessing** | |
+| 5 | **Alignment** | |
+| 6 | **Mesh Repair** | |
+
+So the front door was a Phase 1 spot-check tool that stores nothing, scan diagnostics were buried
+inside it, and landmarking and measurement came **before** the preprocessing and alignment they
+depend on. Reading the panel downwards led through the workflow backwards.
+
+### 11t.2 The new order
+
+| | New order | `bl_order` |
+|---|---|---|
+| 1 | **Scan Setup** | 10 |
+| | ├ Mesh Diagnostics | 10 |
+| | ├ Quick Measure (A to B) | 20 |
+| | └ Geodesic Backend (Developer) | 30 |
+| 2 | **Scan Preprocessing** | 20 |
+| | └ Mesh Repair | 10 |
+| 3 | **Alignment** | 30 |
+| 4 | **Landmark Manager** | 40 |
+| 5 | **Measurement Manager** | 50 |
+| 6 | **Measurement Visualization** | 60 |
+| 7 | **Results and Export** | 70 |
+
+**Alignment and export are real, not placeholders.** Both were already implemented — Milestone 3.6
+(v0.14.0) and Milestone 3.11 (v0.18.0) — so the brief's contingency for unimplemented stages did
+not apply, and no disabled placeholder was added.
+
+*Session and Export* is renamed **Results and Export** and promoted out of Measurement Manager, as
+is **Measurement Visualization**. **Mesh Repair** becomes a child of Scan Preprocessing: it is
+mesh-quality work belonging to that stage, and it keeps the top level at exactly seven items.
+
+### 11t.3 Ordering is declared, not inherited
+
+Every panel now carries an explicit `bl_order`. Blender documents it as *"Panels with lower numbers
+are default ordered before panels with higher numbers"*, and it was verified rather than assumed:
+three panels registered in the order third, first, second with `bl_order` 30, 10, 20 laid out
+first, second, third on 4.5.13.
+
+Numbers are spaced by ten so a stage can be inserted without renumbering, and they come from one
+map keyed by the stage constants in `readiness.py`, so the panel order and the workflow vocabulary
+cannot drift apart. `panels.workflow_panels()` returns the panels in laid-out order — parent, then
+its children — and is what the tests read, so "the sidebar reads as the workflow" is checked
+against the same numbers Blender uses.
+
+A test **reverses the registration tuple** and asserts the sidebar order is unchanged.
+
+### 11t.4 Guidance, not a wizard, and not a gate
+
+Each stage draws at most one short line saying what it still needs:
+
+| Stage | Example |
+|---|---|
+| any, with nothing selected | "No scan selected." |
+| Scan Setup | "Analyze the scan before preprocessing." |
+| Scan Preprocessing | "Analyze the scan first." / "Resolve critical mesh issues before exact surface measurement." |
+| Alignment | *nothing, ever* — optional by design |
+| Landmark Manager | "Create or load landmarks before defining measurements." / "Pick each landmark on the scan surface." |
+| Measurement Manager | "Create landmarks first." / "Define landmark pairs before calculation." |
+| Measurement Visualization | "Define a measurement to visualize." |
+| Results and Export | "Calculate measurements before exporting." |
+
+A stage with nothing to say says nothing. `readiness.stage_hint` is pure — every argument is a
+number or a flag the add-on already holds — and `state.workflow_facts` collects those with `peek()`
+only, so a panel redraw can never build a canonical mesh or reach the solver.
+
+**Nothing is disabled by any of this** (sect. 11). A researcher may open the Landmark Manager
+before preprocessing, load a protocol at any time, and press Analyze Scan with nothing selected.
+Tests assert `layout.enabled = False` appears nowhere in `panels.py` and that the hint helper only
+ever draws a label. What may actually *run* is still decided by each operator's `poll()` and by
+`preprocess.preflight`, neither of which this milestone touched (sect. 12).
+
+### 11t.5 Saying things once
+
+Requirement 14 is about a sidebar that reads as one workflow rather than a developer toolbox:
+
+- the **readiness line** is drawn in exactly one place, Scan Setup;
+- the **full measurement-target block** likewise, in Scan Setup;
+- Measurement Manager keeps a single `Measuring on: <mesh>` line, because a result still has to be
+  tied to the mesh it belongs to — but not by repeating the block;
+- **Quick Measure** is closed by default and labelled as a spot check that stores nothing, so it
+  cannot be mistaken for the measurement workflow.
+
+Both counts are asserted by test, so a future panel cannot quietly add a second status line.
+
+### 11t.6 What is verified
+
+`tests/test_panel_order.py` (new, 49 offline checks): the seven stages in workflow order, every
+panel declaring `bl_order`, order surviving a reversed registration tuple, stage map and readiness
+vocabulary agreeing, one-level nesting, parents registered before children, the legacy panel
+demoted and closed, status drawn once, no `layout.enabled = False`, and the single vocabulary.
+
+`tests/test_workflow_ui.py` (new, 69 checks under real Blender): every panel's `draw` runs in an
+empty scene, with a raw scan, with an analysed scan, with a measurement mesh, and under each of the
+three preprocessing verdicts; prerequisite messages appear and then clear as the workflow advances;
+and the density threshold, the density guard and the non-manifold refusal are all unchanged.
+
+`tests/test_readiness.py` grew from 102 to 149 offline checks covering every stage-hint branch,
+including that alignment never demands anything and that every message is one short sentence.
+
+Regression: 2,378 offline checks across nineteen suites, plus 69 workflow-UI, 110 preprocessing and
+90 path-visualisation checks in Blender. 0 failures. The 0.22.0 extension package installs on a
+clean Blender config and lays the seven stages out in workflow order.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~
