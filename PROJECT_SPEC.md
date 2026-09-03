@@ -3295,6 +3295,221 @@ sixteen Blender acceptance scripts re-run clean.
 
 ---
 
+## 11r. Milestone 3.14 — Measurement path cache (v0.20.0, 2026-09-03)
+
+Surface-path visualisation worked, and on a large scan it was unusable. This milestone finds out
+why, and the answer is not where the symptom pointed. No geodesic algorithm changed, no
+preprocessing changed, and no measurement number changed.
+
+### 11r.1 What the symptom was, and what it was not
+
+"Displaying measurement lines is very slow, and worse as triangle count rises" reads like a
+drawing problem. It was measured as one first, on Blender 4.5.13, before anything was touched:
+
+| Operation | 261,120 tris, 511-point path |
+|---|---|
+| `viz.refresh()` | 0.29 ms |
+| `apply_measurement_display()` (colour/thickness) | 0.46 ms |
+| `sync_transforms()` | 0.03 ms |
+| object translate, whole handler chain | 0.10 ms |
+| `build_path` including the surface lift | 7 ms |
+| **bounded surface distance** | **6.3 s** |
+| **exact unbounded path solve** | **31.2 s** |
+
+Every display operation was sub-millisecond. Only the solver was slow — by four orders of
+magnitude. So the question was never "why is drawing slow"; it was **"what makes drawing reach the
+solver at all"**.
+
+A second run, end to end on a **801,024-triangle** scan, puts a number on what a lost cache
+actually costs:
+
+| | |
+|---|---|
+| canonical mesh build | 1.22 s |
+| bounded surface distance | 137.7 s |
+| **exact unbounded path solve** | **410.8 s — 6.8 minutes, one solver construction** |
+| of which: MMP structure construction | 0.28 s |
+| of which: propagation across the mesh | 409.9 s |
+
+The instrumentation settles which half is expensive, and it is not the one that looks it:
+construction is a third of a second, propagation is seven minutes. So **every avoidable re-solve
+was a seven-minute freeze**, and there is nothing to be gained by making the solver cheaper to
+build. The only useful move is to never run it twice for the same question.
+
+### 11r.2 Root cause: the display was the storage
+
+The computed polyline existed in exactly one place — the points of the helper `Curve` that drew
+it. `state.path_is_current()` said so outright:
+
+```python
+if not visualization.measurement_helper_exists(item.stable_id, 'PATH'):
+    return False
+```
+
+A cache whose validity test is "is the drawing still on screen" is not a cache. Consequences, all
+real:
+
+- `viz.refresh()` called `clear_measurement_path()` the moment a path failed that test, so a cache
+  that merely *looked* stale was **deleted**, not marked;
+- `Clear Selected` and `Clear All` destroyed the cached path, while their own descriptions said
+  "The cached path is kept";
+- deleting the helper in the Outliner, or anything that could not find it by name, was
+  indistinguishable from "never computed";
+- the only way back from any of those was the unbounded solve — 31 s at 261k triangles, and it
+  scales with the mesh.
+
+That is the whole reported symptom. The slowness attributed to visualisation was the solver,
+re-entered because the visualisation had thrown its own result away.
+
+### 11r.3 The cache, moved out of the drawing
+
+`pathcache.py` stores each measurement's polyline in a `Mesh` datablock of its own,
+`BSMT_PathCache_<stable id>`, with `use_fake_user` so it survives a save with no object attached.
+It holds `2k` vertices: the polyline in the **scan's local space**, then the unit surface normal at
+each point.
+
+Local, never world, is what makes a rigid transform free — translating or rotating the scan cannot
+change a local coordinate, so the entry stays valid and the helper follows by matrix. Storing world
+coordinates as the authoritative copy would make every move a re-solve.
+
+The **normals are cached with the points** because the drawn path is lifted off the surface by a
+multiple of its own thickness, and finding those normals is one BVH query per point: **138 ms for
+20,000 points on a 261k-triangle mesh**, measured. Done once at solve time, every later thickness
+or offset change becomes one vectorised multiply-add.
+
+Vertex coordinates are float32. Deliberate: this is display geometry feeding a float32 curve. The
+measurement is `path_length_mm` / `path_distance_mm`, which are never re-derived from these points.
+
+### 11r.4 Cache identity, and the four states
+
+An entry carries everything needed to judge it **without reading geometry, building a canonical
+mesh, or calling anything native**: the measurement stable id, both landmark stable ids, both
+endpoint SurfacePoints as triangle index + barycentric, the geometry hash, the metric tensor and
+metric key, the unit, the polyline, its length, its point count and its solve time.
+
+Endpoint triangle + barycentric is the field that was missing. Landmark stable ids alone cannot see
+a **re-pick**: the id survives, the point moves, and a path from where a landmark used to be would
+have kept claiming to be current.
+
+`state.path_cache_state()` returns one of four, with a reason:
+
+| State | Meaning |
+|---|---|
+| `NOT COMPUTED` | no solve has been run for this measurement |
+| `CACHED` | the stored polyline is the path for the current landmarks, geometry and metric |
+| `STALE` | a dependency changed. **The entry is kept and reported, never silently recomputed** |
+| `INVALID` | the polyline, a landmark, or the scan is gone |
+
+Invalidation:
+
+| Event | Result |
+|---|---|
+| rigid translation / rotation | **CACHED** — the metric tensor is rotation invariant and carries no translation |
+| scale or coordinate-unit change | **STALE** — the physical metric the geodesic was solved under changed |
+| mesh geometry edit | **STALE** — marked by the meshcache handler, which writes two properties and nothing else |
+| landmark re-picked | **STALE**, and only for the measurements that reference it |
+| measurement repointed at a different landmark | **STALE** |
+| landmark or scan deleted | **INVALID** |
+| helper hidden, removed, restyled, or the file reopened | **CACHED** — the helper is not where anything is kept |
+
+### 11r.5 What may now reach the solver
+
+Exactly one thing: pressing **Compute Surface Path**. Nothing else — not a panel redraw, an orbit,
+a zoom, a selection change, a colour, a thickness, a visibility toggle, a scene redraw, a rigid
+transform, or any depsgraph handler. `tests/test_path_visualization.py` proves this rather than
+asserting it: it wraps `pygeodesic.geodesic.PyGeodesicAlgorithmExact` — the only door to the native
+solver — in a counter, and every check records the count before and after and requires it
+unchanged.
+
+A stale path is **not** recomputed, by anything, ever. It is hidden, named as stale in the panel
+with its reason, and left for the researcher to decide about. Recomputing a path costs minutes on a
+dense scan; that is not a decision an update callback is entitled to make.
+
+### 11r.6 Helper writes are compared before they are made
+
+Assigning `bevel_depth`, a colour or `matrix_world` re-tags the datablock for re-evaluation whether
+or not the value changed, and re-evaluating a beveled poly curve costs time proportional to its
+point count. Measured on Blender 4.5.13:
+
+| Curve operation | 500 pts | 5,000 pts | 20,000 pts |
+|---|---|---|---|
+| assign `bevel_depth` (same value) | 0.38 ms | 2.22 ms | 8.19 ms |
+| rewrite every spline point | 0.35 ms | 2.41 ms | 8.53 ms |
+| rewrite points, bevel **off** | 0.08 ms | 0.40 ms | 1.38 ms |
+| assign `obj.color` | 0.02 ms | 0.01 ms | 0.01 ms |
+| assign `matrix_world` (same value) | 0.01 ms | 0.01 ms | 0.01 ms |
+
+The colour picker fires its update callback on **every mouse move**, so an unguarded `bevel_depth`
+write there was one full curve rebuild per pixel of drag. Every write in `visualization.py` is now
+guarded by a comparison, and a redisplay whose points would come out identical is skipped entirely
+by comparing a **draw signature** — cache generation plus lift distance plus object — instead of
+rewriting thousands of points to discover they were already right.
+
+`sync_transforms()` likewise writes a helper's matrix only when it actually moved, so a depsgraph
+tick no longer re-tags every measurement curve.
+
+The bevel cost itself was measured and **left alone**: it is genuine geometry work, it only appears
+when the thickness really changes, and changing the representation on the strength of a 15 ms
+worst case would be a much larger change than the evidence supports.
+
+### 11r.7 Canonical mesh invalidation, narrowed
+
+The meshcache handler cleared the **entire** canonical cache on any non-helper geometry update, so
+editing one object threw away every other scan's analysis — about 1.7 s per 1M triangles to
+rebuild. It now drops only the entries the changed datablock actually affects (an Object, or every
+cached object using a changed Mesh), and marks the paths solved on those objects stale. Property
+writes only; no geometry read, no canonical mesh, no solver.
+
+### 11r.8 Timing, so the next answer is not a guess
+
+"The measurement line is slow" has four causes with four different fixes: **A** the solver, **B** a
+cache miss that made A run, **C** Blender curve construction, **D** handler churn. `timing.py`
+records each named stage — cache validation, cache load/store, solver construction, exact path
+solve, result copy, helper create/update, helper transform — into a bounded sample ring plus
+**cumulative** totals. Cumulative matters: a bounded history would evict the one 40 s solve within
+seconds of redraws and the report would say the solver never ran.
+
+Console logging is off by default and throttled to one line per stage every two seconds, so a
+redraw-rate stage cannot flood the console. The panel reads the totals without measuring anything.
+
+### 11r.9 Measured result
+
+On the 801,024-triangle scan above, immediately after its 410.8 s solve: hide → show 0.18 ms,
+colour 0.20 ms, thickness 1.11 ms, `viz.refresh()` 0.13 ms, rigid translate 0.11 ms, and **zero**
+pygeodesic constructions across all of it.
+
+Worst case for the drawing itself — 1,046,528 triangles with a 20,000-point cached path, which is
+far longer than a real anatomical geodesic on that mesh:
+
+| Operation | Before | After |
+|---|---|---|
+| cache validation | required the helper object | **0.04 ms** |
+| hide → show cached path | destroyed the cache on some routes | **0.17 ms** |
+| colour change | full curve rebuild per mouse move | **0.19 ms** |
+| redisplay from cache | 14.56 ms | **0.02 ms** |
+| `viz.refresh()` | 14.90 ms | **0.16 ms** |
+| rigid translate, whole handler chain | — | **0.13 ms** |
+| thickness change | — | 15.35 ms (bevel rebuild + re-lift; genuine work) |
+| pygeodesic calls across all of the above | could be a full re-solve | **0** |
+
+### 11r.10 What is verified
+
+`tests/test_path_visualization.py`, 74 checks under real Blender, covering acceptance A–I: straight
+line instant and solver-free; exactly one solve on request; hide→show, helper deletion, colour,
+thickness, offset, redraws and orbit-equivalent ticks all solver-free; rigid transform keeps the
+cache and the helper follows; scale makes it stale without deleting it; a landmark re-pick
+invalidates only dependent measurements; a geometry edit marks stale without re-solving; and a full
+**.blend save/reload round trip** returning the identical polyline and redrawing in 0.18 ms.
+
+`tests/test_pathcache.py` adds 48 offline checks for the display lift, the timing recorder, the
+write guards and the source-level guarantees.
+
+Regression: 2,242 offline checks across sixteen suites plus 90 in Blender, 0 failures. The
+extension package installs and enables on a clean Blender config, selects its own platform wheel,
+and registers every new operator.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

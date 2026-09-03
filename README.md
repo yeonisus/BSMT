@@ -22,7 +22,7 @@ the caveats in [Limitations](#limitations).
 | **Alignment** | Rigidly aligns the scan to an anatomical frame, by hand or from four reference points. Object transform only — no vertex is moved |
 | **Landmarks** | Named points picked on the surface, stored as triangle + barycentric coordinates rather than as an XYZ, so they survive any rigid transform |
 | **Measurements** | Researcher-defined pairs of landmarks. Straight distance, exact surface distance, or both |
-| **Surface Path** | The exact geodesic polyline a surface distance follows, drawn in the viewport |
+| **Surface Path** | The exact geodesic polyline a surface distance follows, drawn in the viewport. Solved only when you press the button, then cached per measurement — showing, hiding, restyling or moving it never re-solves |
 | **Export** | Measurements and landmarks as CSV, plus a reusable protocol as JSON |
 
 Distances are always reported in **millimetres**.

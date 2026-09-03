@@ -18,7 +18,8 @@ from bpy.props import (
 )
 
 from . import (alignment, export, geodesic, landmarks, measurement,
-               measurements, overlay, preprocess, readiness, visualization)
+               measurements, overlay, pathcache, preprocess, readiness,
+               timing, visualization)
 
 
 def _on_display_changed(self, context):
@@ -335,10 +336,30 @@ def _on_preprocess_preset_changed(self, context):
         self.preprocess_target_triangles = target
 
 
+def _on_timing_debug_changed(self, context):
+    """Console logging follows the checkbox. Recording is never turned off."""
+    try:
+        timing.set_enabled(self.timing_debug)
+    except Exception:                                 # pragma: no cover
+        pass
+
+
 def _on_visualization_style_changed(self, context):
-    """Colour or thickness changed. Cosmetic: no rebuild, no recomputation."""
+    """Colour or thickness changed. Cosmetic: no rebuild, no recomputation.
+
+    Nothing here can reach the solver, and nothing here invalidates a cache.
+    The refresh is needed because the drawn path is lifted off the surface by
+    a multiple of its own thickness, so a thickness change moves the drawn
+    points - and it is cheap because a redisplay whose points would come out
+    identical is skipped by signature (viz.draw_cached_path).
+    """
     try:
         visualization.apply_measurement_display(context, self)
+    except Exception:                                 # pragma: no cover
+        pass
+    try:
+        from . import viz
+        viz.refresh(context, self)
     except Exception:                                 # pragma: no cover
         pass
 
@@ -449,9 +470,17 @@ class BSMT_Measurement(bpy.types.PropertyGroup):
     )
 
     # --- cached surface path ---------------------------------------------
-    # The polyline itself lives in the helper curve, in the scan's local
-    # space. These fields are the provenance that says whether it is still
-    # the path for the current landmarks, geometry and metric.
+    # The polyline itself lives in a datablock of its own (pathcache.py), in
+    # the scan's local space - NOT in the helper curve, and never in world
+    # coordinates. These fields are the provenance that says whether that
+    # polyline is still the path for the current landmarks, geometry and
+    # metric, so validating a cache costs no geometry read at all.
+    #
+    # Everything sect. 4 of the visualisation brief asks a cache entry to
+    # carry is here: the measurement's own stable id (this PropertyGroup),
+    # both landmark stable ids, both endpoint SurfacePoint locations
+    # (triangle + barycentric), the geometry hash, the metric/scale key, the
+    # polyline (in pathcache), its length, its status and its solve time.
     path_valid: BoolProperty(default=False)
     path_point_count: IntProperty(default=0)
     path_length_mm: FloatProperty(default=0.0)
@@ -462,8 +491,35 @@ class BSMT_Measurement(bpy.types.PropertyGroup):
     path_object: StringProperty(default="")
     path_geometry_hash: StringProperty(default="")
     path_metric_tensor: FloatVectorProperty(size=9, default=(0.0,) * 9)
+    path_metric_key: StringProperty(default="")
+    path_unit: StringProperty(default="")
     path_source_stable_id: IntProperty(default=0)
     path_target_stable_id: IntProperty(default=0)
+
+    # The exact endpoints the path was solved from. Landmark stable ids alone
+    # are not enough: re-picking a landmark keeps its id and moves the point,
+    # and a path from where a landmark USED to be is not this measurement.
+    path_source_triangle: IntProperty(default=-1)
+    path_source_bary: FloatVectorProperty(size=3, default=(0.0,) * 3)
+    path_target_triangle: IntProperty(default=-1)
+    path_target_bary: FloatVectorProperty(size=3, default=(0.0,) * 3)
+
+    # Set when a dependency changed under a cache that still exists. The
+    # entry is KEPT and reported as STALE rather than silently deleted or,
+    # worse, silently recomputed (sect. 9).
+    path_stale: BoolProperty(default=False)
+    path_stale_reason: StringProperty(default="")
+
+    # Whether the researcher currently wants THIS measurement's path drawn.
+    # Separate from `show_visualization`, which is about the measurement as a
+    # whole: hiding a path must not also hide its straight chord. Purely a
+    # display choice - it never touches the cache (sect. 9).
+    path_shown: BoolProperty(
+        name="Show Path",
+        description="Draw this measurement's cached surface path. Hiding it "
+                    "keeps the cache; showing it again computes nothing",
+        default=True,
+    )
 
     # --- dependency fingerprint, for sect. 12 invalidation ---------------
     result_object: StringProperty(default="")
@@ -669,6 +725,29 @@ class BSMT_Properties(bpy.types.PropertyGroup):
     show_surface_debug: BoolProperty(
         name="SurfacePoint Debug",
         description="Show canonical surface attachment details for A and B",
+        default=False,
+    )
+
+    # Milestone 3.14: which of the four possible causes of a slow measurement
+    # line is actually responsible - the solver, a cache miss, Blender curve
+    # construction, or handler churn. Recording is always on and costs a
+    # deque append; this only controls whether it is also printed, and even
+    # then a repeating stage prints at most once every two seconds so a
+    # redraw-rate stage can never flood the console.
+    timing_debug: BoolProperty(
+        name="Timing Log",
+        description=(
+            "Print [BSMT TIMING] stage timings to the system console. The "
+            "timings are always recorded and shown in the panel; this only "
+            "adds the console lines. Development aid"
+        ),
+        default=False,
+        update=_on_timing_debug_changed,
+    )
+    show_timing: BoolProperty(
+        name="Path Timing",
+        description="Show what the last path operations actually spent their "
+                    "time on",
         default=False,
     )
 
@@ -1658,6 +1737,13 @@ def remove_measurement(context, props, index):
         return None
     stable_id = int(collection[index].stable_id)
     collection.remove(index)
+    # The cached polyline outlives the helper on purpose, but not the
+    # definition that owns it: a cache with no measurement is unreachable
+    # weight in the .blend.
+    try:
+        pathcache.drop(stable_id)
+    except Exception:                                 # pragma: no cover
+        pass
     if props.measurement_index >= len(collection):
         props.measurement_index = max(0, len(collection) - 1)
     return stable_id
@@ -1669,17 +1755,40 @@ def clear_measurements(context, props):
         return 0
     count = len(collection)
     collection.clear()
+    try:
+        pathcache.drop_all()
+    except Exception:                                 # pragma: no cover
+        pass
     props.measurement_index = 0
     props.measurement_summary = ""
     props.measurement_progress = ""
     return count
 
 
+#: The four states a surface path can be in. Made explicit because the only
+#: safe response to "stale" is to SAY so - never to silently recompute a
+#: solve that costs minutes on a dense scan (sect. 9).
+PATH_NOT_COMPUTED = 'NOT_COMPUTED'
+PATH_CACHED = 'CACHED'
+PATH_STALE = 'STALE'
+PATH_INVALID = 'INVALID'
+
+PATH_STATE_LABELS = {
+    PATH_NOT_COMPUTED: "NOT COMPUTED",
+    PATH_CACHED: "CACHED",
+    PATH_STALE: "STALE",
+    PATH_INVALID: "INVALID",
+}
+
+
 def clear_measurement_path(item, remove_helper=True):
     """Forget a cached surface path. The measurement result is untouched.
 
-    The polyline lives in the helper curve, so dropping the cache removes it:
-    a path that is no longer known to be current must not stay on screen.
+    This is the deliberate, explicit discard - the Clear Cached Path button
+    and the invalidation paths. It is NOT what a display change does: a
+    helper can be removed and rebuilt as often as the researcher likes
+    without the polyline going anywhere, because the polyline does not live
+    in the helper (see pathcache.py).
     """
     had = bool(item.path_valid)
     item.path_valid = False
@@ -1692,8 +1801,20 @@ def clear_measurement_path(item, remove_helper=True):
     item.path_object = ""
     item.path_geometry_hash = ""
     item.path_metric_tensor = (0.0,) * 9
+    item.path_metric_key = ""
+    item.path_unit = ""
     item.path_source_stable_id = 0
     item.path_target_stable_id = 0
+    item.path_source_triangle = -1
+    item.path_source_bary = (0.0,) * 3
+    item.path_target_triangle = -1
+    item.path_target_bary = (0.0,) * 3
+    item.path_stale = False
+    item.path_stale_reason = ""
+    try:
+        pathcache.drop(item.stable_id)
+    except Exception:                                 # pragma: no cover
+        pass
     if remove_helper:
         try:
             visualization.remove_measurement_helper(item.stable_id, 'PATH')
@@ -1702,29 +1823,152 @@ def clear_measurement_path(item, remove_helper=True):
     return had
 
 
-def path_is_current(item, canonical=None, matrix_world=None):
-    """Whether a cached path still describes the current configuration.
+def _endpoints_match(item, source, target):
+    """Whether the cache was solved from the landmarks' CURRENT locations.
 
-    A rigid transform deliberately cannot fail this: the metric tensor is
-    rotation invariant and carries no translation, so a translated or rotated
-    scan keeps its path and simply follows (sect. 11).
+    Compared as triangle index plus barycentric coordinates, which is what a
+    SurfacePoint actually is. Re-picking a landmark keeps its stable id, so
+    ids alone would let a path outlive the point it was solved from.
     """
+    for landmark, triangle, bary in (
+        (source, item.path_source_triangle, item.path_source_bary),
+        (target, item.path_target_triangle, item.path_target_bary),
+    ):
+        if landmark is None:
+            return False
+        point = landmark.surface_point
+        if not point.valid:
+            return False
+        if int(point.triangle_index) != int(triangle):
+            return False
+        for stored, live in zip(bary, point.barycentric):
+            # Barycentric coordinates are stored in single precision on both
+            # sides, so they are compared at the float32 noise floor rather
+            # than exactly.
+            if abs(float(stored) - float(live)) > 1e-6:
+                return False
+    return True
+
+
+def _landmarks_for(context, item):
+    """The landmark collection this measurement lives beside, or None.
+
+    Reached from the measurement's own `id_data` - the Scene its collection
+    is attached to - when no context is available, which is the case in a
+    depsgraph handler. Returning None means "cannot check", and the endpoint
+    comparison is then skipped rather than guessed at: a cache must never be
+    declared invalid because the caller had no context.
+    """
+    collection = get_landmarks(context) if context is not None else None
+    if collection is not None:
+        return collection
+    scene = getattr(item, "id_data", None)
+    return getattr(scene, "bsmt_landmarks", None) if scene is not None else None
+
+
+def path_cache_state(context, item, canonical=None, matrix_world=None):
+    """(state, reason) for one measurement's cached surface path.
+
+    Pure inspection: it reads properties and asks pathcache whether a
+    polyline exists. It never touches geometry, never builds a canonical
+    mesh and above all never calls the solver, so it is safe from a panel
+    draw and from a depsgraph handler.
+
+    A rigid transform deliberately cannot reach STALE: the metric tensor is
+    rotation invariant and carries no translation, so a translated or rotated
+    scan keeps its path and the helper simply follows (sect. 11). A SCALE
+    change does reach it, because it changes the physical metric the geodesic
+    was solved under.
+    """
+    with timing.stage(timing.CACHE_VALIDATE):
+        return _path_cache_state(context, item, canonical, matrix_world)
+
+
+def _path_cache_state(context, item, canonical, matrix_world):
     if not item.path_valid:
-        return False
-    if item.path_source_stable_id != item.source_stable_id:
-        return False
-    if item.path_target_stable_id != item.target_stable_id:
-        return False
-    if not visualization.measurement_helper_exists(item.stable_id, 'PATH'):
-        return False
+        return PATH_NOT_COMPUTED, ""
+
+    try:
+        cached_points = pathcache.exists(item.stable_id)
+    except Exception:                                 # pragma: no cover
+        cached_points = False
+    if not cached_points:
+        return PATH_INVALID, "the cached polyline is missing from this file"
+
+    if item.path_source_stable_id != item.source_stable_id or \
+            item.path_target_stable_id != item.target_stable_id:
+        return PATH_STALE, "the measurement now uses different landmarks"
+
+    collection = _landmarks_for(context, item)
+    if collection is not None:
+        source = landmark_by_stable_id(collection, item.source_stable_id)
+        target = landmark_by_stable_id(collection, item.target_stable_id)
+        if source is None or target is None:
+            return PATH_INVALID, "a referenced landmark no longer exists"
+        if not _endpoints_match(item, source, target):
+            return PATH_STALE, "a landmark has been re-picked since the solve"
+
+    if item.path_object and bpy.data.objects.get(item.path_object) is None:
+        return PATH_INVALID, "the scan '%s' is no longer in the file" % item.path_object
+
+    if item.path_stale:
+        return PATH_STALE, item.path_stale_reason or "a dependency changed"
+
     if canonical is not None:
         if canonical.geometry_hash != item.path_geometry_hash:
-            return False
+            return PATH_STALE, "the mesh geometry changed since the solve"
         if matrix_world is not None:
             live = metric_tensor(matrix_world, canonical.unit_multiplier)
             if not metric_tensors_match(live, item.path_metric_tensor):
-                return False
+                return PATH_STALE, ("the object scale or coordinate unit "
+                                    "changed since the solve")
+    return PATH_CACHED, ""
+
+
+def path_is_current(item, canonical=None, matrix_world=None, context=None):
+    """Whether a cached path still describes the current configuration.
+
+    Thin wrapper over `path_cache_state` kept because it reads better at the
+    call sites that only care whether the path may be drawn.
+    """
+    state, _reason = path_cache_state(context, item, canonical, matrix_world)
+    return state == PATH_CACHED
+
+
+def mark_path_stale(item, reason):
+    """Record that a cached path no longer matches its dependencies.
+
+    Deliberately does NOT delete anything. A stale path is reported as stale
+    and recomputed only when the researcher asks, because the alternative -
+    quietly re-running the unbounded solve - is minutes of frozen Blender
+    triggered by something as innocent as a mesh edit (sect. 9).
+    """
+    if not item.path_valid or item.path_stale:
+        return False
+    item.path_stale = True
+    item.path_stale_reason = str(reason)
     return True
+
+
+def mark_paths_stale_for_object(scene, object_name, reason):
+    """Mark every cached path solved on this scan stale. Returns the count.
+
+    Cheap enough for a depsgraph handler by construction: it is a loop over
+    the measurement definitions writing two properties, with no geometry
+    read, no canonical mesh and no solver anywhere near it (sect. 7).
+    """
+    collection = getattr(scene, "bsmt_measurements", None) if scene else None
+    if not collection:
+        return 0
+    marked = 0
+    for item in collection:
+        if not item.path_valid:
+            continue
+        if object_name and item.path_object and item.path_object != object_name:
+            continue
+        if mark_path_stale(item, reason):
+            marked += 1
+    return marked
 
 
 def clear_measurement_result(item):

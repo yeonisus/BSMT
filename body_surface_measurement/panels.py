@@ -24,7 +24,7 @@ import bpy
 
 from . import (alignment, export, geodesic, landmarks, measurement,
                measurements, overlay, preprocess, repair, scancopy, state,
-               visualization, viz)
+               timing, visualization, viz)
 
 
 class BSMT_PT_body_measurement(bpy.types.Panel):
@@ -1308,7 +1308,7 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
                         text="Show This Measurement")
 
         self._draw_scope_report(context, layout, props)
-        self._draw_path_controls(layout, props, item)
+        self._draw_path_controls(context, layout, props, item)
 
         style = layout.box()
         style.label(text="Straight Distance")
@@ -1346,32 +1346,67 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
                        % (report["count"],
                           "" if report["count"] == 1 else "s"),
                   icon='HIDE_OFF')
-        if not report["path_wanted"] or not report["without_path"]:
+        if not report["path_wanted"]:
             return
-        missing = box.column(align=True)
-        missing.label(text="Path not computed:", icon='INFO')
-        for label in report["without_path"][:6]:
-            missing.label(text="   %s" % label)
-        if len(report["without_path"]) > 6:
-            missing.label(text="   and %d more"
-                               % (len(report["without_path"]) - 6))
+        if report["stale"]:
+            stale = box.column(align=True)
+            stale.alert = True
+            stale.label(text="Path stale (not recomputed):", icon='ERROR')
+            for label in report["stale"][:6]:
+                stale.label(text="   %s" % label)
+            if len(report["stale"]) > 6:
+                stale.label(text="   and %d more" % (len(report["stale"]) - 6))
+        if report["without_path"]:
+            missing = box.column(align=True)
+            missing.label(text="Path not computed:", icon='INFO')
+            for label in report["without_path"][:6]:
+                missing.label(text="   %s" % label)
+            if len(report["without_path"]) > 6:
+                missing.label(text="   and %d more"
+                                   % (len(report["without_path"]) - 6))
+        if not report["stale"] and not report["without_path"]:
+            return
         note = box.column(align=True)
         note.enabled = False
         for line in _wrap("Select one and press Compute Surface Path. "
-                          "Nothing is computed automatically.", 42):
+                          "Nothing is computed automatically, and a stale "
+                          "path is never recomputed behind your back.", 42):
             note.label(text=line)
 
     @staticmethod
-    def _draw_path_controls(layout, props, item):
+    def _draw_path_controls(context, layout, props, item):
+        """The surface path's state, in words, and the three buttons.
+
+        The state is always NAMED - NOT COMPUTED, CACHED, STALE or INVALID -
+        because a path is expensive enough that "why is nothing drawn" must
+        never need guessing, and because a stale path has to be visibly stale
+        rather than quietly re-solved (sect. 9).
+        """
         box = layout.box()
         if props.viz_running:
             box.label(text="Computing the surface path...", icon='TIME')
             return
 
-        if item.path_valid:
+        current, reason = viz.path_state(context, props, item)
+        label = state.PATH_STATE_LABELS.get(current, current)
+        icon = {
+            state.PATH_CACHED: 'CHECKMARK',
+            state.PATH_STALE: 'ERROR',
+            state.PATH_INVALID: 'CANCEL',
+        }.get(current, 'INFO')
+        header = box.row()
+        header.alert = current in (state.PATH_STALE, state.PATH_INVALID)
+        header.label(text="Surface Path:  %s" % label, icon=icon)
+        if reason:
+            detail = box.column(align=True)
+            detail.scale_y = 0.7
+            detail.enabled = False
+            for line in _wrap(reason, 44):
+                detail.label(text=line)
+
+        if current == state.PATH_CACHED:
             column = box.column(align=True)
             column.scale_y = 0.75
-            column.label(text="Surface path computed", icon='CHECKMARK')
             column.label(text="Points:          %d" % item.path_point_count)
             column.label(text="Path length:     %s"
                               % measurement.format_mm(item.path_length_mm))
@@ -1381,29 +1416,80 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
                               % measurement.format_mm(item.surface_mm))
             column.label(text="Agreement:       %.3e mm"
                               % item.path_agreement_mm)
-            column.label(text="Elapsed:         %.2f s" % item.path_elapsed_s)
-            box.operator("bsmt.compute_surface_path", text="Recompute Path",
-                         icon='FILE_REFRESH')
-            return
-
-        if props.viz_mode in ('SURFACE', 'BOTH'):
+            column.label(text="Solve time:      %.2f s" % item.path_elapsed_s)
+        elif current == state.PATH_NOT_COMPUTED:
             note = box.column(align=True)
             note.scale_y = 0.75
-            note.label(text="Path not computed", icon='INFO')
             if not item.surface_valid:
                 note.label(text="Calculate the surface distance first.")
             else:
-                for line in _wrap("This runs the unbounded exact solve and "
-                                  "may freeze Blender for tens of seconds.",
-                                  42):
+                for line in _wrap("Computing the path runs the unbounded "
+                                  "exact solve and may freeze Blender for "
+                                  "tens of seconds.", 42):
                     note.label(text=line)
-        box.operator("bsmt.compute_surface_path", icon='PLAY')
+        elif current == state.PATH_STALE:
+            note = box.column(align=True)
+            note.scale_y = 0.75
+            for line in _wrap("The cached path has been kept but is not "
+                              "drawn. Nothing was recomputed - press "
+                              "Compute Surface Path if you want it solved "
+                              "again.", 42):
+                note.label(text=line)
+
+        # Three buttons, three separate decisions. Computing is the only one
+        # that can ever reach the solver; the other two are display and
+        # cache management and are instant whatever the mesh size.
+        row = box.row(align=True)
+        row.operator(
+            "bsmt.compute_surface_path",
+            text=("Recompute Surface Path" if current != state.PATH_NOT_COMPUTED
+                  else "Compute Surface Path"),
+            icon=('FILE_REFRESH' if current != state.PATH_NOT_COMPUTED
+                  else 'PLAY'),
+        )
+        row = box.row(align=True)
+        row.operator(
+            "bsmt.toggle_surface_path",
+            text="Show Path" if not item.path_shown else "Hide Path",
+            icon='HIDE_OFF' if not item.path_shown else 'HIDE_ON',
+        )
+        row.operator("bsmt.clear_cached_path", icon='TRASH')
 
         if props.viz_status:
             status = box.column(align=True)
             status.scale_y = 0.7
             for line in _wrap(props.viz_status, 42):
                 status.label(text=line)
+
+        BSMT_PT_measurement_visualization._draw_timing(box, props)
+
+    @staticmethod
+    def _draw_timing(layout, props):
+        """Where the time actually went. Read from the ring buffer only.
+
+        Nothing is measured by drawing this - the samples were recorded when
+        the work happened - so opening the section cannot itself cost
+        anything, and it is what distinguishes a slow solver from a slow
+        curve rebuild from handler churn.
+        """
+        box = layout.box()
+        box.prop(props, "show_timing",
+                 icon='TRIA_DOWN' if props.show_timing else 'TRIA_RIGHT',
+                 emboss=False)
+        if not props.show_timing:
+            return
+        box.prop(props, "timing_debug")
+        totals = timing.totals()
+        if not totals:
+            box.label(text="Nothing timed yet.", icon='INFO')
+            return
+        column = box.column(align=True)
+        column.scale_y = 0.7
+        column.enabled = False
+        for label in sorted(totals, key=lambda key: -totals[key][1]):
+            count, total = totals[label]
+            column.label(text="%-16s %4dx %9.2f ms" % (label, count, total))
+        box.operator("bsmt.path_timing_report", icon='CONSOLE')
 
 
 class BSMT_PT_preprocessing(bpy.types.Panel):

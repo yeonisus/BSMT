@@ -16,7 +16,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 #: modern way. This constant is defined by the module itself, survives both
 #: packaging modes, and is what tools/build_release.py reads to stamp the
 #: extension manifest, so the two can never disagree.
-VERSION = (0, 19, 0)
+VERSION = (0, 20, 0)
 
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
@@ -40,7 +40,9 @@ bl_info = {
         "Milestone 3.9: screen-space landmark markers, with an "
         "optional visible-surface-only mode. "
         "Milestone 3.11: CSV export, session metadata and "
-        "reusable protocols"
+        "reusable protocols. "
+        "Milestone 3.14: per-measurement surface path cache, so display "
+        "never re-solves"
     ),
     "category": "3D View",
 }
@@ -51,9 +53,9 @@ if "bpy" in locals():
 
     from . import (
         alignment, attach, export, geodesic, landmarks, measurement,
-        measurements, meshrepair, overlay, panels, picking, preprocess,
-        protocol, readiness, repair, scancopy, state, visualization, viz,
-        operators,
+        measurements, meshrepair, overlay, panels, pathcache, picking,
+        preprocess, protocol, readiness, repair, scancopy, state, timing,
+        visualization, viz, operators,
     )
 
     importlib.reload(geodesic)
@@ -67,7 +69,9 @@ if "bpy" in locals():
     importlib.reload(repair)
     importlib.reload(protocol)
     importlib.reload(measurement)
+    importlib.reload(timing)
     importlib.reload(visualization)
+    importlib.reload(pathcache)
     importlib.reload(overlay)
     importlib.reload(state)
     importlib.reload(scancopy)
@@ -80,9 +84,9 @@ if "bpy" in locals():
 else:
     from . import (
         alignment, attach, export, geodesic, landmarks, measurement,
-        measurements, meshrepair, operators, overlay, panels, picking,
-        preprocess, protocol, readiness, repair, scancopy, state,
-        visualization, viz,
+        measurements, meshrepair, operators, overlay, panels, pathcache,
+        picking, preprocess, protocol, readiness, repair, scancopy, state,
+        timing, visualization, viz,
     )
 
 import bpy  # noqa: E402  (kept after the reload guard on purpose)
@@ -117,10 +121,42 @@ def _sweep_legacy_landmark_markers():
     return removed
 
 
+def _prune_orphan_path_caches():
+    """Drop cached polylines whose measurement is gone from this file.
+
+    A cache entry is kept alive by a fake user precisely so it survives with
+    no object attached, which also means nothing else will ever collect one.
+    Pruning is therefore explicit, and it is keyed on the measurement
+    definitions actually present - never on whether a helper is drawn.
+    """
+    try:
+        wanted = set()
+        found = False
+        # EVERY scene, not just the active one. Measurements live on a Scene,
+        # so pruning against one scene's list would delete another scene's
+        # solves - and a cached path is minutes of work, not a temp file.
+        for scene in bpy.data.scenes:
+            collection = getattr(scene, "bsmt_measurements", None)
+            if collection is None:
+                continue
+            found = True
+            wanted.update(int(item.stable_id) for item in collection)
+        if not found:
+            return 0
+        removed = pathcache.keep_only(wanted)
+    except Exception:                                 # pragma: no cover
+        return 0
+    if removed:
+        print("[BSMT] released %d cached surface path(s) with no measurement"
+              % removed)
+    return removed
+
+
 @bpy.app.handlers.persistent
 def _on_load_post(_path):
     """Sweep legacy markers in a file opened after the add-on registered."""
     _sweep_legacy_landmark_markers()
+    _prune_orphan_path_caches()
 
 
 def _purge_load_handler():

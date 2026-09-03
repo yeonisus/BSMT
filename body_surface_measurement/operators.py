@@ -11,8 +11,9 @@ from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        IntProperty, StringProperty)
 
 from . import (alignment, attach, export, geodesic, landmarks, measurement,
-               measurements, meshrepair, overlay, picking, preprocess,
-               protocol, repair, scancopy, state, visualization, viz)
+               measurements, meshrepair, overlay, pathcache, picking,
+               preprocess, protocol, repair, scancopy, state, timing,
+               visualization, viz)
 
 def _addon_version():
     # VERSION, not bl_info: Blender strips bl_info from an extension module.
@@ -2985,6 +2986,10 @@ class BSMT_OT_compute_surface_path(bpy.types.Operator):
 
         elapsed = time.perf_counter() - started
 
+        # The cache entry's identity, written in full. Everything needed to
+        # decide later whether this polyline is still the answer, WITHOUT
+        # reading geometry or running anything: both landmark ids, both
+        # endpoint surface locations, the geometry hash and the metric.
         item.path_point_count = int(result.point_count)
         item.path_length_mm = float(result.polyline_length_mm)
         item.path_distance_mm = float(result.distance_mm)
@@ -2996,8 +3001,20 @@ class BSMT_OT_compute_surface_path(bpy.types.Operator):
         item.path_metric_tensor = state.metric_tensor(
             obj.matrix_world, canonical.unit_multiplier
         )
+        item.path_metric_key = canonical.metric_key
+        item.path_unit = props.unit
         item.path_source_stable_id = int(item.source_stable_id)
         item.path_target_stable_id = int(item.target_stable_id)
+        item.path_source_triangle = int(source.surface_point.triangle_index)
+        item.path_source_bary = tuple(
+            float(value) for value in source.surface_point.barycentric
+        )
+        item.path_target_triangle = int(target.surface_point.triangle_index)
+        item.path_target_bary = tuple(
+            float(value) for value in target.surface_point.barycentric
+        )
+        item.path_stale = False
+        item.path_stale_reason = ""
         item.path_valid = True
 
         if not viz.build_path(context, props, item, result.polyline_solver,
@@ -3010,6 +3027,8 @@ class BSMT_OT_compute_surface_path(bpy.types.Operator):
 
         if not item.show_visualization:
             item.show_visualization = True
+        # Asking for a path is asking to see it.
+        item.path_shown = True
         viz.refresh(context, props)
 
         props.viz_status = (
@@ -3080,12 +3099,146 @@ class BSMT_OT_clear_visualization(bpy.types.Operator):
             return {'CANCELLED'}
         removed = viz.clear_for(item)
         item.show_visualization = False
-        # The cached path lived in the helper that has just been removed, so
-        # the cache goes with it rather than pointing at nothing.
-        state.clear_measurement_path(item)
+        # The cached path is deliberately KEPT. Since 0.20.0 the polyline
+        # lives in its own datablock rather than in the helper curve, so
+        # removing the drawing costs nothing to undo - which is what this
+        # operator's own description has always promised. Discarding a solve
+        # is what "Clear Cached Path" is for, and it has to be asked for.
         props.viz_status = ""
         self.report({'INFO'}, "BSMT: removed %d helper(s) for '%s'"
                     % (removed, item.label))
+        return {'FINISHED'}
+
+
+class BSMT_OT_toggle_surface_path(bpy.types.Operator):
+    """Show or hide the selected measurement's cached surface path.
+
+    Display only. It reads the cached polyline and never calls the solver:
+    a path that has already been computed costs nothing to put back on screen
+    """
+
+    bl_idname = "bsmt.toggle_surface_path"
+    bl_label = "Show/Hide Path"
+    bl_description = ("Show or hide the cached surface path. Nothing is"
+                      " computed: hiding and showing a cached path is free")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or props.viz_running:
+            return False
+        item = state.active_measurement(context, props)
+        return item is not None and item.path_valid
+
+    def execute(self, context):
+        props = state.get_props(context)
+        item = state.active_measurement(context, props)
+        if props is None or item is None:
+            return {'CANCELLED'}
+
+        current, reason = viz.path_state(context, props, item)
+        if current != state.PATH_CACHED:
+            message = ("the cached path is %s%s"
+                       % (state.PATH_STATE_LABELS.get(current, current),
+                          " - %s" % reason if reason else ""))
+            props.viz_status = message
+            self.report({'WARNING'}, "BSMT: " + message
+                        + ". Press Compute Surface Path to solve it again")
+            return {'CANCELLED'}
+
+        showing = item.path_shown and visualization.measurement_helper_visible(
+            item.stable_id, 'PATH')
+        if showing:
+            # Recorded on the measurement, not just on the helper, so the
+            # next refresh does not undo the button. The cache is untouched.
+            item.path_shown = False
+            visualization.set_measurement_helper_visible(item.stable_id,
+                                                         'PATH', False)
+            props.viz_status = "Path hidden (still cached)"
+            self.report({'INFO'}, "BSMT: path hidden; the cache is kept")
+            return {'FINISHED'}
+
+        if props.viz_mode == 'STRAIGHT':
+            # Asking to see the path while the mode says otherwise is an
+            # instruction, not a conflict.
+            props.viz_mode = 'BOTH'
+        item.path_shown = True
+        item.show_visualization = True
+        if not viz.draw_cached_path(context, props, item):
+            message = "the cached path could not be drawn"
+            props.viz_status = message
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+        visualization.set_measurement_helper_visible(item.stable_id, 'PATH',
+                                                     True)
+        props.viz_status = ("Path shown from cache (%d points, no solve)"
+                            % item.path_point_count)
+        self.report({'INFO'}, "BSMT: path shown from cache; nothing computed")
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_cached_path(bpy.types.Operator):
+    """Discard the selected measurement's cached surface path.
+
+    The only route that throws a solve away. Showing it again afterwards
+    means running the unbounded solver, which on a dense scan is minutes
+    """
+
+    bl_idname = "bsmt.clear_cached_path"
+    bl_label = "Clear Cached Path"
+    bl_description = ("Discard the cached surface path for this measurement."
+                      " Recomputing it later runs the full unbounded solve"
+                      " again")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or props.viz_running:
+            return False
+        item = state.active_measurement(context, props)
+        return item is not None and item.path_valid
+
+    def execute(self, context):
+        props = state.get_props(context)
+        item = state.active_measurement(context, props)
+        if props is None or item is None:
+            return {'CANCELLED'}
+        points = item.path_point_count
+        state.clear_measurement_path(item)
+        props.viz_status = "Cached path discarded"
+        self.report({'INFO'},
+                    "BSMT: discarded the cached path for '%s' (%d points)"
+                    % (item.label, points))
+        return {'FINISHED'}
+
+
+class BSMT_OT_path_timing_report(bpy.types.Operator):
+    """Print what the path pipeline has spent its time on.
+
+    Says whether slowness is the solver, a cache miss, Blender curve
+    construction or handler churn - the four are fixed differently
+    """
+
+    bl_idname = "bsmt.path_timing_report"
+    bl_label = "Print Timing Report"
+    bl_description = ("Print the recorded stage timings to the system"
+                      " console: solver, cache, helper and handler")
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        totals = timing.totals()
+        if not totals:
+            self.report({'INFO'}, "BSMT: nothing timed yet")
+            return {'CANCELLED'}
+        print("[BSMT TIMING] --- stage totals (last %d samples) ---"
+              % len(timing.samples()))
+        for label in sorted(totals, key=lambda key: -totals[key][1]):
+            count, total = totals[label]
+            print("[BSMT TIMING] %-18s %5d call(s) %10.2f ms total "
+                  "%8.2f ms each" % (label, count, total, total / count))
+        self.report({'INFO'}, "BSMT: timing report printed to the console")
         return {'FINISHED'}
 
 
@@ -3108,7 +3261,9 @@ class BSMT_OT_clear_all_visualizations(bpy.types.Operator):
         if collection:
             for item in collection:
                 item.show_visualization = False
-                state.clear_measurement_path(item, remove_helper=False)
+        # Cached paths are kept, as this operator's description says. The
+        # drawing is what is being cleared, not the tens of seconds of solve
+        # behind it.
         if props is not None:
             props.viz_status = ""
         self.report({'INFO'}, "BSMT: removed %d measurement helper(s)" % removed)
@@ -5117,6 +5272,9 @@ classes = (
     BSMT_OT_save_measurement_template,
     BSMT_OT_load_measurement_template,
     BSMT_OT_compute_surface_path,
+    BSMT_OT_toggle_surface_path,
+    BSMT_OT_clear_cached_path,
+    BSMT_OT_path_timing_report,
     BSMT_OT_refresh_visualization,
     BSMT_OT_clear_visualization,
     BSMT_OT_clear_all_visualizations,

@@ -349,13 +349,50 @@ def _is_helper_id(identifier):
         return False
 
 
+def _cached_names_for(identifier):
+    """Which cache entries a changed datablock invalidates.
+
+    An Object invalidates its own entry. A Mesh invalidates every cached
+    object that uses it - the same mesh can be shared, and a cache keyed by
+    object name would otherwise keep serving edited geometry.
+    """
+    if isinstance(identifier, bpy.types.Object):
+        return [identifier.name] if identifier.name in _CACHE else []
+    names = []
+    for name in list(_CACHE):
+        obj = bpy.data.objects.get(name)
+        if obj is not None and obj.data is identifier:
+            names.append(name)
+    return names
+
+
+def _mark_paths_stale(scene, object_name):
+    """Tell the measurements solved on this scan that their path is stale.
+
+    Property writes only - no geometry read, no canonical mesh, no solver.
+    Nothing is recomputed and nothing is deleted: a stale path is reported as
+    stale and re-solved only if the researcher asks for it (sect. 7, sect. 9).
+    """
+    try:
+        from .. import state
+        # Writes must land on the ORIGINAL scene, never on an evaluated copy.
+        original = getattr(scene, "original", None) or scene
+        return state.mark_paths_stale_for_object(
+            original, object_name, "the mesh geometry changed"
+        )
+    except Exception:                                # pragma: no cover
+        return 0
+
+
 @persistent
 def _on_depsgraph_update(scene, depsgraph=None):
     """Drop the cache when scan geometry changes. Transforms never invalidate.
 
     Updates originating from BSMT helper objects are ignored: moving a marker
     or retargeting the measurement curve must not throw away the canonical
-    mesh, or every gizmo drag would trigger a full rebuild.
+    mesh, or every gizmo drag would trigger a full rebuild. Helper flagged
+    datablocks include the per-measurement path caches, so writing one can
+    never invalidate the mesh it was solved on.
     """
     try:
         if depsgraph is None:
@@ -379,7 +416,17 @@ def _on_depsgraph_update(scene, depsgraph=None):
             # A real mesh edit always reports on the Object and its Mesh.
             if not isinstance(identifier, (bpy.types.Object, bpy.types.Mesh)):
                 continue
-            _CACHE.clear()
+            # Targeted rather than a sweep: editing one object must not cost
+            # a full canonical rebuild of every other scan in the file, which
+            # is seconds apiece at scan density.
+            names = _cached_names_for(identifier)
+            for name in names:
+                _CACHE.pop(name, None)
+                _mark_paths_stale(scene, name)
+            if not names:
+                # A changed datablock nothing has cached. Nothing to drop,
+                # and nothing to mark: no measurement was solved against it.
+                continue
             return
     except Exception:                                # pragma: no cover
         # A handler must never break the user's Blender session.

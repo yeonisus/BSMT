@@ -33,6 +33,9 @@ import time
 
 import numpy as np
 
+# Standard-library only, so this module stays importable outside Blender and
+# the whole measurement pipeline remains unit-testable without bpy.
+from .. import timing
 from . import registry
 from .surface_point import (
     InsertionError,
@@ -468,11 +471,25 @@ def surface_path(vertices_solver, triangles, point_a, point_b,
         return result
 
     # --- the expensive unbounded query ------------------------------------
+    #
+    # Construction and query are timed apart on purpose. "The path is slow"
+    # has to be attributable: building the MMP structure over a 1M-triangle
+    # scratch mesh and propagating across it are different costs with
+    # different fixes, and a single total hides which one is biting.
     started = time.perf_counter()
     try:
-        distance_mm, polyline = registry.exact_mmp.compute_distance_and_path(
-            insertion.vertices, insertion.triangles, source_index, target_index
-        )
+        with timing.stage(
+            timing.SOLVER_BUILD,
+            "%d triangles" % int(insertion.triangles.shape[0]),
+        ):
+            solver = registry.exact_mmp.ExactSolver(
+                insertion.vertices, insertion.triangles
+            )
+        with timing.stage(timing.PATH_SOLVE) as measured:
+            distance_mm, polyline = solver.distance_and_path(
+                source_index, target_index
+            )
+            measured.note("%d points" % int(np.asarray(polyline).shape[0]))
     except registry.exact_mmp.BackendUnavailable as exc:
         raise MeasurementError('BACKEND_MISSING',
                                failure_message('BACKEND_MISSING', str(exc)))
@@ -484,7 +501,12 @@ def surface_path(vertices_solver, triangles, point_a, point_b,
         )
     result.solver_seconds = time.perf_counter() - started
 
-    polyline = np.ascontiguousarray(np.asarray(polyline, dtype=np.float64))
+    # Copied into a float64 array this module owns BEFORE the solver handle
+    # goes out of scope and its native memory is released. Nothing downstream
+    # ever holds a view into pygeodesic's own buffers.
+    with timing.stage(timing.RESULT_COPY):
+        polyline = np.ascontiguousarray(np.asarray(polyline, dtype=np.float64))
+    solver = None
     if polyline.ndim != 2 or polyline.shape[1] != 3 or polyline.shape[0] < 2:
         raise MeasurementError(
             'BACKEND_ERROR',

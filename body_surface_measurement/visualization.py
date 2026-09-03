@@ -461,10 +461,68 @@ def thickness_radius(props, thickness_mm):
                MIN_HELPER_RADIUS)
 
 
+# Every write below is guarded by a comparison, and that is not
+# micro-optimisation. Assigning to bevel_depth, matrix_world or a colour tags
+# the datablock for re-evaluation whether or not the value changed, and
+# re-evaluating a beveled poly curve costs time proportional to its point
+# count - 8 ms for a 20,000-point path, measured on Blender 4.5.13. The
+# colour picker fires its update callback on every mouse move, so an
+# unguarded write there is one full curve rebuild per pixel of drag.
+
+#: Below this a float is the same float. Curve and object properties are
+#: single precision, so anything tighter compares noise.
+_WRITE_EPSILON = 1e-9
+
+
+def _set_float(owner, attribute, value):
+    """Write a float property only when it differs. True when written."""
+    if abs(float(getattr(owner, attribute)) - float(value)) <= _WRITE_EPSILON:
+        return False
+    setattr(owner, attribute, float(value))
+    return True
+
+
+def _set_color(owner, attribute, color):
+    """Write an RGBA property only when it differs. True when written."""
+    current = getattr(owner, attribute)
+    wanted = tuple(float(value) for value in color)
+    if len(current) == len(wanted) and all(
+        abs(float(a) - b) <= _WRITE_EPSILON for a, b in zip(current, wanted)
+    ):
+        return False
+    setattr(owner, attribute, wanted)
+    return True
+
+
+def _set_flag(owner, attribute, value):
+    """Write a boolean property only when it differs. True when written."""
+    if bool(getattr(owner, attribute)) == bool(value):
+        return False
+    setattr(owner, attribute, bool(value))
+    return True
+
+
+def _set_matrix(obj, matrix_world):
+    """Write matrix_world only when it differs. True when written."""
+    current = obj.matrix_world
+    for row in range(4):
+        for column in range(4):
+            if abs(float(current[row][column])
+                   - float(matrix_world[row][column])) > _WRITE_EPSILON:
+                obj.matrix_world = matrix_world
+                return True
+    return False
+
+
 def update_measurement_curve(context, props, stable_id, kind, points_local,
                              matrix_world, color, thickness_mm,
                              show_in_front):
-    """Create or refresh one measurement helper curve. Returns the object."""
+    """Create or refresh one measurement helper curve. Returns the object.
+
+    The object and its curve datablock are REUSED whenever they already
+    exist. Deleting and recreating them would be visible on a long path and
+    would churn the depsgraph for no reason (sect. 6).
+    """
     name = measurement_object_name(stable_id, kind)
     obj = _existing_helper(name)
     if obj is None or not isinstance(obj.data, bpy.types.Curve):
@@ -476,42 +534,79 @@ def update_measurement_curve(context, props, stable_id, kind, points_local,
             get_material("BSMT_Material_Measurement_" + kind.title(), color)
         )
     _set_curve_points(obj.data, points_local)
-    obj.data.bevel_depth = thickness_radius(props, thickness_mm)
-    obj.color = color
+    _set_float(obj.data, "bevel_depth", thickness_radius(props, thickness_mm))
+    _set_color(obj, "color", color)
     material = obj.data.materials[0] if obj.data.materials else None
     if material is not None:
-        material.diffuse_color = color
-    obj.matrix_world = matrix_world
-    obj.show_in_front = bool(show_in_front)
+        _set_color(material, "diffuse_color", color)
+    _set_matrix(obj, matrix_world)
+    _set_flag(obj, "show_in_front", bool(show_in_front))
     return obj
 
 
 def sync_measurement_transform(stable_id, kind, matrix_world):
-    """Point a helper at the scan's current transform. One matrix copy."""
+    """Point a helper at the scan's current transform. One matrix copy.
+
+    Returns True only when the matrix actually MOVED. The transform handler
+    runs this for every measurement on every depsgraph tick, so writing an
+    unchanged matrix would re-tag every helper curve continuously.
+    """
     obj = _existing_helper(measurement_object_name(stable_id, kind))
     if obj is None:
         return False
-    obj.matrix_world = matrix_world
-    return True
+    return _set_matrix(obj, matrix_world)
 
 
 def set_measurement_helper_visible(stable_id, kind, visible):
     """Show or hide a helper WITHOUT destroying it.
 
-    Load-bearing: the path helper's curve is where the computed polyline
-    lives, so removing it to hide it would throw away a solve that costs tens
-    of seconds. Switching display mode must never do that (sect. 6).
+    Load-bearing twice over. The helper is expensive to rebuild on a long
+    path, and until 0.20.0 its curve was also the only copy of the computed
+    polyline - so removing it to hide it threw away a solve costing tens of
+    seconds. The polyline now lives in pathcache.py, but hiding is still the
+    right answer: showing it again must cost nothing (sect. 6).
     """
     obj = _existing_helper(measurement_object_name(stable_id, kind))
     if obj is None:
         return False
-    obj.hide_viewport = not visible
-    obj.hide_render = not visible
+    _set_flag(obj, "hide_viewport", not visible)
+    _set_flag(obj, "hide_render", not visible)
     return True
+
+
+def measurement_helper(stable_id, kind):
+    """The helper object for one measurement, or None."""
+    return _existing_helper(measurement_object_name(stable_id, kind))
+
+
+def restyle_measurement_curve(props, obj, color, thickness_mm, matrix_world):
+    """Push colour, thickness and transform onto an existing helper.
+
+    Never touches a curve point, so it is what a redisplay uses when the
+    geometry on screen is already correct. Every write is guarded, so
+    restyling to the values a helper already has costs nothing at all.
+    """
+    if obj is None:
+        return False
+    changed = 0
+    if isinstance(obj.data, bpy.types.Curve):
+        changed += _set_float(obj.data, "bevel_depth",
+                              thickness_radius(props, thickness_mm))
+        if obj.data.materials:
+            changed += _set_color(obj.data.materials[0], "diffuse_color", color)
+    changed += _set_color(obj, "color", color)
+    changed += _set_matrix(obj, matrix_world)
+    return bool(changed)
 
 
 def measurement_helper_exists(stable_id, kind):
     return _existing_helper(measurement_object_name(stable_id, kind)) is not None
+
+
+def measurement_helper_visible(stable_id, kind):
+    """Whether a helper exists AND is currently shown in the viewport."""
+    obj = _existing_helper(measurement_object_name(stable_id, kind))
+    return obj is not None and not obj.hide_viewport
 
 
 def remove_measurement_helper(stable_id, kind):
@@ -542,15 +637,22 @@ def apply_measurement_display(context, props):
     """
     straight_radius = thickness_radius(props, props.viz_straight_thickness_mm)
     path_radius = thickness_radius(props, props.viz_path_thickness_mm)
+    changed = 0
     for obj in measurement_helper_objects():
         is_path = obj.name.endswith(PATH_SUFFIX)
         color = (tuple(props.viz_path_color) if is_path
                  else tuple(props.viz_straight_color))
         if isinstance(obj.data, bpy.types.Curve):
-            obj.data.bevel_depth = path_radius if is_path else straight_radius
+            # Guarded: the colour picker calls this on every mouse move, and
+            # an unguarded bevel_depth write rebuilds the whole beveled curve
+            # each time even when the thickness has not moved at all.
+            changed += _set_float(obj.data, "bevel_depth",
+                                  path_radius if is_path else straight_radius)
             if obj.data.materials:
-                obj.data.materials[0].diffuse_color = color
-        obj.color = color
+                changed += _set_color(obj.data.materials[0], "diffuse_color",
+                                      color)
+        changed += _set_color(obj, "color", color)
+    return changed
 
 
 # ---------------------------------------------------------------------------
