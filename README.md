@@ -100,6 +100,16 @@ preprocessing report says so and asks you to re-pick them on the copy.
 `NOT READY: <reason>` — which is the fastest way to find out what is missing.
 It appears once, at the top, and is not repeated per panel.
 
+Every mesh status in BSMT — the readiness line, the `Topology:` line in Scan
+Setup, and the verdict in the preprocessing report — comes from one function,
+`preprocess.classify_ready`. A mesh is `NOT READY` if its canonical form
+cannot be built, it has no triangles, it has non-manifold edges, it has
+degenerate (zero-area) triangles, or preprocessing lost its appearance data;
+`WARNING` for several components, boundary edges, or a triangle count still
+above the density threshold. **Exact-coincident and near-coincident vertices
+are diagnostic only** — they are reported, but they do not by themselves
+change the verdict or refuse a solve.
+
 Two panels sit under Scan Setup rather than in the workflow itself:
 **Quick Measure (A to B)**, a Phase 1 spot check between two picked points
 that stores nothing in the landmark or measurement lists, and **Geodesic

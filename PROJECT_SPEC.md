@@ -3797,8 +3797,110 @@ clean Blender config and lays the seven stages out in workflow order.
 
 ---
 
+## 11u. Milestone 3.17 — One readiness verdict (v0.22.1, 2026-09-03)
+
+A defect report, and the reason it is worth a section: the tool disagreed with itself in public.
+
+A real measurement mesh — 351,220 triangles, 1 connected component, 0 boundary edges, 0
+non-manifold edges, degenerate triangles present, 14 exact coincident vertices — was displayed in
+Scan Setup as `Topology: Ready` while Topology Diagnostics listed the defects on the same mesh.
+
+### 11u.1 Root cause: three verdicts where there should have been one
+
+Reproduced before anything was changed. A UV sphere with 14 vertices collapsed onto one another
+gives exactly the reported shape — 1 component, 0 boundary, 0 non-manifold, 16 degenerate, 14
+duplicate vertices — and produced:
+
+| Source | Rule it applied | Verdict |
+|---|---|---|
+| `panels._draw_measurement_target` | `"Ready" if non_manifold == 0` | **Ready** |
+| `readiness.evaluate` | `if non_manifold > 0` | **READY** |
+| `preprocess.preflight` (solver gate) | degenerate → *warning* | allowed |
+| `preprocess.classify_ready` (policy, 3.15) | degenerate → **blocking** | **NOT_READY** |
+
+Two UI surfaces carried their **own** readiness rule. Both tested non-manifold edges and nothing
+else, so both were blind to degenerate triangles, and neither consulted the policy the rest of
+BSMT applies. The Milestone 3.16 reorganisation did not introduce this — the rule predates it —
+but it made the wrong label more prominent by moving that block to the top of the sidebar.
+
+The lesson is the one the milestone brief had already stated as a requirement and the code had
+quietly broken: **a duplicated rule is a rule that will diverge.**
+
+### 11u.2 The single authoritative source
+
+`state.mesh_verdict(context, props, obj)` is now the only route any surface has to a mesh verdict.
+It does not decide anything: it locates the current topology report and hands it to
+`preprocess.classify_ready`, which remains the one place the policy lives.
+
+    Scan Setup topology line  ─┐
+    readiness headline        ─┼─→ state.mesh_verdict ─→ preprocess.classify_ready
+    workflow stage hints      ─┘                              (the policy)
+
+Both private rules are deleted. `readiness.evaluate` no longer takes `non_manifold`; it takes
+`mesh_reasons`, the blocking-reason list from `classify_ready`, and reports them verbatim. The
+reason code `REASON_NON_MANIFOLD` is renamed `REASON_MESH_NOT_READY`, because it now covers every
+way the mesh itself can block; its pointer is still *Mesh Repair*.
+
+Tests assert this on the **function bodies**, not on whole files — the first version of those
+checks was satisfied by a docstring explaining the very rule it was asserting had been removed, so
+the helper strips comments and docstrings before matching.
+
+### 11u.3 Policy: unchanged, and stated
+
+Requirement 1 was to fix the surfaces, not the policy, and nothing in `classify_ready` or
+`preflight` was touched. Non-manifold topology blocks exactly as it did. What changed is that two
+surfaces which were **failing to apply** the policy now apply it.
+
+**Coincident vertices are diagnostic only.** Exact-coincident and near-coincident vertex counts
+are computed and displayed — in Topology Diagnostics and in the before/after table — and are read
+by **neither** `classify_ready` **nor** `preflight`. They change no verdict and refuse no solve.
+The 14 coincident vertices in the report therefore had no effect on readiness by themselves; the
+degenerate triangles they produced are what should have blocked it. A test pins this so the answer
+is a check rather than a recollection.
+
+**A divergence deliberately left in place.** Degenerate triangles are *blocking* for
+`classify_ready` but only a *warning* for `preflight`, so the exact solver will still run on a mesh
+the verdict calls NOT READY. Both are the existing policy; reconciling them is a policy decision
+and was out of scope here. It is recorded in sect. 12 as an open item.
+
+### 11u.4 Staleness
+
+`meshcache.peek()` answers "is there a cached report", which is not the same question as "may I
+show it". `peek_current(obj)` / `is_current(obj)` add the second: the cached entry is returned only
+while its cheap fingerprint — object name, mesh name, vertex count, polygon count, modifier count —
+still matches the live object. O(1), no geometry read, safe from a draw.
+
+Two things were checked rather than assumed:
+
+- **A cache does not survive a file load.** Opening a different .blend containing an object of the
+  same name returns `None` from `peek`, so there was no bug to fix there.
+- **A vertex move changes no count**, so the fingerprint alone cannot see it. That case is covered
+  by the depsgraph handler, which drops the entry on any geometry update — verified: moving
+  vertices and letting the depsgraph run leaves `peek()` returning `None`, the verdict reports NOT
+  ANALYSED rather than the old READY, and re-analysing then reports NOT READY. The fingerprint is
+  the cheap backstop for count-changing edits, not a substitute for that handler, and the docstring
+  says so.
+
+### 11u.5 What is verified
+
+`tests/test_readiness.py` 149 → 183 offline checks: the reported case as a rule (manifold, closed,
+degenerate > 0 → NOT READY on every surface), non-manifold still blocking, coincident vertices
+affecting nothing, and that no surface has regrown a private rule.
+
+`tests/test_workflow_ui.py` 69 → 89 checks under Blender: the defect reproduced against a real mesh
+and asserted absent, the clean mesh still reading READY, and the staleness sequence end to end.
+
+Regression: 2,412 offline checks across nineteen suites, plus 89 workflow-UI, 110 preprocessing and
+90 path-visualisation checks in Blender. 0 failures.
+
+---
+
 ## 12. Open items requiring decisions
 
+1. **Degenerate triangles block the readiness verdict but only warn the solver gate.**
+   `preprocess.classify_ready` treats them as blocking (NOT READY) while `preprocess.preflight`
+   treats them as a warning, so an exact solve can run on a mesh the verdict refuses. Both are
+   deliberate as written; reconciling them is a policy decision for the project owner.
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~
    **Resolved 2026-09-02 (§5.1a): Python 3.11.15, Darwin arm64, numpy 1.26.4.**
 2. Whether landmark pairs may wrap a limb or torso; affects interpretation, not the algorithm.

@@ -22,7 +22,7 @@ UNKNOWN = 'UNKNOWN'
 #: shown in the compact line; the rest are available for the expanded view.
 REASON_NO_MESH = 'NO_MESH'
 REASON_NOT_ANALYSED = 'NOT_ANALYSED'
-REASON_NON_MANIFOLD = 'NON_MANIFOLD'
+REASON_MESH_NOT_READY = 'MESH_NOT_READY'
 REASON_DENSE = 'DENSE'
 REASON_NON_UNIFORM_SCALE = 'NON_UNIFORM_SCALE'
 REASON_NO_LANDMARKS = 'NO_LANDMARKS'
@@ -35,7 +35,7 @@ REASON_NO_MEASUREMENTS = 'NO_MEASUREMENTS'
 PANEL_FOR_REASON = {
     REASON_NO_MESH: "Scan Setup",
     REASON_NOT_ANALYSED: "Scan Setup",
-    REASON_NON_MANIFOLD: "Mesh Repair",
+    REASON_MESH_NOT_READY: "Mesh Repair",
     REASON_DENSE: "Scan Preprocessing",
     REASON_NON_UNIFORM_SCALE: "Alignment",
     REASON_NO_LANDMARKS: "Landmark Manager",
@@ -153,14 +153,22 @@ def _plural(count, word):
     return "%d %s%s" % (count, word, "" if count == 1 else "s")
 
 
-def evaluate(mesh_name="", triangle_count=0, non_manifold=0, analysed=True,
+def evaluate(mesh_name="", triangle_count=0, mesh_reasons=(), analysed=True,
              dense_threshold=0, guard_dense=True, scale_uniform=True,
              landmark_total=0, landmarks_unpicked=0, landmarks_stale=0,
              measurements_defined=0):
     """The readiness of the current measurement target.
 
-    Every argument is a number or a flag already held by the add-on, so this
-    function reads no geometry and can be called from a panel draw.
+    Every argument is a number, a flag or a list of strings already held by
+    the add-on, so this function reads no geometry and can be called from a
+    panel draw.
+
+    `mesh_reasons` is the blocking-reason list from
+    ``preprocess.classify_ready`` - the ONE place that decides whether a mesh
+    is fit to measure on. This module does not re-derive that verdict and
+    must never start to: it used to test ``non_manifold > 0`` itself, which
+    silently disagreed with the policy the rest of BSMT applies and reported
+    READY on a mesh carrying degenerate triangles.
 
     Returns a dict with `state`, `headline`, `reasons` (each a dict with
     `code`, `text` and `panel`), `blocked` and `icon`.
@@ -183,10 +191,11 @@ def evaluate(mesh_name="", triangle_count=0, non_manifold=0, analysed=True,
         # inventing one.
         add(REASON_NOT_ANALYSED, "topology not analyzed yet", False)
 
-    if non_manifold > 0:
-        add(REASON_NON_MANIFOLD,
-            "%s - the exact solver is refused"
-            % _plural(non_manifold, "non-manifold edge"), True)
+    # The mesh verdict, as decided elsewhere. Passed through verbatim so the
+    # readiness line, the Scan Setup topology line and the preprocessing
+    # report can never disagree about the same mesh.
+    for text in mesh_reasons:
+        add(REASON_MESH_NOT_READY, str(text), True)
 
     if (guard_dense and dense_threshold and triangle_count
             and triangle_count > dense_threshold):

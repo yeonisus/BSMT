@@ -324,6 +324,102 @@ def main():
           "def _draw_hint" in panels_text
           and "row.label(text=text, icon='INFO')" in panels_text)
 
+    # ------------------------------------------- the 0.22.0 status defect --
+    print("\nH. a degenerate-only mesh must never read as Ready")
+    # The reported case: manifold, closed, one component, no non-manifold
+    # edges - and degenerate triangles from vertices collapsed onto each
+    # other. Scan Setup said "Topology: Ready" and the headline said READY,
+    # because both carried their own rule that tested non-manifold only.
+    wipe()
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32)
+    bad = context.object
+    bad.name = "DegenerateScan"
+    context.view_layer.objects.active = bad
+    for index in range(1, 15):
+        bad.data.vertices[index].co = bad.data.vertices[0].co
+    bad.data.update()
+
+    canonical = state.geodesic.meshcache.get(context, bad, props.unit,
+                                             rebuild=True)
+    report = canonical.topology
+    check("the fixture reproduces the report: 1 component",
+          report["component_count"] == 1, report["component_count"])
+    check("  0 boundary edges", report["boundary_edge_count"] == 0,
+          report["boundary_edge_count"])
+    check("  0 non-manifold edges", report["nonmanifold_edge_count"] == 0,
+          report["nonmanifold_edge_count"])
+    check("  degenerate triangles present",
+          report["degenerate_triangle_count"] > 0,
+          report["degenerate_triangle_count"])
+    check("  and exact coincident vertices",
+          report["duplicate_vertex_count"] > 0,
+          report["duplicate_vertex_count"])
+
+    verdict = state.mesh_verdict(context, props, bad)
+    check("the one authoritative verdict says NOT READY",
+          verdict["state"] == preprocess.MEASUREMENT_NOT_READY,
+          verdict["state"])
+
+    setup = texts(draw_panel(panels.BSMT_PT_scan_setup, context))
+    check("Scan Setup does NOT say 'Topology: Ready'",
+          not any(t.strip() == "Topology:         Ready" for t in setup),
+          setup)
+    check("it says NOT READY",
+          any("Topology:" in t and "NOT READY" in t for t in setup), setup)
+    check("and names the degenerate triangles",
+          any("degenerate" in t for t in setup), setup)
+    check("the readiness headline agrees",
+          any(t.startswith("NOT READY") and "degenerate" in t for t in setup),
+          setup)
+    check("no line in Scan Setup claims READY",
+          not any(t.startswith("READY") for t in setup), setup)
+
+    pre = texts(draw_panel(panels.BSMT_PT_preprocessing, context))
+    check("Scan Preprocessing shows the same non-zero degenerate count",
+          any("Degenerate tris:" in t and "0" != t.split()[-1] for t in pre),
+          pre)
+
+    print("\n   the same mesh, repaired, reads Ready again")
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32)
+    good = context.object
+    good.name = "CleanScan"
+    context.view_layer.objects.active = good
+    state.geodesic.meshcache.get(context, good, props.unit, rebuild=True)
+    verdict = state.mesh_verdict(context, props, good)
+    check("a clean mesh is READY", verdict["state"]
+          == preprocess.MEASUREMENT_READY, verdict)
+    setup = texts(draw_panel(panels.BSMT_PT_scan_setup, context))
+    check("and Scan Setup says so",
+          any("Topology:" in t and "MEASUREMENT READY" in t for t in setup),
+          setup)
+
+    # ------------------------------------------------------ staleness -----
+    print("\nI. a stale diagnostic never leaves an old status behind")
+    context.view_layer.objects.active = good
+    check("the cached report is current to start with",
+          state.geodesic.meshcache.is_current(good))
+    for index in range(1, 15):
+        good.data.vertices[index].co = good.data.vertices[0].co
+    good.data.update()
+    context.view_layer.update()
+    check("a geometry edit drops the cached report",
+          state.geodesic.meshcache.peek(good.name) is None)
+    verdict = state.mesh_verdict(context, props, good)
+    check("so the verdict reports NOT ANALYSED, not the old READY",
+          verdict["state"] == state.MESH_NOT_ANALYSED and not verdict["analysed"],
+          verdict["state"])
+    setup = texts(draw_panel(panels.BSMT_PT_scan_setup, context))
+    check("and Scan Setup says 'not analyzed yet' rather than Ready",
+          any("not analyzed yet" in t for t in setup), setup)
+    check("no stale Ready survives the edit",
+          not any("Ready" in t and "Topology" in t for t in setup), setup)
+
+    print("\n   re-analysing tells the truth about the new geometry")
+    state.geodesic.meshcache.get(context, good, props.unit, rebuild=True)
+    verdict = state.mesh_verdict(context, props, good)
+    check("the re-analysed mesh is NOT READY",
+          verdict["state"] == preprocess.MEASUREMENT_NOT_READY, verdict)
+
     print("\n%d checks, %d failure(s)" % (CHECKS[0], len(FAILURES)))
     for label in FAILURES:
         print("  FAILED: %s" % label)

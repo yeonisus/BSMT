@@ -211,6 +211,43 @@ def peek(object_name):
     return _CACHE.get(object_name)
 
 
+def is_current(obj):
+    """Whether the cached mesh for `obj` still matches its cheap fingerprint.
+
+    O(1): it compares object name, mesh name, vertex count, polygon count and
+    modifier count - the same fingerprint `get()` uses to decide whether to
+    rebuild. No geometry is read, so this is safe from a panel draw.
+
+    What it CANNOT see is a pure vertex move, which changes no count. That
+    case is covered by the depsgraph handler below, which drops the entry on
+    any geometry update - verified: moving vertices and letting the depsgraph
+    run leaves peek() returning None. This is the cheap backstop for the
+    count-changing edits, not a substitute for that handler.
+    """
+    if obj is None:
+        return False
+    cached = _CACHE.get(obj.name)
+    if cached is None:
+        return False
+    try:
+        return cached.fingerprint == _fingerprint(obj)
+    except Exception:                                # pragma: no cover
+        return False
+
+
+def peek_current(obj):
+    """The cached mesh for `obj`, but only while it still describes it.
+
+    The one lookup the UI should use. `peek()` answers "is there a cached
+    report", which is not the same question as "may I show it": a report that
+    no longer describes the object is worse than none, because it renders as
+    a confident status line about geometry that has moved on.
+    """
+    if obj is None:
+        return None
+    return _CACHE.get(obj.name) if is_current(obj) else None
+
+
 def invalidate(object_name=None):
     if object_name is None:
         _CACHE.clear()

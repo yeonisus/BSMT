@@ -4,6 +4,63 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.22.1 — one readiness verdict, not three
+
+Fixes a reported contradiction: a real measurement mesh with 351,220
+triangles, 1 connected component, 0 boundary edges and 0 non-manifold edges,
+but with degenerate triangles and 14 exact coincident vertices, was shown as
+`Topology: Ready` in Scan Setup while Topology Diagnostics reported the
+defects.
+
+**Root cause: two UI surfaces carried their own private readiness rule, and
+both tested non-manifold edges only.**
+
+- `panels._draw_measurement_target` labelled the mesh `"Ready" if
+  non_manifold == 0`, ignoring degenerate triangles entirely.
+- `readiness.evaluate` did the same in its own way — a bare `non_manifold > 0`
+  test — so the headline said `READY` on the same mesh.
+
+Neither consulted `preprocess.classify_ready`, the authoritative policy added
+in 0.21.0, which blocks on degenerate triangles. Reproduced before fixing: a
+sphere with 14 vertices collapsed onto one another reports 1 component, 0
+boundary, 0 non-manifold, 16 degenerate, 14 duplicate vertices — and the panel
+said `Topology: Ready` while `classify_ready` said `NOT_READY`.
+
+- **One authoritative source.** `state.mesh_verdict()` is now the only way any
+  surface reaches a mesh verdict. It locates the current topology report and
+  hands it to `preprocess.classify_ready`; it decides nothing itself. Both
+  private rules are deleted, and tests assert on the *function bodies* that
+  neither has grown back.
+- **The policy is unchanged.** `classify_ready`'s rules are untouched, and so
+  is `preprocess.preflight`, the solver gate. Non-manifold topology still
+  blocks exactly as before; what changed is that two surfaces that were
+  failing to apply the policy now apply it.
+- **Stale diagnostics cannot leave an old status.** New
+  `meshcache.peek_current(obj)` / `is_current(obj)` return a cached report
+  only while its cheap fingerprint still matches the live object; the status
+  paths use it, so a report that no longer describes the object reads as "not
+  analyzed yet" instead of rendering as a confident label. Verified: after a
+  geometry edit the depsgraph handler drops the entry, the verdict reports
+  NOT ANALYSED, and re-analysing then reports NOT READY.
+- `readiness.REASON_NON_MANIFOLD` is renamed `REASON_MESH_NOT_READY` — the
+  code now covers every way the mesh itself can block, because the text it
+  carries is `classify_ready`'s. Its pointer is still *Mesh Repair*.
+
+**Coincident vertices — current policy, reported not changed (as asked).**
+Exact-coincident and near-coincident vertex counts are **diagnostic only**.
+They are counted and displayed in Topology Diagnostics and in the
+before/after table, and they are read by **neither** `classify_ready` **nor**
+`preflight` — so they change no verdict and refuse no solve. The 14 exact
+coincident vertices in the report therefore had no effect on readiness by
+themselves; it was the degenerate triangles they produced that should have
+blocked it. A test now pins this, so changing it later has to be deliberate.
+
+**A divergence worth knowing about, deliberately left alone.** Degenerate
+triangles are *blocking* for `classify_ready` (NOT READY) but only a
+*warning* for `preflight`, so the exact solver will still run on a mesh the
+verdict calls NOT READY. That is the existing policy in both places and
+changing either would be a policy change, which this task excluded.
+
 ## 0.22.0 — workflow-ordered sidebar
 
 UI and workflow organisation only. No measurement, preprocessing, solver or

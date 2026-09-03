@@ -2414,6 +2414,72 @@ def measurement_target(context, props=None):
     return None, "no mesh selected"
 
 
+#: What `mesh_verdict` reports when nothing has been analysed yet. Distinct
+#: from every classify_ready state on purpose: "not analysed" is not an
+#: answer about the mesh, and rendering it as one is how a stale or absent
+#: diagnostic turns into a confident status line.
+MESH_NOT_ANALYSED = 'NOT_ANALYSED'
+
+
+def mesh_verdict(context, props=None, obj=None):
+    """THE readiness answer for the measurement target's mesh.
+
+    One source, used by every surface that shows a mesh status: the Scan
+    Setup topology line, the readiness headline, and the preprocessing
+    report. It does not decide anything itself - it locates the current
+    topology report and hands it to `preprocess.classify_ready`, which is
+    where the policy lives and the only place it lives.
+
+    This exists because two panels used to carry their OWN rule - "Ready if
+    non-manifold == 0" - which ignored degenerate triangles and therefore
+    reported Ready on a mesh that classify_ready calls NOT READY.
+
+    Panel-draw safe: `peek_current` never builds a canonical mesh, and a
+    report that no longer describes the live object is treated as absent
+    rather than shown.
+
+    Returns a dict with `analysed`, `state`, `reasons`, `report` and `object`.
+    """
+    if props is None:
+        props = get_props(context)
+    if obj is None and props is not None:
+        obj, _reason = measurement_target(context, props)
+
+    blank = {
+        "analysed": False,
+        "state": MESH_NOT_ANALYSED,
+        "reasons": [],
+        "report": {},
+        "object": obj.name if obj is not None else "",
+    }
+    if obj is None or not geodesic.MESHCACHE_AVAILABLE:
+        return blank
+
+    canonical = geodesic.meshcache.peek_current(obj)
+    if canonical is None:
+        return blank
+
+    report = dict(canonical.topology or {})
+    verdict, reasons = preprocess.classify_ready(
+        report,
+        canonical_built=True,
+        # Appearance is a preprocessing concern and is judged there, against
+        # the facts recorded at copy time. Nothing about it can be
+        # rediscovered from a topology report, so it is not guessed at here.
+        appearance_ok=True,
+        dense_threshold=(props.dense_threshold_triangles
+                         if props is not None else
+                         preprocess.DEFAULT_DENSE_THRESHOLD),
+    )
+    return {
+        "analysed": True,
+        "state": verdict,
+        "reasons": list(reasons),
+        "report": report,
+        "object": obj.name,
+    }
+
+
 def workflow_facts(context, props=None):
     """The handful of numbers the per-stage guidance needs (sect. 10).
 
@@ -2433,15 +2499,13 @@ def workflow_facts(context, props=None):
         }
 
     obj, _reason = measurement_target(context, props)
-    analysed = False
-    non_manifold = 0
-    if obj is not None and geodesic.MESHCACHE_AVAILABLE:
-        cached = geodesic.meshcache.peek(obj.name)
-        if cached is not None:
-            analysed = True
-            non_manifold = int(
-                (cached.topology or {}).get("nonmanifold_edge_count", 0) or 0
-            )
+    # Same accessor as everything else, so "analysed" means the same thing
+    # here as it does in the Scan Setup topology line.
+    verdict = mesh_verdict(context, props, obj)
+    analysed = verdict["analysed"]
+    non_manifold = int(
+        verdict["report"].get("nonmanifold_edge_count", 0) or 0
+    )
 
     landmark_collection = get_landmarks(context) or ()
     picked = sum(1 for item in landmark_collection
@@ -2484,16 +2548,14 @@ def readiness_snapshot(context, props=None):
         return readiness.evaluate()
 
     obj, _reason = measurement_target(context, props)
-    triangle_count = 0
-    non_manifold = 0
-    analysed = False
-    if obj is not None and geodesic.MESHCACHE_AVAILABLE:
-        cached = geodesic.meshcache.peek(obj.name)
-        if cached is not None:
-            report = cached.topology or {}
-            triangle_count = int(report.get("triangle_count", 0) or 0)
-            non_manifold = int(report.get("nonmanifold_edge_count", 0) or 0)
-            analysed = True
+    # The mesh half of the answer comes from the ONE authoritative verdict,
+    # never from a rule re-derived here.
+    verdict = mesh_verdict(context, props, obj)
+    analysed = verdict["analysed"]
+    triangle_count = int(verdict["report"].get("triangle_count", 0) or 0)
+    mesh_reasons = (verdict["reasons"]
+                    if verdict["state"] == preprocess.MEASUREMENT_NOT_READY
+                    else [])
 
     scale_uniform = True
     if obj is not None:
@@ -2511,7 +2573,7 @@ def readiness_snapshot(context, props=None):
     return readiness.evaluate(
         mesh_name=obj.name if obj is not None else "",
         triangle_count=triangle_count,
-        non_manifold=non_manifold,
+        mesh_reasons=mesh_reasons,
         analysed=analysed,
         dense_threshold=props.dense_threshold_triangles,
         guard_dense=props.guard_dense_solve,

@@ -116,7 +116,10 @@ def diagnostics(obj):
     from . import geodesic
     if not geodesic.MESHCACHE_AVAILABLE or geodesic.meshcache is None:
         return None
-    canonical = geodesic.meshcache.peek(obj.name)
+    # peek_current, not peek: a cached report that no longer describes this
+    # object must read as "not analysed" rather than render as a confident
+    # topology line about geometry that has moved on.
+    canonical = geodesic.meshcache.peek_current(obj)
     if canonical is None:
         return None
     report = dict(canonical.topology or {})

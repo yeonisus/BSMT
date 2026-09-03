@@ -397,22 +397,29 @@ def _draw_measurement_target(context, layout, props):
     if is_copy and provenance.source_name:
         column.label(text="Source Mesh:      %s" % provenance.source_name)
 
-    cached = (geodesic.meshcache.peek(obj.name)
-              if geodesic.MESHCACHE_AVAILABLE else None)
-    if cached is None:
+    # The verdict is read, never re-derived. This block used to carry its own
+    # rule - "Ready if non-manifold == 0" - which ignored degenerate
+    # triangles and so labelled a mesh Ready that the rest of BSMT calls NOT
+    # READY. There is one policy, in preprocess.classify_ready, and
+    # state.mesh_verdict is the only way this panel reaches it.
+    verdict = state.mesh_verdict(context, props, obj)
+    if not verdict["analysed"]:
         column.label(text="Topology:         not analyzed yet")
         return
-    report = cached.topology or {}
+    report = verdict["report"]
     column.label(text="Triangles:        {:,}".format(
         int(report.get("triangle_count", 0) or 0)))
-    non_manifold = int(report.get("nonmanifold_edge_count", 0) or 0)
+
+    label = preprocess.READY_LABELS.get(verdict["state"], verdict["state"])
     status = column.row()
-    status.alert = non_manifold > 0
-    status.label(
-        text="Topology:         %s"
-             % ("Ready" if non_manifold == 0
-                else "%d non-manifold edge(s)" % non_manifold)
-    )
+    status.alert = verdict["state"] != preprocess.MEASUREMENT_READY
+    status.label(text="Topology:         %s" % label)
+    # Naming the first blocker here is what makes the status actionable; the
+    # full list stays in the Scan Preprocessing report.
+    for reason in verdict["reasons"][:2]:
+        line = column.row()
+        line.alert = verdict["state"] == preprocess.MEASUREMENT_NOT_READY
+        line.label(text="   %s" % reason)
 
 
 def _wrap(text, width):

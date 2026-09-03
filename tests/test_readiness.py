@@ -28,6 +28,55 @@ def check(label, condition, detail=""):
         print("  FAIL  %s %s" % (label, detail))
 
 
+def strip_comments(source):
+    """Source with comment lines and docstring prose removed.
+
+    Assertions about what the code DOES must not be satisfied or broken by
+    what a comment SAYS - three of these checks first fired on their own
+    explanatory prose.
+    """
+    out = []
+    in_docstring = False
+    for line in source.splitlines():
+        stripped = line.strip()
+        # Docstrings are prose too: the first version of these checks was
+        # satisfied by a docstring explaining the very rule it asserted had
+        # been removed.
+        fences = stripped.count('"""') + stripped.count("'''")
+        if in_docstring:
+            if fences:
+                in_docstring = False
+            continue
+        if fences == 1:
+            in_docstring = True
+            continue
+        if fences >= 2 or stripped.startswith("#"):
+            continue
+        out.append(line.split("  #")[0])
+    return "\n".join(out)
+
+
+def function_source(filename, name):
+    """The body of one top-level or method definition, comments stripped."""
+    lines = open(os.path.join(PACKAGE, filename)).read().splitlines()
+    start = None
+    indent = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("def %s(" % name):
+            start = index
+            indent = len(line) - len(line.lstrip())
+            break
+    if start is None:
+        return ""
+    body = [lines[start]]
+    for line in lines[start + 1:]:
+        if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+            break
+        body.append(line)
+    return strip_comments("\n".join(body))
+
+
 def load(name, filename):
     spec = importlib.util.spec_from_file_location(
         name, os.path.join(PACKAGE, filename))
@@ -39,6 +88,9 @@ def load(name, filename):
 
 measurements = load("bsmt_measurements", "measurements.py")
 readiness = load("bsmt_readiness", "readiness.py")
+# The readiness surfaces are fed by preprocess.classify_ready, so the
+# regression tests below exercise the two together rather than a stand-in.
+preprocess = load("bsmt_preprocess", "preprocess.py")
 
 
 class FakeMeasurement(object):
@@ -191,7 +243,7 @@ def test_calculate_all_ignores_drafts():
 # readiness (sect. 13)
 # ---------------------------------------------------------------------------
 
-CLEAN = dict(mesh_name="A_BSMT", triangle_count=350000, non_manifold=0,
+CLEAN = dict(mesh_name="A_BSMT", triangle_count=350000, mesh_reasons=(),
              analysed=True, dense_threshold=1000000, scale_uniform=True,
              landmark_total=4, landmarks_unpicked=0, landmarks_stale=0,
              measurements_defined=2)
@@ -212,8 +264,8 @@ def test_blockers():
     print("\n[readiness] what blocks, and what merely remains to do")
     cases = [
         ("no mesh", dict(mesh_name=""), readiness.REASON_NO_MESH, True),
-        ("non-manifold", dict(non_manifold=7),
-         readiness.REASON_NON_MANIFOLD, True),
+        ("mesh not ready", dict(mesh_reasons=["7 non-manifold edge(s)"]),
+         readiness.REASON_MESH_NOT_READY, True),
         ("too dense", dict(triangle_count=2783068),
          readiness.REASON_DENSE, True),
         ("non-uniform scale", dict(scale_uniform=False),
@@ -258,20 +310,22 @@ def test_unknown_is_not_an_answer():
           result["headline"])
 
     # A real blocker outranks not-yet-analysed.
-    result = readiness.evaluate(**dict(CLEAN, analysed=False, non_manifold=3))
+    result = readiness.evaluate(**dict(
+        CLEAN, analysed=False, mesh_reasons=["3 non-manifold edge(s)"]))
     check("a known blocker still wins", result["state"] == readiness.NOT_READY)
 
 
 def test_first_blocker_is_the_headline():
     print("\n[readiness] the researcher is told ONE next thing")
     result = readiness.evaluate(**dict(
-        CLEAN, non_manifold=7, scale_uniform=False, landmarks_stale=1))
+        CLEAN, mesh_reasons=["7 non-manifold edge(s)"], scale_uniform=False,
+        landmarks_stale=1))
     check("three problems are recorded", len(result["blockers"]) == 3,
           len(result["blockers"]))
     check("but the headline names only the first",
           result["headline"].count(":") == 1, result["headline"])
     check("and that first one is the topology",
-          result["blockers"][0]["code"] == readiness.REASON_NON_MANIFOLD)
+          result["blockers"][0]["code"] == readiness.REASON_MESH_NOT_READY)
 
     lines = readiness.lines(result)
     check("the expanded form lists them", len(lines) >= 4, lines)
@@ -426,9 +480,166 @@ def test_unknown_stage_is_silent():
           readiness.stage_hint('NOT_A_STAGE', has_mesh=True) == "")
 
 
+# ---------------------------------------------------------------------------
+# Milestone 3.17 - the surfaces must not carry their own readiness rule
+# ---------------------------------------------------------------------------
+
+def test_degenerate_only_mesh_is_not_ready():
+    """The reported defect, as a rule: manifold, closed, but degenerate.
+
+    Real measurement mesh, 351,220 triangles, 1 component, 0 boundary edges,
+    0 non-manifold edges - and degenerate triangles present. Scan Setup said
+    "Topology: Ready" and the headline said READY, because both carried their
+    own rule that tested non-manifold edges only.
+    """
+    print("\n[regression] a degenerate-only mesh is NOT READY everywhere")
+    report = {
+        "triangle_count": 351220,
+        "component_count": 1,
+        "boundary_edge_count": 0,
+        "nonmanifold_edge_count": 0,
+        "degenerate_triangle_count": 3,
+        "duplicate_vertex_count": 14,
+        "near_coincident_count": 6,
+    }
+
+    verdict, reasons = preprocess.classify_ready(report)
+    check("the authoritative verdict is NOT READY",
+          verdict == preprocess.MEASUREMENT_NOT_READY, verdict)
+    check("and it names the degenerate triangles",
+          any("degenerate" in reason for reason in reasons), reasons)
+
+    # The readiness headline is fed the same verdict, so it cannot disagree.
+    result = readiness.evaluate(**dict(CLEAN, mesh_reasons=reasons))
+    check("the readiness line is NOT READY too",
+          result["state"] == readiness.NOT_READY, result["state"])
+    check("it is blocked", result["blocked"])
+    check("the headline names the degenerate triangles",
+          "degenerate" in result["headline"], result["headline"])
+    check("and points at Mesh Repair",
+          result["blockers"][0]["panel"] == "Mesh Repair",
+          result["blockers"][0])
+    check("the word Ready never appears alone in the headline",
+          not result["headline"].startswith("READY"), result["headline"])
+
+    # And the same mesh WITHOUT the degeneracy is ready, so the rule is not
+    # simply refusing everything.
+    clean_report = dict(report, degenerate_triangle_count=0)
+    verdict, reasons = preprocess.classify_ready(clean_report)
+    check("the same mesh with no degenerate triangles is READY",
+          verdict == preprocess.MEASUREMENT_READY, (verdict, reasons))
+    check("and then the readiness line agrees",
+          readiness.evaluate(**dict(CLEAN, mesh_reasons=reasons))["state"]
+          == readiness.READY)
+
+
+def test_non_manifold_still_blocks():
+    print("\n[regression] routing through the verdict weakened nothing")
+    report = {
+        "triangle_count": 351220, "component_count": 1,
+        "boundary_edge_count": 0, "nonmanifold_edge_count": 5,
+        "degenerate_triangle_count": 0,
+    }
+    verdict, reasons = preprocess.classify_ready(report)
+    check("non-manifold is still NOT READY",
+          verdict == preprocess.MEASUREMENT_NOT_READY, verdict)
+    result = readiness.evaluate(**dict(CLEAN, mesh_reasons=reasons))
+    check("and still blocks the readiness line",
+          result["state"] == readiness.NOT_READY)
+    check("naming non-manifold edges",
+          "non-manifold" in result["headline"], result["headline"])
+
+
+def test_coincident_vertices_do_not_affect_readiness():
+    """Sect. 7: report the current policy, do not change it.
+
+    Exact-coincident and near-coincident vertices are DIAGNOSTIC ONLY. They
+    are counted and displayed by the topology report, and they are read by
+    neither `classify_ready` nor `preflight`, so they change no verdict and
+    refuse no solve. Pinned here so the answer to "do they matter?" is a test
+    rather than a memory - and so that changing it later is a deliberate act.
+    """
+    print("\n[policy] coincident vertices are diagnostic only")
+    base = {
+        "triangle_count": 351220, "component_count": 1,
+        "boundary_edge_count": 0, "nonmanifold_edge_count": 0,
+        "degenerate_triangle_count": 0,
+    }
+    clean_verdict, clean_reasons = preprocess.classify_ready(base)
+
+    for field, count in (("duplicate_vertex_count", 14),
+                         ("near_coincident_count", 97),
+                         ("duplicate_group_count", 7),
+                         ("near_coincident_group_count", 3)):
+        verdict, reasons = preprocess.classify_ready(dict(base, **{field: count}))
+        check("%s=%d does not change the verdict" % (field, count),
+              verdict == clean_verdict and reasons == clean_reasons,
+              (verdict, reasons))
+
+    gate = preprocess.preflight(dict(base, duplicate_vertex_count=14,
+                                     near_coincident_count=97))
+    check("nor does it refuse a solve", gate["allowed"], gate["refusals"])
+    check("and it raises no warning either",
+          not any("coincident" in line.lower() for line in gate["warnings"]),
+          gate["warnings"])
+
+    # Asserted against the POLICY functions, not the whole file: the
+    # before/after comparison table displays duplicate vertices, and
+    # displaying a number is not reading it for a decision.
+    for name in ("classify_ready", "preflight"):
+        body = function_source("preprocess.py", name)
+        for field in ("duplicate_vertex_count", "near_coincident_count"):
+            check("%s() never reads %s" % (name, field), field not in body,
+                  name)
+    table = function_source("preprocess.py", "format_comparison")
+    check("but the diagnostics table still shows them to the researcher",
+          "_COMPARISON_ROWS" in table)
+
+
+def test_no_surface_carries_its_own_mesh_rule():
+    print("\n[regression] one policy, one place")
+    panels_source = open(os.path.join(PACKAGE, "panels.py")).read()
+
+    evaluate_body = function_source("readiness.py", "evaluate")
+    check("readiness.evaluate no longer tests non-manifold itself",
+          "non_manifold" not in evaluate_body, evaluate_body[:200])
+    check("it consumes the verdict it is handed",
+          "mesh_reasons" in evaluate_body)
+
+    target_body = function_source("panels.py", "_draw_measurement_target")
+    check("the Scan Setup block no longer labels a mesh Ready on its own",
+          "non_manifold" not in target_body, target_body[:200])
+    check("it reads the verdict instead",
+          "state.mesh_verdict(" in target_body)
+    check("no panel calls the policy function directly",
+          "classify_ready(" not in strip_comments(panels_source),
+          "panels must reach it through state.mesh_verdict")
+
+    state_source = open(os.path.join(PACKAGE, "state.py")).read()
+    check("state.py has the single accessor",
+          "def mesh_verdict(" in state_source)
+    verdict_body = function_source("state.py", "mesh_verdict")
+    check("which calls the authoritative policy",
+          "preprocess.classify_ready(" in verdict_body)
+    check("and it is the only call in the module",
+          state_source.count("preprocess.classify_ready(") == 1,
+          state_source.count("preprocess.classify_ready("))
+    check("it reads the cache with peek_current, not peek",
+          "meshcache.peek_current(obj)" in verdict_body)
+    snapshot_body = function_source("state.py", "readiness_snapshot")
+    check("and readiness_snapshot routes through the same accessor",
+          "mesh_verdict(context, props, obj)" in snapshot_body)
+    check("rather than re-deriving a rule",
+          "nonmanifold_edge_count" not in snapshot_body, snapshot_body[:200])
+
+
 def main():
     print("BSMT Milestone 3.7 - draft and readiness tests")
     for test in (
+        test_degenerate_only_mesh_is_not_ready,
+        test_non_manifold_still_blocks,
+        test_coincident_vertices_do_not_affect_readiness,
+        test_no_surface_carries_its_own_mesh_rule,
         test_stage_hints,
         test_stage_hint_sequence,
         test_not_ready_mesh_is_named,

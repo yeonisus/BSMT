@@ -16,7 +16,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 #: modern way. This constant is defined by the module itself, survives both
 #: packaging modes, and is what tools/build_release.py reads to stamp the
 #: extension manifest, so the two can never disagree.
-VERSION = (0, 22, 0)
+VERSION = (0, 22, 1)
 
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
