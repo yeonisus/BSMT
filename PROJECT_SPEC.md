@@ -3895,12 +3895,136 @@ Regression: 2,412 offline checks across nineteen suites, plus 89 workflow-UI, 11
 
 ---
 
+## 11v. Milestone 3.18 — One degenerate-triangle policy (v0.23.0, 2026-09-03)
+
+Closes the divergence recorded as open item 1 in 0.22.1. The product contradicted itself: the
+sidebar said `NOT READY` on a mesh with degenerate triangles, and the exact solver ran on that very
+mesh.
+
+### 11v.1 The divergence, confirmed before anything was changed
+
+| Condition | `classify_ready` (UI verdict) | `preflight` (solver gate) |
+|---|---|---|
+| canonical mesh will not build | blocking | *not considered* |
+| no triangles | blocking | *not considered* |
+| non-manifold edges | blocking | refusal |
+| **degenerate triangles** | **blocking** | **warning — solve allowed** |
+| boundary edges | warning | warning |
+| components > 1 | warning | warning |
+| coincident vertices | *not read* | *not read* |
+| density above threshold | warning | guarded refusal |
+
+Two functions, two answers to the same question. `preflight` had been written when non-manifold
+topology was the only condition known to crash Blender, and degenerate triangles were added to
+`classify_ready` in 3.15 without the gate being revisited.
+
+### 11v.2 Checked before adopting the policy
+
+Making degenerate triangles a hard block is only safe if BSMT's own output never contains them —
+otherwise every measurement mesh would be refused. Measured on Blender 4.5.13, collapse decimation
+at four ratios on five mesh types:
+
+| Source | Triangles | 50% | 25% | 10% | 5% |
+|---|---|---|---|---|---|
+| UV sphere 256×128 | 65,024 | 0 | 0 | 0 | 0 |
+| UV sphere 128×64 | 16,128 | 0 | 0 | 0 | 0 |
+| Icosphere sub 6 | 20,480 | 0 | 0 | 0 | 0 |
+| Suzanne, subsurf 3 | 62,976 | 0 | 0 | 0 | 0 |
+| Torus 192×96 | 36,864 | 0 | 0 | 0 | 0 |
+
+Zero in every case. Degenerate triangles come from the input scan, never from decimation, so the
+hard block cannot make a measurement mesh BSMT produced unusable.
+
+### 11v.3 One list, two presentations
+
+`preprocess.blocking_defects(report, canonical_built=True)` is now the only place that decides
+which conditions make exact measurement unsafe. It returns, per defect, a `code`, a `count`, a
+`status` wording and a `refusal` wording. `classify_ready` renders the status wordings into its NOT
+READY reasons; `preflight` renders the refusal wordings into its refusals. Neither decides
+membership, so a condition added to the list is enforced in both places at once by construction.
+
+    blocking_defects  ─┬─→ classify_ready  →  NOT READY (status wording)
+                       └─→ preflight       →  refusal   (refusal wording)
+
+**Hard block:** no canonical mesh · no triangles · non-manifold edges > 0 · degenerate triangles > 0.
+
+**Warning only:** boundary edges · connected components > 1 · coincident and near-coincident
+vertices.
+
+**Density is deliberately not a defect.** It stays a *guarded* refusal inside `preflight`, because
+it is operational and must remain overridable through the density guard; putting it on the defect
+list would have made it unconditional and removed that override.
+
+**Appearance is deliberately not a defect either.** It is preprocessing's own concern, judged
+against the facts recorded at copy time rather than anything in a topology report, so it stays a
+`classify_ready` input and never reaches the solver gate.
+
+### 11v.4 Every route refuses, and none reaches the solver
+
+All three routes to the native library already funnelled through one `solver_preflight` chokepoint,
+so no new gate was needed:
+
+| Operator | Route |
+|---|---|
+| `bsmt.calculate_surface_distance` (A to B) | `solver_preflight` → `solve.surface_distance` |
+| `_measure_one` (`calculate_measurement`, `calculate_all_measurements`) | `solver_preflight` → `solve.surface_distance` |
+| `bsmt.compute_surface_path` | `solver_preflight` → `solve.surface_path` |
+
+Proved rather than asserted: `tests/test_degenerate_policy.py` wraps `PyGeodesicAlgorithmExact` —
+the only door to the native solver — in a counter, and on a degenerate mesh all three operators
+refuse with **zero constructions**. The path route is exercised twice: once naturally, and once
+with a stored surface distance planted so the operator's own precondition passes and the gate is
+the only thing left that can stop it.
+
+### 11v.5 Message
+
+    Surface calculation refused: the measurement mesh contains N degenerate
+    (zero-area) triangle(s). Use the Mesh Repair panel and re-analyze before
+    exact geodesic measurement.
+
+The milestone brief suggested "Run Scan Repair". The panel is called **Mesh Repair**; sending a
+researcher to a panel that does not exist would be a worse outcome than following the suggested
+wording exactly, and an existing test already asserts that readiness pointers name real panels.
+Project vocabulary — "measurement mesh", never "measurement copy" — is asserted by test.
+
+### 11v.6 What did not change
+
+Coincident and near-coincident vertices remain **diagnostic only**, as required. They are counted
+and displayed and read by neither function; they matter only through the degenerate triangles they
+can produce, which the defect list already catches. Pinned twice: on the pure policy, and on a real
+Blender mesh carrying a loose duplicate vertex with no degenerate triangles, which stays READY and
+solvable.
+
+Same-component validation is untouched. Several components is still a mesh-level *warning*, and a
+cross-component landmark pair is still refused individually by `solve.validate_points` raising
+`DISCONNECTED`.
+
+One behaviour change is worth recording: `preflight({})` on an empty topology report now refuses
+instead of allowing. A report with no triangle count is a report that cannot be trusted, and an
+unknown mesh is precisely what this gate exists to keep away from a native solver.
+
+### 11v.7 What is verified
+
+`tests/test_preprocess.py` 149 → 195 offline checks: scenarios A–E from the brief, plus a
+cross-product check that `classify_ready` says NOT READY **if and only if** `preflight` refuses,
+over eight topology shapes, plus the density guard staying separate and overridable.
+
+`tests/test_degenerate_policy.py` (new, 35 checks under Blender): the reported mesh shape refused
+by all three solver routes with zero pygeodesic constructions, coincident-only meshes still
+solvable, a clean mesh still solving for real, and the `DISCONNECTED` pair rule intact.
+
+Regression: 2,460 offline checks across twenty suites, plus 35 degenerate-policy, 89 workflow-UI,
+110 preprocessing and 90 path-visualisation checks in Blender. 0 failures. The 0.23.0 extension
+package installs on a clean Blender config and applies the unified policy.
+
+---
+
 ## 12. Open items requiring decisions
 
-1. **Degenerate triangles block the readiness verdict but only warn the solver gate.**
-   `preprocess.classify_ready` treats them as blocking (NOT READY) while `preprocess.preflight`
-   treats them as a warning, so an exact solve can run on a mesh the verdict refuses. Both are
-   deliberate as written; reconciling them is a policy decision for the project owner.
+1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~
+   **Resolved 2026-09-03 (Milestone 3.18, v0.23.0):** both now read one
+   `preprocess.blocking_defects` list, so degenerate triangles hard-block the UI verdict and the
+   solver gate together.
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~
    **Resolved 2026-09-02 (§5.1a): Python 3.11.15, Darwin arm64, numpy 1.26.4.**
 2. Whether landmark pairs may wrap a limb or torso; affects interpretation, not the algorithm.

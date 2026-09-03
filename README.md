@@ -101,14 +101,23 @@ preprocessing report says so and asks you to re-pick them on the copy.
 It appears once, at the top, and is not repeated per panel.
 
 Every mesh status in BSMT — the readiness line, the `Topology:` line in Scan
-Setup, and the verdict in the preprocessing report — comes from one function,
-`preprocess.classify_ready`. A mesh is `NOT READY` if its canonical form
-cannot be built, it has no triangles, it has non-manifold edges, it has
-degenerate (zero-area) triangles, or preprocessing lost its appearance data;
-`WARNING` for several components, boundary edges, or a triangle count still
-above the density threshold. **Exact-coincident and near-coincident vertices
-are diagnostic only** — they are reported, but they do not by themselves
-change the verdict or refuse a solve.
+Setup, the preprocessing verdict, **and the solver's own refusal** — comes
+from one list of blocking defects.
+
+**Hard block** (the UI says `NOT READY` *and* exact surface calculation is
+refused): the canonical mesh cannot be built, the mesh has no triangles, it
+has non-manifold edges, or it has degenerate (zero-area) triangles.
+
+**Warning only** (measurement is still allowed): several connected
+components, boundary edges, and exact- or near-coincident vertices. A dense
+mesh is warned about and, by default, its exact solve is refused by the
+separate density guard — which you can switch off deliberately.
+
+**Coincident vertices are diagnostic only.** They are reported but never
+block on their own; they matter when they produce degenerate triangles, and
+those do block. Several components never blocks the mesh either — a landmark
+*pair* spanning two components is refused individually, which is the check
+that actually matters.
 
 Two panels sit under Scan Setup rather than in the workflow itself:
 **Quick Measure (A to B)**, a Phase 1 spot check between two picked points
@@ -136,8 +145,10 @@ Backend (Developer)**. Both are closed by default.
   represent.
 - **Exact geodesic distance is exact for the mesh, not for the body.** It is
   the true shortest path across the triangulated surface it is given.
-- **Non-manifold topology is refused, not worked around.** BSMT will not
-  produce a surface distance on a mesh the solver is not safe on.
+- **Unsafe topology is refused, not worked around.** BSMT will not produce a
+  surface distance on a mesh with non-manifold edges or degenerate triangles.
+  The refusal and the sidebar's `NOT READY` come from the same list, so they
+  cannot disagree.
 - **Nothing is silently approximated.** A measurement that cannot be computed
   reports a failure state; an uncalculated value exports as a blank field, not
   a zero.

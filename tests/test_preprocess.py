@@ -283,13 +283,24 @@ def test_gate_warns_without_refusing():
     check("the boundary warning explains the risk",
           any("artefact" in w for w in result["warnings"]))
 
+    # Degenerate triangles used to warn here while classify_ready called them
+    # blocking - the sidebar said NOT READY and the solver ran on that very
+    # mesh. They REFUSE now, from the same list (Milestone 3.18).
     degenerate = preprocess.preflight(report(degenerate_triangle_count=3))
-    check("degenerate triangles warn only", degenerate["allowed"])
-    check("and are counted",
-          any("3 degenerate" in w for w in degenerate["warnings"]))
+    check("degenerate triangles now REFUSE the solve",
+          not degenerate["allowed"], str(degenerate))
+    check("and the refusal counts them",
+          any("3 degenerate" in line for line in degenerate["refusals"]),
+          str(degenerate["refusals"]))
+    check("they are not also listed as a warning",
+          not any("degenerate" in line for line in degenerate["warnings"]),
+          str(degenerate["warnings"]))
 
-    check("a missing key is treated as zero, not as an error",
-          preprocess.preflight({})["allowed"])
+    check("a missing key does not raise",
+          isinstance(preprocess.preflight({}), dict))
+    check("but an empty report is refused, not waved through",
+          not preprocess.preflight({})["allowed"],
+          "an unknown mesh must not reach a native solver")
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +523,168 @@ def test_ready_lines():
           trimmed[-1] == "  - and 3 more", str(trimmed))
 
 
+# ---------------------------------------------------------------------------
+# Milestone 3.18 - one policy for readiness and for the solver gate
+# ---------------------------------------------------------------------------
+
+def _both(report_dict):
+    """(classify_ready state, preflight allowed) for one topology report."""
+    verdict, _reasons = preprocess.classify_ready(report_dict)
+    return verdict, preprocess.preflight(report_dict)["allowed"]
+
+
+def test_A_degenerate_blocks_everywhere():
+    print("\n[policy A] degenerate triangles block the UI AND the solver")
+    defective = report(component_count=1, boundary_edge_count=0,
+                       nonmanifold_edge_count=0, degenerate_triangle_count=4)
+    verdict, allowed = _both(defective)
+    check("classify_ready says NOT READY",
+          verdict == preprocess.MEASUREMENT_NOT_READY, verdict)
+    check("and the solver gate refuses", not allowed)
+
+    gate = preprocess.preflight(defective)
+    check("the refusal names the measurement mesh",
+          any("measurement mesh" in line for line in gate["refusals"]),
+          gate["refusals"])
+    check("it counts the triangles",
+          any("4 degenerate" in line for line in gate["refusals"]),
+          gate["refusals"])
+    check("it points at Mesh Repair",
+          any("Mesh Repair" in line for line in gate["refusals"]),
+          gate["refusals"])
+    check("and it says to re-analyze",
+          any("re-analyze" in line for line in gate["refusals"]),
+          gate["refusals"])
+    check("the project vocabulary is used",
+          not any("measurement copy" in line.lower()
+                  for line in gate["refusals"]))
+    check("the defect is reported by code too",
+          preprocess.DEFECT_DEGENERATE in gate["blocking_codes"],
+          gate["blocking_codes"])
+
+
+def test_B_coincident_vertices_stay_warning_only():
+    print("\n[policy B] coincident vertices alone refuse nothing")
+    for field, count in (("duplicate_vertex_count", 14),
+                         ("near_coincident_count", 320),
+                         ("duplicate_group_count", 7),
+                         ("near_coincident_group_count", 3)):
+        coincident = report(degenerate_triangle_count=0, **{field: count})
+        verdict, allowed = _both(coincident)
+        check("%s=%d does not block the UI" % (field, count),
+              verdict == preprocess.MEASUREMENT_READY, verdict)
+        check("  nor the solver", allowed)
+
+    both = report(degenerate_triangle_count=0, duplicate_vertex_count=14,
+                  near_coincident_count=320)
+    gate = preprocess.preflight(both)
+    check("no refusal mentions coincidence",
+          not any("coincident" in line.lower() for line in gate["refusals"]),
+          gate["refusals"])
+    check("and neither does any warning",
+          not any("coincident" in line.lower() for line in gate["warnings"]),
+          gate["warnings"])
+    check("the shared defect list ignores them entirely",
+          preprocess.blocking_defects(both) == [],
+          preprocess.blocking_defects(both))
+
+    # They matter only through the degeneracy they can cause.
+    verdict, allowed = _both(report(duplicate_vertex_count=14,
+                                    degenerate_triangle_count=2))
+    check("coincidence that HAS produced degeneracy blocks",
+          verdict == preprocess.MEASUREMENT_NOT_READY and not allowed)
+
+
+def test_C_boundary_edges_warn_and_allow():
+    print("\n[policy C] a hole is a warning, not a refusal")
+    holed = report(boundary_edge_count=120, nonmanifold_edge_count=0,
+                   degenerate_triangle_count=0)
+    verdict, allowed = _both(holed)
+    check("classify_ready says WARNING",
+          verdict == preprocess.MEASUREMENT_WARNING, verdict)
+    check("and the solve is still allowed", allowed)
+    gate = preprocess.preflight(holed)
+    check("the boundary is warned about",
+          any("boundary edge" in line for line in gate["warnings"]),
+          gate["warnings"])
+    check("nothing is refused", gate["refusals"] == [], gate["refusals"])
+
+
+def test_D_non_manifold_refusal_unchanged():
+    print("\n[policy D] the existing non-manifold refusal is untouched")
+    bad = report(nonmanifold_edge_count=9)
+    verdict, allowed = _both(bad)
+    check("classify_ready says NOT READY",
+          verdict == preprocess.MEASUREMENT_NOT_READY, verdict)
+    check("the solver refuses", not allowed)
+    gate = preprocess.preflight(bad)
+    check("with the wording it has always used",
+          any(line == preprocess.REFUSE_NON_MANIFOLD % 9
+              for line in gate["refusals"]), gate["refusals"])
+    check("and the code is reported",
+          preprocess.DEFECT_NON_MANIFOLD in gate["blocking_codes"])
+
+
+def test_E_components_warn_and_allow():
+    print("\n[policy E] several components warn; the PAIR rule does the work")
+    split = report(component_count=4, degenerate_triangle_count=0)
+    verdict, allowed = _both(split)
+    check("classify_ready says WARNING",
+          verdict == preprocess.MEASUREMENT_WARNING, verdict)
+    check("and the mesh may still be solved on", allowed)
+    gate = preprocess.preflight(split)
+    check("the warning says measurement is still allowed",
+          any("still allowed" in line for line in gate["warnings"]),
+          gate["warnings"])
+    check("and that a pair is refused individually",
+          any("individually" in line for line in gate["warnings"]),
+          gate["warnings"])
+    # The per-pair rule itself lives in the solver and is asserted in
+    # tests/test_surface_distance.py; the gate must not pre-empt it.
+    check("no refusal is raised for the mesh as a whole",
+          gate["refusals"] == [], gate["refusals"])
+
+
+def test_one_policy_two_presentations():
+    print("\n[policy] the two gates cannot disagree, by construction")
+    cases = [
+        {}, {"degenerate_triangle_count": 1}, {"nonmanifold_edge_count": 1},
+        {"triangle_count": 0}, {"boundary_edge_count": 5},
+        {"component_count": 9}, {"duplicate_vertex_count": 3},
+        {"degenerate_triangle_count": 2, "nonmanifold_edge_count": 3},
+    ]
+    for extra in cases:
+        current = report(**extra)
+        verdict, allowed = _both(current)
+        blocked = bool(preprocess.blocking_defects(current))
+        check("%s: NOT READY iff refused" % (extra or "clean"),
+              (verdict == preprocess.MEASUREMENT_NOT_READY) == blocked
+              and allowed == (not blocked),
+              (verdict, allowed, blocked))
+
+    source = open(os.path.join(PACKAGE, "preprocess.py")).read()
+    body = source[source.index("def preflight("):source.index("def _thousands")
+                  if "def _thousands" in source[source.index("def preflight("):]
+                  else len(source)]
+    check("preflight derives its refusals from the shared list",
+          "blocking_defects(report" in body, body[:200])
+
+
+def test_dense_guard_is_separate_and_overridable():
+    print("\n[policy] density stays a guarded refusal, not a defect")
+    dense = report(triangle_count=2000000)
+    check("guarded, it refuses",
+          not preprocess.preflight(dense, guard_dense=True)["allowed"])
+    check("unguarded, it warns and allows",
+          preprocess.preflight(dense, guard_dense=False)["allowed"])
+    check("density is NOT on the blocking-defect list",
+          preprocess.blocking_defects(dense) == [],
+          preprocess.blocking_defects(dense))
+    check("so a dense mesh is only a WARNING to the UI",
+          preprocess.classify_ready(dense)[0]
+          == preprocess.MEASUREMENT_WARNING)
+
+
 def test_no_welding_or_hole_filling_anywhere():
     print("\n[scope] nothing welds or fills holes")
     for name in ("preprocess.py", "scancopy.py"):
@@ -550,6 +723,13 @@ def main():
         test_gate_refuses_non_manifold,
         test_gate_density_threshold,
         test_gate_warns_without_refusing,
+        test_A_degenerate_blocks_everywhere,
+        test_B_coincident_vertices_stay_warning_only,
+        test_C_boundary_edges_warn_and_allow,
+        test_D_non_manifold_refusal_unchanged,
+        test_E_components_warn_and_allow,
+        test_one_policy_two_presentations,
+        test_dense_guard_is_separate_and_overridable,
         test_representation_is_honest,
         test_comparison_table,
         test_no_welding_or_hole_filling_anywhere,

@@ -270,6 +270,111 @@ def compare_texture(before, after):
 
 
 # ---------------------------------------------------------------------------
+# the blocking-defect policy - ONE list, two presentations (Milestone 3.18)
+# ---------------------------------------------------------------------------
+#
+# Until 0.22.1 there were two answers to "is this mesh safe to measure on".
+# `classify_ready` called degenerate triangles blocking; `preflight` called
+# them a warning and let the solve run. The product therefore said NOT READY
+# in the sidebar and then handed the same mesh to pygeodesic anyway.
+#
+# The conditions now live here, once. `classify_ready` renders them as status
+# reasons and `preflight` renders them as refusals - different wording for
+# different contexts, but never a different SET. Neither decides membership.
+#
+# What is deliberately NOT on this list, and stays warning-only:
+#   * boundary edges          - a hole makes a geodesic questionable, not unsafe
+#   * connected components    - enforced per landmark PAIR, not per mesh
+#   * coincident vertices     - diagnostic; they matter only when they produce
+#                               degenerate triangles, which this list catches
+#   * density                 - operational, and guarded separately by
+#                               `guard_dense` so it stays overridable
+
+DEFECT_NO_CANONICAL = 'NO_CANONICAL'
+DEFECT_NO_TRIANGLES = 'NO_TRIANGLES'
+DEFECT_NON_MANIFOLD = 'NON_MANIFOLD'
+DEFECT_DEGENERATE = 'DEGENERATE'
+
+#: Order matters: the first defect is the one a compact line reports.
+BLOCKING_DEFECT_CODES = (
+    DEFECT_NO_CANONICAL,
+    DEFECT_NO_TRIANGLES,
+    DEFECT_NON_MANIFOLD,
+    DEFECT_DEGENERATE,
+)
+
+REFUSE_DEGENERATE = (
+    "Surface calculation refused: the measurement mesh contains %d "
+    "degenerate (zero-area) triangle(s). Use the Mesh Repair panel and "
+    "re-analyze before exact geodesic measurement."
+)
+REFUSE_NO_TRIANGLES = (
+    "Surface calculation refused: the measurement mesh has no triangles."
+)
+REFUSE_NO_CANONICAL = (
+    "Surface calculation refused: the canonical mesh could not be built from "
+    "this geometry."
+)
+
+
+def blocking_defects(report, canonical_built=True):
+    """Every condition that makes exact surface measurement unsafe.
+
+    THE list. `classify_ready` turns it into a NOT READY verdict and
+    `preflight` turns it into a solver refusal; neither is entitled to decide
+    what belongs on it, and a condition added here is enforced in both places
+    at once by construction.
+
+    Returns a list of dicts with `code`, `count`, `status` (status wording)
+    and `refusal` (refusal wording). Empty means nothing blocks.
+    """
+    if not canonical_built:
+        return [{
+            "code": DEFECT_NO_CANONICAL,
+            "count": 0,
+            "status": ("the canonical mesh could not be built from this "
+                       "geometry, so nothing can be measured on it"),
+            "refusal": REFUSE_NO_CANONICAL,
+        }]
+
+    triangles = int(report.get("triangle_count", 0) or 0)
+    non_manifold = int(report.get("nonmanifold_edge_count", 0) or 0)
+    degenerate = int(report.get("degenerate_triangle_count", 0) or 0)
+
+    defects = []
+    if triangles <= 0:
+        # A report with no triangle count is a report that cannot be trusted,
+        # and an unknown mesh is exactly what this gate exists to keep away
+        # from a native solver.
+        defects.append({
+            "code": DEFECT_NO_TRIANGLES,
+            "count": 0,
+            "status": "the mesh has no triangles",
+            "refusal": REFUSE_NO_TRIANGLES,
+        })
+    if non_manifold > 0:
+        defects.append({
+            "code": DEFECT_NON_MANIFOLD,
+            "count": non_manifold,
+            "status": ("%d non-manifold edge(s). The exact solver has crashed "
+                       "Blender on non-manifold input, so it is refused "
+                       "outright" % non_manifold),
+            "refusal": REFUSE_NON_MANIFOLD % non_manifold,
+        })
+    if degenerate > 0:
+        # A zero-area triangle makes barycentric reconstruction ill-defined
+        # at the point a landmark lands on one. That is a WRONG measurement
+        # rather than a slow one, which is why it blocks rather than warns.
+        defects.append({
+            "code": DEFECT_DEGENERATE,
+            "count": degenerate,
+            "status": "%d degenerate (zero-area) triangle(s)" % degenerate,
+            "refusal": REFUSE_DEGENERATE % degenerate,
+        })
+    return defects
+
+
+# ---------------------------------------------------------------------------
 # solver safety gate
 # ---------------------------------------------------------------------------
 
@@ -310,30 +415,33 @@ def _thousands(value):
 
 
 def preflight(report, dense_threshold=DEFAULT_DENSE_THRESHOLD,
-              guard_dense=True):
+              guard_dense=True, canonical_built=True):
     """Decide whether this mesh may be handed to the native solver.
 
     `report` is a geodesic.topology.analyse() summary. Returns a dict with
     `allowed`, `refusals` and `warnings`.
 
-    Only non-manifold topology is an unconditional refusal: it is the
-    condition that has actually crashed Blender, and a SIGSEGV takes the
-    session with it. Density is a guarded refusal rather than a hard limit -
-    the threshold is operational, so it can be overridden deliberately, but
-    it defaults to blocking because losing an unsaved session is worse than
-    being asked to make a measurement copy first.
+    The unconditional refusals are `blocking_defects` - the same list that
+    makes `classify_ready` say NOT READY. This function does not decide which
+    conditions are unsafe and must never start to: until 0.22.1 it kept its
+    own view, under which degenerate triangles were merely a warning, so the
+    sidebar said NOT READY and the solver was handed that very mesh anyway.
+
+    Density is separate and stays a GUARDED refusal rather than a defect: the
+    threshold is operational, so it can be overridden deliberately, but it
+    defaults to blocking because losing an unsaved session is worse than
+    being asked to make a measurement mesh first.
     """
-    refusals = []
     warnings = []
+
+    defects = blocking_defects(report, canonical_built=canonical_built)
+    refusals = [defect["refusal"] for defect in defects]
+    blocked_codes = [defect["code"] for defect in defects]
 
     non_manifold = int(report.get("nonmanifold_edge_count", 0) or 0)
     triangles = int(report.get("triangle_count", 0) or 0)
     components = int(report.get("component_count", 0) or 0)
     boundary = int(report.get("boundary_edge_count", 0) or 0)
-    degenerate = int(report.get("degenerate_triangle_count", 0) or 0)
-
-    if non_manifold > 0:
-        refusals.append(REFUSE_NON_MANIFOLD % non_manifold)
 
     if triangles > int(dense_threshold):
         if guard_dense:
@@ -343,19 +451,20 @@ def preflight(report, dense_threshold=DEFAULT_DENSE_THRESHOLD,
             warnings.append(WARN_DENSE % (_thousands(triangles),
                                           _thousands(dense_threshold)))
 
+    # Warnings only from here down; every one of these leaves the solve
+    # ALLOWED. A hole makes a geodesic questionable rather than unsafe, and
+    # connectivity is enforced per landmark PAIR by the solver's own
+    # validation rather than per mesh.
     if components > 1:
         warnings.append(WARN_COMPONENTS % components)
     if boundary > 0:
         warnings.append(WARN_BOUNDARY % boundary)
-    if degenerate > 0:
-        warnings.append(
-            "This mesh has %d degenerate (zero-area) triangle(s)." % degenerate
-        )
 
     return {
         "allowed": not refusals,
         "refusals": refusals,
         "warnings": warnings,
+        "blocking_codes": blocked_codes,
         "triangle_count": triangles,
         "nonmanifold_edge_count": non_manifold,
         "component_count": components,
@@ -406,32 +515,22 @@ def classify_ready(report, canonical_built=True, appearance_ok=True,
     Connectivity is a property of a landmark PAIR, and it is enforced there,
     per-measurement, by the solver's own validation (sect. 6).
     """
-    blocking = []
     warnings = []
 
+    # The same list the solver gate refuses on, rendered as status wording.
+    # This function does not decide which conditions are unsafe.
+    defects = blocking_defects(report, canonical_built=canonical_built)
+    blocking = [defect["status"] for defect in defects]
     if not canonical_built:
-        blocking.append("the canonical mesh could not be built from this "
-                        "geometry, so nothing can be measured on it")
         return MEASUREMENT_NOT_READY, blocking
 
-    non_manifold = int(report.get("nonmanifold_edge_count", 0) or 0)
     triangles = int(report.get("triangle_count", 0) or 0)
     components = int(report.get("component_count", 0) or 0)
     boundary = int(report.get("boundary_edge_count", 0) or 0)
-    degenerate = int(report.get("degenerate_triangle_count", 0) or 0)
 
-    if triangles <= 0:
-        blocking.append("the mesh has no triangles")
-    if non_manifold > 0:
-        blocking.append(
-            "%d non-manifold edge(s). The exact solver has crashed Blender on "
-            "non-manifold input, so it is refused outright" % non_manifold
-        )
-    if degenerate > 0:
-        # Zero-area triangles make barycentric reconstruction ill-defined at
-        # the point a landmark lands on one, which is a wrong measurement
-        # rather than a slow one.
-        blocking.append("%d degenerate (zero-area) triangle(s)" % degenerate)
+    # Appearance is preprocessing's own concern, judged against the facts
+    # recorded at copy time rather than anything in a topology report, so it
+    # is not a mesh defect and does not belong on the shared list.
     if not appearance_ok:
         blocking.extend(str(problem) for problem in appearance_problems)
 
