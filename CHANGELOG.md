@@ -4,6 +4,62 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.24.2 — picking says why, instead of blaming the cursor
+
+**Reported:** on a real preprocessed and repaired PLY measurement mesh at
+location `(-28570, -2692, -176)`, rotation `(90.1, -2.3, -0.6)`, unit scale,
+Alignment → Pick LEFT answered *"no mesh surface under the cursor of 'scan
+(1)_BSMT'"* while the body was plainly on screen under the cursor. The
+transform was the natural suspect.
+
+**The transform was innocent.** Measured before changing anything:
+`picking.ray_cast_object` hits correctly at identity, at that translation, at
+that rotation, and at both together, on a body-scale mesh and after a full
+Preprocessing → Mesh Repair pipeline. It inverts `matrix_world`, casts in
+local space and transforms the hit back out, and a rigid transform cannot
+make it miss.
+
+**Alignment has no picking code of its own.** `bsmt.pick_alignment_reference`
+delegates to `bsmt.pick_point` with `target='ALIGN'` — the same modal picker,
+the same single `ray_cast_surface` call site, that Landmark Manager and Quick
+Measure use. There was no legacy raycast to unify.
+
+**Root cause: the target object was hidden in the viewport.** BSMT restricts
+the cast to the active object — deliberately, because a measurement mesh sits
+at exactly its source's transform and a scene-wide cast would silently return
+the wrong one. But **BSMT's own Source / Measurement buttons set
+`hide_viewport`** on that very object. Measured on Blender 4.5.13:
+`hide_viewport`, a collection hidden in the viewport, and a collection
+excluded from the view layer all make `Object.ray_cast` **raise**, while
+`hide_set()` (the eye icon) leaves it working — and `evaluated.data` reports a
+full mesh in all four, so evaluability cannot be probed without attempting a
+cast.
+
+So the sequence was: press *Source* to compare → the measurement mesh is
+hidden but stays the **active object** → the researcher sees the source scan,
+coincident and identical → clicks it → the pick, aimed at the hidden copy,
+finds nothing and reports the cursor.
+
+- **`picking.pick_blocker()`** now answers the researcher's question — can
+  this object be seen and therefore clicked? — before any cast, and the picker
+  reports *"'scan (1)_BSMT' is hidden in the viewport, so there is nothing on
+  screen to click. Show it again — Scan Preprocessing > Measurement, or the
+  eye and monitor icons in the Outliner…"* instead of blaming the cursor.
+  Refusing is the safe direction: a pick on an object nobody can see would
+  record a reference against geometry never inspected.
+- **`ray_cast_object` falls back to BSMT's canonical BVH** when
+  `Object.ray_cast` cannot answer, so a momentary depsgraph gap on a *visible*
+  object no longer reads as "nothing there". Same BVH the SurfacePoint is
+  built against, so the two cannot disagree about where the surface is.
+- No transform is applied, no geometry is edited, and no alignment
+  mathematics changed.
+
+New `tests/test_picking_transforms.py`, 45 checks in Blender: identity,
+translation, rotation, translation + rotation and the reported transform all
+hit and land on the surface; empty space still misses; every hidden state is
+reported with its real cause; BSMT's own *Show Source* button reproduces the
+original failure and *Show Both* clears it.
+
 ## 0.24.1 — Mesh Repair is a workflow stage again
 
 **The Mesh Repair panel was invisible.** Reported against a confirmed 0.24.0

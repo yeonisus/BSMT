@@ -154,6 +154,22 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         # the same transform as its source, so a scene-wide cast can return
         # the original instead and record the landmark against the wrong mesh.
         target = self._pick_target(context)
+
+        # Say WHY before saying "nothing there". A target that is disabled in
+        # the viewport has no evaluated mesh, so the cast finds nothing - and
+        # BSMT's own Source / Measurement buttons set that flag. Because a
+        # measurement mesh sits at its source's transform, the researcher is
+        # then looking at a body, clicking on it, and being told their cursor
+        # is over no surface.
+        blocker = "" if target is None else picking.pick_blocker(context, target)
+        if blocker:
+            self.report(
+                {'WARNING'},
+                "BSMT: '%s' %s (ESC or right click to cancel)"
+                % (target.name, blocker),
+            )
+            return {'RUNNING_MODAL'}
+
         hit = picking.ray_cast_surface(context, self._region, rv3d, coord,
                                        target=target)
         if hit is None:

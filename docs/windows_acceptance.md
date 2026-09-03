@@ -3,7 +3,7 @@
 **Status: READY FOR MANUAL WINDOWS VALIDATION. Nothing below has been run on
 Windows.**
 
-BSMT 0.24.1 is packaged for Windows x64 and audited for platform assumptions
+BSMT 0.24.2 is packaged for Windows x64 and audited for platform assumptions
 from macOS. That is not the same as working. This checklist is what a real
 Windows machine has to confirm before anyone should call Windows *supported*.
 
@@ -30,7 +30,7 @@ Blender version and machine.
 ### Install
 
 - [ ] Clean Blender 4.5.13 x64 installed from blender.org
-- [ ] `bsmt-0.24.1.zip` downloaded **without the browser unzipping it**
+- [ ] `bsmt-0.24.2.zip` downloaded **without the browser unzipping it**
 - [ ] Preferences → Get Extensions → ▾ → Install from Disk succeeds
 - [ ] BSMT appears and is enabled
 - [ ] No error in **Window → Toggle System Console**
@@ -99,7 +99,7 @@ Blender version and machine.
 
 ### Failure behaviour
 
-- [ ] Uninstall the extension, install `body_surface_measurement-0.24.1.zip`
+- [ ] Uninstall the extension, install `body_surface_measurement-0.24.2.zip`
       (no solver) instead
 - [ ] BSMT still enables
 - [ ] *About BSMT* reports `Exact Geodesic: Unavailable` with a reason

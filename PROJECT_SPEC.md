@@ -4225,6 +4225,102 @@ the panel is confirmed visible from a clean-config install of the rebuilt ZIP.
 
 ---
 
+## 11y. Milestone 3.21 — Picking says why (v0.24.2, 2026-09-03)
+
+A defect report whose stated cause was wrong, and where finding that out mattered more than the
+fix.
+
+### 11y.1 The report
+
+On a real preprocessed and repaired PLY measurement mesh — location `(-28570, -2692, -176)`,
+rotation `(90.1, -2.3, -0.6)`, unit scale, displaying correctly — Alignment > Pick LEFT answered:
+
+    BSMT: no mesh surface under the cursor of 'scan (1)_BSMT'
+
+with the cursor over the visible body. The reasonable hypothesis was that alignment picking had its
+own older raycast that mishandled the object transform.
+
+### 11y.2 The transform was innocent, and there was no second implementation
+
+Measured before changing anything. `picking.ray_cast_object` was cast at a body-scale mesh under
+each transform in turn:
+
+| Transform | Result |
+|---|---|
+| identity | hit |
+| translation `(-28570, -2692, -176)` | hit |
+| rotation `(90.1, -2.3, -0.6)` | hit |
+| translation + rotation | hit |
+| after Preprocessing then Mesh Repair, at that transform | hit |
+
+It inverts `matrix_world`, casts in local space and transforms the hit back out; a rigid transform
+cannot make it miss.
+
+And Alignment has **no picking code of its own**: `bsmt.pick_alignment_reference` is four lines
+delegating to `bsmt.pick_point` with `target='ALIGN'` — the same modal picker, the same single
+`picking.ray_cast_surface` call site, that Landmark Manager and Quick Measure use. There was no
+legacy raycast to unify and no duplicated transform maths to remove.
+
+### 11y.3 Root cause: BSMT hid the object it was aiming at
+
+The cast is deliberately restricted to the active object: a measurement mesh sits at exactly its
+source's transform, so a scene-wide cast returns whichever the depsgraph reaches first and records
+a landmark against the wrong mesh (sect. 11n). **But BSMT's own Source / Measurement buttons set
+`hide_viewport` on that object**, and selection is unaffected by hiding.
+
+Measured on Blender 4.5.13, and the states are not interchangeable:
+
+| State | `visible_get()` | `evaluated.data` | `Object.ray_cast` |
+|---|---|---|---|
+| visible | True | full mesh | hit |
+| `hide_set()` — eye icon | False | full mesh | **hit** |
+| `hide_viewport` — monitor icon | False | full mesh | **raises** |
+| collection hidden in viewport | False | full mesh | **raises** |
+| collection excluded from view layer | False | full mesh | **raises** |
+
+`evaluated.data` reports a full mesh in every case, so evaluability cannot be probed without
+attempting a cast. The sequence that produced the report:
+
+1. press *Source* to compare the two meshes — the measurement mesh gets `hide_viewport = True`;
+2. it remains the **active object**;
+3. the researcher sees the source scan, coincident and visually identical, and clicks on it;
+4. the pick, aimed at the hidden copy, finds nothing and reports the cursor.
+
+Everything in that chain worked as designed. The failure was that BSMT described it as a problem
+with the researcher's aim.
+
+### 11y.4 The fix
+
+`picking.pick_blocker(context, obj)` answers the question that actually matters — can this object be
+seen, and therefore clicked? — before any cast is attempted, using `visible_get()`, which covers all
+four hiding mechanisms at once. The picker reports the real cause and the remedy instead of
+"no mesh surface under the cursor".
+
+Refusing is the safe direction rather than the convenient one: a pick on an object nobody can see
+would record an alignment reference or a landmark against geometry the researcher never inspected,
+which is the same class of error the target restriction exists to prevent.
+
+`ray_cast_object` additionally falls back to BSMT's canonical BVH when `Object.ray_cast` cannot
+answer, so a momentary depsgraph gap on a **visible** object does not read as "nothing there". It is
+the same BVH the SurfacePoint is built against a moment later, so the two cannot disagree about
+where the surface is.
+
+No transform is applied, no geometry is edited, and no alignment mathematics changed (sect. 6).
+
+### 11y.5 What is verified
+
+`tests/test_picking_transforms.py` (new, 45 checks under Blender): identity, translation, rotation,
+translation + rotation and the reported transform all hit and land on the surface at the right
+radius and on the near side; a ray through empty space still misses; every hiding mechanism is
+reported with its real cause; the canonical fallback resolves a cast the depsgraph cannot; and
+BSMT's own *Show Source* button reproduces the original failure while *Show Both* clears it.
+
+Regression: 2,525 offline checks across twenty-one suites, plus 45 picking, 98 workflow-UI, 76
+mesh-repair, 35 degenerate-policy, 110 preprocessing and 90 path-visualisation checks in Blender.
+0 failures.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~

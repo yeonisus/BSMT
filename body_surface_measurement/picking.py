@@ -60,20 +60,114 @@ def world_ray(region, rv3d, coord):
     return _view_ray(region, rv3d, coord)
 
 
+#: Why an object cannot be picked on. Reported instead of "nothing under the
+#: cursor", which is what BSMT used to say for every one of these and which
+#: sent the researcher looking for a problem with their aim.
+BLOCKED_NOT_MESH = "is not a mesh object"
+BLOCKED_HELPER = "is a BSMT helper, not a scan"
+BLOCKED_DISABLED = (
+    "is hidden in the viewport, so there is nothing on screen to click. Show "
+    "it again - Scan Preprocessing > Measurement, or the eye and monitor "
+    "icons in the Outliner - and pick on the mesh you can see"
+)
+BLOCKED_NO_GEOMETRY = "has no evaluated geometry to cast against"
+
+
+def pick_blocker(context, obj):
+    """Why a click on `obj` cannot succeed, or "" when it can.
+
+    This exists because "no mesh surface under the cursor" was BSMT's answer
+    to a genuinely different question. An object that is DISABLED in the
+    viewport has no evaluated mesh, so ``Object.ray_cast`` finds nothing -
+    and BSMT's own Source / Measurement buttons set exactly that flag. A
+    measurement mesh sits at the same transform as its source, so the
+    researcher sees a body, clicks on it, and is told their cursor is not
+    over any surface. It is: just not over the one the pick was aimed at.
+
+    The test is `visible_get()`, which is the researcher's question rather
+    than Blender's: can this object be seen and therefore clicked? It covers
+    every way an object leaves the viewport - the eye icon, the monitor icon,
+    a collection hidden in the viewport, and a collection excluded from the
+    view layer.
+
+    Measured on Blender 4.5.13, the underlying states differ in a way no
+    single API flag exposes: `hide_viewport`, a hidden collection and an
+    excluded collection all make ``Object.ray_cast`` RAISE, while
+    `hide_set()` leaves it working - and `evaluated.data` reports a full mesh
+    in all four. So evaluability cannot be probed without attempting a cast.
+    Visibility can, it is the question that actually matters, and refusing on
+    it is the safe direction: a pick on an object nobody can see would record
+    a reference against geometry the researcher never inspected.
+    """
+    if obj is None or getattr(obj, "type", None) != 'MESH':
+        return BLOCKED_NOT_MESH
+    if visualization.is_helper(obj):
+        return BLOCKED_HELPER
+    try:
+        if not obj.visible_get():
+            return BLOCKED_DISABLED
+    except Exception:                                 # pragma: no cover
+        pass
+    return ""
+
+
+def _canonical_ray_cast(context, obj, origin, direction):
+    """Fall back to BSMT's own canonical BVH. Returns (location, normal) or None.
+
+    The canonical mesh is built from the object's geometry in LOCAL space and
+    the cast transforms the world ray in and the hit back out, exactly as the
+    depsgraph path does. It consults no evaluated object, so it still answers
+    when Blender has nothing evaluated to offer - and it is the same BVH the
+    SurfacePoint is built against a moment later, so the two cannot disagree
+    about where the surface is.
+    """
+    from . import geodesic
+    if not geodesic.MESHCACHE_AVAILABLE or geodesic.meshcache is None:
+        return None
+    canonical = geodesic.meshcache.peek_current(obj)
+    if canonical is None:
+        return None
+    result = geodesic.meshcache.ray_cast_local(
+        canonical, obj.matrix_world, origin, direction
+    )
+    if result is None:
+        return None
+    _triangle, _local, world_location, _bary = result
+    from mathutils import Vector
+    location = Vector((float(world_location[0]), float(world_location[1]),
+                       float(world_location[2])))
+    # The normal is not needed by any caller that reaches this path, and
+    # inventing one from the canonical arrays would be a second definition of
+    # a value the depsgraph path gets from Blender. Zero says "not known".
+    return location, Vector((0.0, 0.0, 0.0))
+
+
 def ray_cast_object(context, obj, origin, direction):
     """Cast a world-space ray at ONE object. Returns (location, normal) or None.
 
     ``Object.ray_cast`` works in the object's own local space, so the ray is
     transformed in and the hit transformed back out. The normal uses the
     inverse-transpose so it stays perpendicular under a non-uniform scale.
+
+    A rigid transform - any translation, any rotation - is handled entirely
+    by that inversion and cannot cause a miss; verified on a mesh at
+    (-28570, -2692, -176) rotated (90.1, -2.3, -0.6).
+
+    When the object has no evaluated mesh, BSMT's canonical BVH answers
+    instead, so a momentary depsgraph gap does not read as "nothing there".
     """
-    depsgraph = context.evaluated_depsgraph_get()
-    evaluated = obj.evaluated_get(depsgraph)
-    matrix = evaluated.matrix_world
+    matrix = obj.matrix_world
     try:
         inverse = matrix.inverted()
     except ValueError:
         return None                      # degenerate transform
+
+    evaluated = obj.evaluated_get(context.evaluated_depsgraph_get())
+    matrix = evaluated.matrix_world
+    try:
+        inverse = matrix.inverted()
+    except ValueError:
+        return None
 
     local_origin = inverse @ origin
     local_direction = (inverse.to_3x3() @ direction)
@@ -86,7 +180,7 @@ def ray_cast_object(context, obj, origin, direction):
             local_origin, local_direction
         )
     except (RuntimeError, ValueError):
-        return None
+        return _canonical_ray_cast(context, obj, origin, direction)
     if not hit:
         return None
 
