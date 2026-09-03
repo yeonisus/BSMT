@@ -3510,6 +3510,168 @@ and registers every new operator.
 
 ---
 
+## 11s. Milestone 3.15 — Scan preprocessing v1 (v0.21.0, 2026-09-03)
+
+Milestone 3.3 (v0.11.0) already shipped the non-destructive measurement mesh: the duplicate, the
+target-count decimation, the before/after topology table, the provenance record and the solver
+safety gate. This milestone did not rebuild any of that. It closed the gap that made the workflow
+unsafe for the project's **primary** input format, and gave the result a verdict a researcher can
+read in one line.
+
+### 11s.1 The gap: colour was never checked
+
+The appearance comparison looked at three things — UV layers, materials, image textures. A PLY
+full-body scan typically has **none of them**. Its entire appearance is a per-vertex colour
+attribute, and `compare_texture` had no concept of one. So for the format named first in the
+milestone brief, the check reported:
+
+    ok  the source had no UV layer, so none was expected
+    ok  the source referenced no image texture
+
+...and passed. A copy that had lost its colour would have been called measurement-ready.
+
+`texture_facts` now carries `color_attributes` as (name, domain, data_type) triples, plus the
+active colour and the set of material slots any face actually uses. A lost colour attribute is a
+**FAILURE**, on the same footing as a lost UV layer, and it feeds the NOT READY verdict.
+
+### 11s.2 What Blender actually does, measured
+
+Probed on Blender 4.5.13 before designing anything, because the whole workflow rests on it:
+
+| Data | Survives COLLAPSE decimate + `new_from_object` bake? |
+|---|---|
+| UV layers (multiple) | **Yes** |
+| Colour attributes, POINT / BYTE_COLOR | **Yes**, with interpolated values, not defaults |
+| Colour attributes, POINT / FLOAT_COLOR | **Yes** |
+| Colour attributes, CORNER / BYTE_COLOR | **Yes** |
+| Active / default colour attribute name | **Yes** |
+| Generic float attributes | **Yes** |
+| Material slots | **Yes** |
+| Material *assignments* | **No** — see below |
+| `preserve_all_data_layers=True` | Made **no difference** in any of these cases on 4.5.13 |
+
+Two findings worth recording:
+
+**A material slot outlives the faces that used it.** A sphere with a second material on exactly one
+face, decimated to 2%, kept both slots — but every remaining face referenced slot 0. Slot presence
+is therefore a weaker check than it looks, and `used_materials` distinguishes "the material is
+still there" from "the material is still used". Reported as a note, never as a loss: the appearance
+data is intact and only the assignment is gone.
+
+**`preserve_all_data_layers` bought nothing here.** It is kept anyway — it is documented to matter
+and costs nothing — but the tests do not depend on it.
+
+### 11s.2b A Blender quirk the acceptance test found
+
+Building the scenario-A fixture surfaced something worth writing down, because it looked at first
+like a decimation defect and is not one. A Blender UV sphere is watertight at every ordinary
+density and **is not at very high density**:
+
+| UV sphere | Triangles | Boundary edges |
+|---|---|---|
+| 16 × 8 | 224 | 0 |
+| 64 × 32 | 3,968 | 0 |
+| 256 × 128 | 65,024 | 0 |
+| **1024 × 512** | **1,046,528** | **40** |
+| icosphere, 6 subdivisions | 20,480 | 0 |
+
+Those 40 boundary edges are in the **source**, before any decimation, and the copy inherited 30 of
+them. So the WARNING verdict on scenario A is correct and the diagnostics are doing exactly their
+job — the fixture, not the tool, was the thing that was not clean. The test now asserts the
+property that actually matters (decimation introduced no non-manifold edges and no degenerate
+triangles, and any WARNING is explained by a condition really present in the report) rather than
+asserting a READY verdict a non-watertight input cannot honestly earn.
+
+The practical lesson for the workflow is the same one the panel already gives: **analyse the scan
+before trusting it**. A dense mesh that looks closed on screen may not be.
+
+### 11s.3 The measurement-ready verdict
+
+One line, three states, from the **existing** `topology.analyse()` report. No second definition of
+any diagnostic exists (sect. 0).
+
+| | Conditions |
+|---|---|
+| **NOT READY** | the canonical mesh will not build; no triangles; non-manifold edges > 0; degenerate (zero-area) triangles > 0; appearance data lost |
+| **WARNING** | still above the operational density threshold; connected components > 1; boundary edges > 0 |
+| **MEASUREMENT READY** | none of the above |
+
+`classify_ready` is not the same question as `preflight`. `preflight` decides whether one solve may
+be handed to the native library right now; `classify_ready` decides whether a copy is fit to
+landmark and measure on at all. They cannot contradict each other, because every preflight refusal
+that is about the mesh itself is also a NOT READY condition.
+
+**Components == 1 is deliberately not a rule.** A real scan can legitimately contain more than one
+component — a separate hair cap, a prop, a stray island — and refusing to measure such a scan would
+be wrong. Connectivity is a property of a landmark **pair**, and it is enforced there, per
+measurement, by `solve.validate_points` raising `DISCONNECTED`. A test pins this so the rule cannot
+be tightened by accident.
+
+Degenerate triangles are blocking rather than advisory: a zero-area triangle makes barycentric
+reconstruction ill-defined at the point a landmark lands on one, which is a *wrong* measurement
+rather than a slow one.
+
+### 11s.4 Landmarks are never carried across
+
+A decimated mesh is a different polyhedral surface. A SurfacePoint is a triangle index plus
+barycentric coordinates, so the same numbers name a **different physical point** on the copy.
+Re-projecting one would move a researcher's landmark without telling them, which is worse than
+losing it.
+
+BSMT therefore does neither: nothing is copied, nothing is re-projected, and existing SurfacePoint
+staleness behaviour is untouched. What is new is that preprocessing **counts** the landmarks
+anchored to the source and, if there are any, says so in the report and asks for a re-pick on the
+copy. Preprocessing is best done before landmarking, and the tool now says so rather than assuming
+it.
+
+### 11s.5 Panel
+
+The Scan Preprocessing panel shows object and mesh name, vertices, triangles, connected components,
+boundary edges, non-manifold edges, degenerate triangles, coincident vertices, UV maps, colour
+attributes, materials and image textures.
+
+Topology comes from `scancopy.diagnostics`, which **peeks** at the canonical mesh cache and never
+builds one — a redraw must not cost 1.7 s per million triangles. When the scan has not been
+analysed, the panel says so and offers the **existing** `bsmt.diagnose_topology` operator under the
+label *Analyze Scan*. There is no second diagnostics path.
+
+*Source* / *Measurement* / *Both* replace a single blind toggle. All three are `hide_viewport`
+only: nothing is unlinked, nothing is deleted, every one of them is one click from being undone.
+
+### 11s.6 What is verified
+
+`tests/test_preprocess.py` grew from 107 to 147 offline checks: colour preservation and loss,
+domain and active-colour changes as notes, unused material slots, geometry-only sources, and every
+branch of the readiness classification including the components rule.
+
+`tests/test_preprocess_blender.py` is new and covers the brief's scenarios A-D under real Blender,
+against real datablocks:
+
+| | |
+|---|---|
+| **A** | 1,046,528-triangle sphere → target 350k: copy created, source byte-for-byte unchanged, result within 5% of target, independent mesh datablock, full before/after diagnostics, complete provenance, MEASUREMENT READY |
+| **B** | PLY-shaped mesh (point colours, no UV, no material) → colour attribute survives with its domain, its type and real interpolated values |
+| **C** | Textured OBJ-shaped mesh → UV, material and image reference survive; the material datablock is *shared*, not duplicated; no new image datablock is created |
+| **D** | Non-manifold input → preprocessing is allowed and a copy is produced, the verdict is NOT READY naming non-manifold topology, and the solver gate still refuses |
+| **E** | Target above the current count → copied, not decimated; triangle count identical; method recorded as `COPY_ONLY` |
+| **F** | Deterministic naming: `Twin_BSMT`, `Twin_BSMT.001`, `Twin_BSMT.002`, each with its own mesh datablock |
+| **G** | A landmarked source → the landmark still points at the source, nothing is added, moved or re-projected, and the report asks for a re-pick |
+| **H** | The density threshold, its wording and the solver gate are unchanged |
+| **I** | No repair call of any kind exists in either preprocessing module |
+| **J** | The Scan Preprocessing panel draws in every state — nothing selected, unanalysed, analysed, and each of the three verdicts — offering the existing diagnostics operator rather than a new one |
+
+Regression: 2,282 offline checks across seventeen suites, plus 110 preprocessing and 90
+path-visualisation checks in Blender. 0 failures. The 0.21.0 extension package installs and enables
+on a clean Blender config with every new operator and property registered.
+
+### 11s.7 Scope held
+
+No hole filling, no merge-by-distance, no global weld, no non-manifold repair, no remeshing, no
+smoothing, no texture baking, no alignment change, no export change, no automatic landmark
+detection. Repair is the next milestone, deliberately after this one has been used on real scans.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~Confirmation of Blender 4.5.13's bundled Python version and architecture (Milestone 2.2).~~

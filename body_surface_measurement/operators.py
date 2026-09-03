@@ -3333,6 +3333,22 @@ def _report_preflight(operator, result, label="", object_name=""):
     return " ".join(result["warnings"])
 
 
+def _landmarks_on_object(context, object_name):
+    """How many landmarks are currently anchored to this object.
+
+    Counted, never moved. Preprocessing produces a NEW surface, and a stored
+    triangle index means nothing on it (sect. 10).
+    """
+    collection = state.get_landmarks(context)
+    if not collection:
+        return 0
+    return sum(
+        1 for item in collection
+        if item.surface_point.valid
+        and item.surface_point.source_object == object_name
+    )
+
+
 class BSMT_OT_create_measurement_copy(bpy.types.Operator):
     """Create a lighter TEXTURED measurement copy of the active scan.
 
@@ -3416,6 +3432,23 @@ class BSMT_OT_create_measurement_copy(bpy.types.Operator):
         print("[BSMT] measurement mesh of '%s': %s"
               % (source.name, step["summary"]))
 
+        # sect. 10: landmarks are NEVER transferred to the copy. A decimated
+        # mesh is a different polyhedral surface, so a stored triangle index
+        # and barycentric pair does not name the same point on it - and
+        # re-projecting one would silently move a researcher's landmark. The
+        # honest outcome is to say so and let them re-pick.
+        stranded = _landmarks_on_object(context, source.name)
+        if stranded:
+            warning = (
+                "'%s' already carries %d landmark(s). They are NOT copied to "
+                "the measurement mesh and are not re-projected onto it - "
+                "re-pick them on the copy. Preprocessing is best done before "
+                "landmarking." % (source.name, stranded)
+            )
+            lines.append("")
+            lines.append("!! " + warning)
+            print("[BSMT] warning: %s" % warning)
+
         # --- duplicate, then decimate the COPY ----------------------------
         existing = scancopy.find_measurement_copy(source)
         if existing is not None:
@@ -3493,6 +3526,21 @@ class BSMT_OT_create_measurement_copy(bpy.types.Operator):
             after_report, props.dense_threshold_triangles,
             props.guard_dense_solve,
         )
+
+        # sect. 6: one plain verdict about the COPY, from the same
+        # diagnostics everything else reads. `after_report` is empty only
+        # when the postcheck itself failed, which is exactly the
+        # "canonical mesh could not be built" case.
+        status, reasons = preprocess.classify_ready(
+            after_report,
+            canonical_built=bool(after_report),
+            appearance_ok=texture_ok,
+            appearance_problems=problems,
+            dense_threshold=props.dense_threshold_triangles,
+        )
+        lines.append("")
+        lines.extend(preprocess.ready_lines(status, reasons, limit=6))
+
         lines.append("")
         lines.append("Exact geodesic readiness")
         if gate["allowed"]:
@@ -3505,6 +3553,12 @@ class BSMT_OT_create_measurement_copy(bpy.types.Operator):
         props.preprocess_report = "\n".join(lines)
         props.preprocess_valid = True
         props.preprocess_copy_name = copy.name
+        props.preprocess_status = status
+        props.preprocess_status_detail = reasons[0] if reasons else ""
+        props.preprocess_seconds = float(decimate_seconds)
+        props.preprocess_diagnostic_seconds = float(
+            precheck_seconds + postcheck_seconds
+        )
         print("\n[BSMT] Scan preprocessing\n" + props.preprocess_report + "\n")
 
         if not texture_ok:
@@ -3588,6 +3642,64 @@ class BSMT_OT_toggle_measurement_copy(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _source_and_copy(context):
+    """(source, copy) for the active object's preprocessing pair, or (None, None)."""
+    obj = context.active_object
+    if obj is None or obj.type != 'MESH':
+        return None, None
+    source = scancopy.resolve_source(obj)
+    if source is not None:
+        return source, obj
+    return obj, scancopy.find_measurement_copy(obj)
+
+
+class BSMT_OT_show_scan(bpy.types.Operator):
+    """Show the source scan or its measurement copy, one at a time.
+
+    Visibility only. Neither object is deleted, neither is irreversibly
+    hidden, and the researcher can flip back and forth to compare silhouette,
+    landmark regions and texture registration
+    """
+
+    bl_idname = "bsmt.show_scan"
+    bl_label = "Show"
+    bl_description = ("Show the source scan, its measurement mesh, or both."
+                      " Visibility only - nothing is deleted")
+    bl_options = {'REGISTER'}
+
+    which: EnumProperty(
+        name="Which",
+        items=(
+            ('SOURCE', "Show Source", "Show the original scan"),
+            ('COPY', "Show Measurement Mesh", "Show the measurement mesh"),
+            ('BOTH', "Show Both", "Show both, to compare them directly"),
+        ),
+        default='SOURCE',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        source, copy = _source_and_copy(context)
+        return source is not None and copy is not None
+
+    def execute(self, context):
+        source, copy = _source_and_copy(context)
+        if source is None or copy is None:
+            self.report({'ERROR'}, "BSMT: no source/measurement-copy pair found")
+            return {'CANCELLED'}
+        # hide_viewport only. Nothing is unlinked and nothing is deleted, so
+        # every one of these is one click from being undone (sect. 8).
+        source.hide_viewport = self.which == 'COPY'
+        copy.hide_viewport = self.which == 'SOURCE'
+        shown = {
+            'SOURCE': source.name,
+            'COPY': copy.name,
+            'BOTH': "%s and %s" % (source.name, copy.name),
+        }[self.which]
+        self.report({'INFO'}, "BSMT: showing %s" % shown)
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_preprocess_report(bpy.types.Operator):
     """Clear the preprocessing report. Objects are not touched"""
 
@@ -3602,6 +3714,10 @@ class BSMT_OT_clear_preprocess_report(bpy.types.Operator):
             props.preprocess_report = ""
             props.preprocess_valid = False
             props.preprocess_copy_name = ""
+            props.preprocess_status = ""
+            props.preprocess_status_detail = ""
+            props.preprocess_seconds = 0.0
+            props.preprocess_diagnostic_seconds = 0.0
         return {'FINISHED'}
 
 
@@ -5280,6 +5396,7 @@ classes = (
     BSMT_OT_clear_all_visualizations,
     BSMT_OT_create_measurement_copy,
     BSMT_OT_toggle_measurement_copy,
+    BSMT_OT_show_scan,
     BSMT_OT_clear_preprocess_report,
     BSMT_OT_pick_alignment_reference,
     BSMT_OT_clear_alignment_references,

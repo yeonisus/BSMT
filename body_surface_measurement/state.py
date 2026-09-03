@@ -1101,6 +1101,21 @@ class BSMT_Properties(bpy.types.PropertyGroup):
     preprocess_copy_name: StringProperty(default="")
     preprocess_running: BoolProperty(default=False, options={'SKIP_SAVE'})
 
+    # Milestone 3.15: the measurement-ready verdict for the copy that was
+    # just produced. Stored rather than recomputed on every redraw, because
+    # it is a statement about ONE preprocessing run and must not silently
+    # change underneath the report that explains it.
+    preprocess_status: StringProperty(default="")
+    preprocess_status_detail: StringProperty(default="")
+    preprocess_seconds: FloatProperty(default=0.0)
+    preprocess_diagnostic_seconds: FloatProperty(default=0.0)
+    show_preprocess_detail: BoolProperty(
+        name="Scan Detail",
+        description="Show the full topology and appearance breakdown for the "
+                    "selected scan",
+        default=True,
+    )
+
     dense_threshold_triangles: IntProperty(
         name="Dense Mesh Threshold",
         description="Triangle count above which exact geodesic computation is "

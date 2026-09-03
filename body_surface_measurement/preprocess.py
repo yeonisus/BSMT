@@ -128,23 +128,64 @@ def accuracy_note(actual_triangles, target_triangles, tolerance=0.05):
 # texture and UV preservation
 # ---------------------------------------------------------------------------
 
-def texture_facts(uv_layers, material_slots, images, image_paths):
-    """A comparable record of a mesh's texture-bearing datablocks."""
+def texture_facts(uv_layers, material_slots, images, image_paths,
+                  color_attributes=(), active_color="", used_materials=()):
+    """A comparable record of a mesh's appearance-bearing datablocks.
+
+    `color_attributes` carries (name, domain, data_type) triples. It is what
+    makes this workflow usable on a PLY scan at all: a PLY normally arrives
+    with no UV map, no material and no image, and its entire appearance is a
+    per-vertex colour attribute. A comparison that only looked at UVs and
+    materials would call such a scan "nothing to preserve" and then not
+    notice if the colour vanished.
+
+    `used_materials` is the subset of slots that at least one face actually
+    references AFTER the operation. A slot survives decimation even when every
+    face that used it has been collapsed away (measured on Blender 4.5.13), so
+    slot presence alone is a weaker check than it looks.
+
+    Later parameters are optional so a caller written against the Milestone
+    3.3 signature keeps working.
+    """
     return {
         "uv_layers": [str(name) for name in uv_layers],
         "material_slots": [str(name) for name in material_slots],
         "images": [str(name) for name in images],
         "image_paths": [str(path) for path in image_paths],
+        "color_attributes": [
+            (str(entry[0]), str(entry[1]), str(entry[2]))
+            if isinstance(entry, (tuple, list)) and len(entry) >= 3
+            else (str(entry), "", "")
+            for entry in color_attributes
+        ],
+        "active_color": str(active_color or ""),
+        "used_materials": [str(name) for name in used_materials],
     }
+
+
+def color_attribute_names(facts):
+    """Just the colour attribute names, in order."""
+    return [entry[0] for entry in facts.get("color_attributes", ())]
+
+
+def has_appearance_data(facts):
+    """Whether a mesh carries anything that shows what the scan looks like."""
+    return bool(facts.get("uv_layers") or facts.get("color_attributes")
+                or facts.get("images"))
 
 
 def compare_texture(before, after):
     """Did the copy keep everything the original had? (ok, problems, notes).
 
-    A lost UV layer or a dropped material means the copy cannot show the scan's
-    texture, which is the whole point of this workflow. That is a FAILURE, not
-    a warning: a measurement copy the researcher cannot visually register
-    against the original is not measurement-ready (sect. 4).
+    A lost UV layer, a dropped material, a dropped image reference or a lost
+    COLOR ATTRIBUTE means the copy cannot show the scan's appearance, which is
+    the whole point of this workflow. That is a FAILURE, not a warning: a
+    measurement copy the researcher cannot visually register against the
+    original is not measurement-ready (sect. 4).
+
+    Not every difference is a loss. A changed colour domain, a changed active
+    colour, and a material slot no longer referenced by any face are all
+    reported as notes - the appearance data is still there.
     """
     problems = []
     notes = []
@@ -174,10 +215,56 @@ def compare_texture(before, after):
         notes.append("image texture(s) preserved: %s"
                      % ", ".join(after["images"]))
 
+    # --- colour attributes (PLY scans live or die on these) --------------
+    before_colors = {name: (domain, kind)
+                     for name, domain, kind in before.get("color_attributes", ())}
+    after_colors = {name: (domain, kind)
+                    for name, domain, kind in after.get("color_attributes", ())}
+    missing_color = [name for name in before_colors if name not in after_colors]
+    if missing_color:
+        problems.append("color attribute(s) lost: %s"
+                        % ", ".join(sorted(missing_color)))
+    elif before_colors:
+        notes.append("color attribute(s) preserved: %s"
+                     % ", ".join(sorted(after_colors)))
+
+    # A surviving name whose domain or type changed is NOT a loss - the colour
+    # is still there - but it is worth saying, because a POINT attribute that
+    # became CORNER will export differently.
+    for name, signature in before_colors.items():
+        if name in after_colors and after_colors[name] != signature:
+            notes.append(
+                "color attribute '%s' changed from %s/%s to %s/%s"
+                % (name, signature[0], signature[1],
+                   after_colors[name][0], after_colors[name][1])
+            )
+
+    before_active = before.get("active_color", "")
+    after_active = after.get("active_color", "")
+    if before_active and after_active != before_active:
+        notes.append("the active color attribute changed from '%s' to '%s'"
+                     % (before_active, after_active or "none"))
+
+    # A material slot survives decimation even when every face that used it
+    # has been collapsed away. Reported as a note, never as a loss: the
+    # appearance data is intact and only the assignment is gone.
+    used_after = set(after.get("used_materials", ()))
+    if used_after:
+        unused = [name for name in after["material_slots"]
+                  if name not in used_after]
+        if unused:
+            notes.append("material slot(s) no longer used by any face: %s"
+                         % ", ".join(unused))
+
     if not before["uv_layers"]:
         notes.append("the source had no UV layer, so none was expected")
     if not before["images"]:
         notes.append("the source referenced no image texture")
+    if not before_colors:
+        notes.append("the source had no color attribute")
+    if not has_appearance_data(before):
+        notes.append("the source carried no appearance data at all - "
+                     "the copy shows geometry only")
 
     return (not problems), problems, notes
 
@@ -195,6 +282,15 @@ REFUSE_DENSE = (
     "threshold. Create a measurement mesh first, or untick the density guard "
     "to proceed anyway."
 )
+#: What to do about a scan above the density threshold. One string, so the
+#: panel, the report and the test all quote the same advice - and so the
+#: project's single vocabulary ("measurement mesh", never "measurement copy")
+#: is applied to it in one place.
+DENSE_SCAN_ADVICE = (
+    "High-density scan. Create a measurement mesh before exact surface-path "
+    "computation."
+)
+
 WARN_DENSE = (
     "High-density mesh: exact geodesic computation may be slow or unstable. "
     "Create a measurement mesh first. (%s triangles, threshold %s.)"
@@ -266,6 +362,113 @@ def preflight(report, dense_threshold=DEFAULT_DENSE_THRESHOLD,
         "boundary_edge_count": boundary,
         "message": " ".join(refusals) if refusals else " ".join(warnings),
     }
+
+
+# ---------------------------------------------------------------------------
+# measurement-ready classification (Milestone 3.15)
+# ---------------------------------------------------------------------------
+#
+# Three states, deliberately conservative, and deliberately NOT the same
+# question as `preflight`. `preflight` decides whether a single solve may be
+# handed to the native library right now. This decides whether a measurement
+# copy is fit to landmark and measure on at all, which is what the researcher
+# is looking at immediately after preprocessing.
+#
+# The two can never contradict each other, because NOT_READY includes every
+# preflight refusal that is about the mesh itself.
+
+MEASUREMENT_READY = 'READY'
+MEASUREMENT_WARNING = 'WARNING'
+MEASUREMENT_NOT_READY = 'NOT_READY'
+
+READY_LABELS = {
+    MEASUREMENT_READY: "MEASUREMENT READY",
+    MEASUREMENT_WARNING: "WARNING",
+    MEASUREMENT_NOT_READY: "NOT READY",
+}
+
+#: Order matters: the first reason is the one the compact line shows.
+_READY_ORDER = (MEASUREMENT_NOT_READY, MEASUREMENT_WARNING, MEASUREMENT_READY)
+
+
+def classify_ready(report, canonical_built=True, appearance_ok=True,
+                   appearance_problems=(), dense_threshold=DEFAULT_DENSE_THRESHOLD):
+    """Is this mesh fit to landmark and measure on? (state, reasons).
+
+    `report` is a geodesic.topology.analyse() summary - the SAME diagnostics
+    every other panel reads, never a second definition of them (sect. 5).
+    `canonical_built` says whether the canonical mesh could be constructed at
+    all, which is the one condition that makes everything else moot.
+
+    Deliberately NOT a rule: connected components == 1. A real scan can
+    legitimately contain more than one component - a separate hair cap, a
+    prop, a stray island - and refusing to measure such a scan would be wrong.
+    Connectivity is a property of a landmark PAIR, and it is enforced there,
+    per-measurement, by the solver's own validation (sect. 6).
+    """
+    blocking = []
+    warnings = []
+
+    if not canonical_built:
+        blocking.append("the canonical mesh could not be built from this "
+                        "geometry, so nothing can be measured on it")
+        return MEASUREMENT_NOT_READY, blocking
+
+    non_manifold = int(report.get("nonmanifold_edge_count", 0) or 0)
+    triangles = int(report.get("triangle_count", 0) or 0)
+    components = int(report.get("component_count", 0) or 0)
+    boundary = int(report.get("boundary_edge_count", 0) or 0)
+    degenerate = int(report.get("degenerate_triangle_count", 0) or 0)
+
+    if triangles <= 0:
+        blocking.append("the mesh has no triangles")
+    if non_manifold > 0:
+        blocking.append(
+            "%d non-manifold edge(s). The exact solver has crashed Blender on "
+            "non-manifold input, so it is refused outright" % non_manifold
+        )
+    if degenerate > 0:
+        # Zero-area triangles make barycentric reconstruction ill-defined at
+        # the point a landmark lands on one, which is a wrong measurement
+        # rather than a slow one.
+        blocking.append("%d degenerate (zero-area) triangle(s)" % degenerate)
+    if not appearance_ok:
+        blocking.extend(str(problem) for problem in appearance_problems)
+
+    if blocking:
+        return MEASUREMENT_NOT_READY, blocking
+
+    if triangles > int(dense_threshold):
+        warnings.append(
+            "%s triangles is above the %s operational threshold. Exact "
+            "surface paths will be slow, and are guarded"
+            % (_thousands(triangles), _thousands(dense_threshold))
+        )
+    if components > 1:
+        warnings.append(
+            "%d connected components. Measuring is allowed; a landmark pair "
+            "on two different components is refused individually" % components
+        )
+    if boundary > 0:
+        warnings.append(
+            "%d boundary edge(s). A geodesic near a hole or a cropped edge "
+            "can take a plausible-looking detour" % boundary
+        )
+
+    if warnings:
+        return MEASUREMENT_WARNING, warnings
+    return MEASUREMENT_READY, []
+
+
+def ready_lines(state, reasons, limit=4):
+    """The classification as displayable lines, worst reason first."""
+    lines = ["Status: %s" % READY_LABELS.get(state, state)]
+    for reason in list(reasons)[:int(limit)]:
+        lines.append("  - %s" % reason)
+    remaining = len(list(reasons)) - int(limit)
+    if remaining > 0:
+        lines.append("  - and %d more" % remaining)
+    return lines
 
 
 # ---------------------------------------------------------------------------

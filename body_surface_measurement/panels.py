@@ -1522,43 +1522,7 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
         if info is None:
             box.label(text="Select a mesh scan to preprocess", icon='INFO')
         else:
-            column = box.column(align=True)
-            column.scale_y = 0.75
-            column.label(text="Selected: %s" % info["name"])
-            column.label(text="Vertices:  {:,}".format(info["vertex_count"]))
-            column.label(text="Triangles: {:,}".format(info["triangle_count"]))
-            column.label(
-                text="UV map: %s" % (", ".join(info["uv_layers"])
-                                     if info["has_uv"] else "NONE"),
-                icon='CHECKMARK' if info["has_uv"] else 'ERROR',
-            )
-            column.label(
-                text="Materials: %s" % (", ".join(info["material_slots"])
-                                        if info["has_material"] else "NONE"),
-                icon='CHECKMARK' if info["has_material"] else 'ERROR',
-            )
-            column.label(
-                text="Image texture: %s" % (", ".join(info["images"])
-                                            if info["has_image"] else "NONE"),
-                icon='CHECKMARK' if info["has_image"] else 'ERROR',
-            )
-            provenance = getattr(obj, "bsmt_scan", None)
-            if provenance is not None and provenance.is_measurement_copy:
-                column.separator()
-                column.label(text="This is a measurement mesh", icon='DUPLICATE')
-                column.label(text="Source Mesh: %s" % provenance.source_name)
-                column.label(text=provenance.representation
-                                  or preprocess.REPRESENTATION)
-
-            if info["triangle_count"] > props.dense_threshold_triangles:
-                warn = box.column(align=True)
-                warn.scale_y = 0.75
-                warn.alert = True
-                for line in _wrap(preprocess.WARN_DENSE % (
-                    "{:,}".format(info["triangle_count"]),
-                    "{:,}".format(props.dense_threshold_triangles)), 44
-                ):
-                    warn.label(text=line)
+            self._draw_scan_facts(box, props, obj, info)
 
         layout.prop(props, "preprocess_preset", text="Preset")
         layout.prop(props, "preprocess_target_triangles", text="Target")
@@ -1575,7 +1539,24 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
                 pass
 
         layout.operator("bsmt.create_measurement_copy", icon='MOD_DECIM')
-        layout.operator("bsmt.toggle_measurement_copy", icon='HIDE_OFF')
+
+        # sect. 8: comparing the source with its copy is how a researcher
+        # checks silhouette, landmark regions and texture registration. Three
+        # explicit choices, all of them visibility only and all reversible.
+        source, copy = None, None
+        if obj is not None and obj.type == 'MESH':
+            source = scancopy.resolve_source(obj)
+            copy = obj if source is not None else scancopy.find_measurement_copy(obj)
+            if source is None:
+                source = obj if copy is not None else None
+        compare = layout.row(align=True)
+        compare.enabled = source is not None and copy is not None
+        compare.operator("bsmt.show_scan", text="Source",
+                         icon='MESH_DATA').which = 'SOURCE'
+        compare.operator("bsmt.show_scan", text="Measurement",
+                         icon='DUPLICATE').which = 'COPY'
+        compare.operator("bsmt.show_scan", text="Both",
+                         icon='OVERLAY').which = 'BOTH'
 
         safety = layout.box()
         safety.label(text="Solver Safety Gate")
@@ -1586,6 +1567,34 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
         note.enabled = False
         note.label(text="A non-manifold mesh is always refused,")
         note.label(text="whatever this threshold is set to.")
+
+        if props.preprocess_valid and props.preprocess_status:
+            verdict = layout.box()
+            state_name = props.preprocess_status
+            label = preprocess.READY_LABELS.get(state_name, state_name)
+            row = verdict.row()
+            row.alert = state_name != preprocess.MEASUREMENT_READY
+            row.label(
+                text="Measurement Mesh: %s" % label,
+                icon={
+                    preprocess.MEASUREMENT_READY: 'CHECKMARK',
+                    preprocess.MEASUREMENT_WARNING: 'ERROR',
+                }.get(state_name, 'CANCEL'),
+            )
+            if props.preprocess_status_detail:
+                detail = verdict.column(align=True)
+                detail.scale_y = 0.7
+                detail.enabled = False
+                for line in _wrap(props.preprocess_status_detail, 44):
+                    detail.label(text=line)
+            if props.preprocess_seconds or props.preprocess_diagnostic_seconds:
+                timing_row = verdict.column(align=True)
+                timing_row.scale_y = 0.7
+                timing_row.enabled = False
+                timing_row.label(text="Decimation:  %.2f s"
+                                      % props.preprocess_seconds)
+                timing_row.label(text="Diagnostics: %.2f s"
+                                      % props.preprocess_diagnostic_seconds)
 
         if props.preprocess_valid and props.preprocess_report:
             layout.separator()
@@ -1599,6 +1608,101 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
                     column.label(text=line)
                 else:
                     column.separator()
+
+
+    @staticmethod
+    def _draw_scan_facts(box, props, obj, info):
+        """Everything known about the selected scan, in one block.
+
+        The topology numbers come from the EXISTING diagnostics via
+        `scancopy.diagnostics`, which peeks at the canonical mesh cache and
+        never builds one - a panel redraw must not cost 1.7 s per million
+        triangles. A scan that has not been analysed says so and offers the
+        existing Analyze Topology operator rather than a second one.
+        """
+        column = box.column(align=True)
+        column.scale_y = 0.75
+        column.label(text="Selected: %s" % info["name"])
+        column.label(text="Mesh:      %s" % info["mesh_name"])
+        column.label(text="Vertices:  {:,}".format(info["vertex_count"]))
+        column.label(text="Triangles: {:,}".format(info["triangle_count"]))
+
+        topology = box.column(align=True)
+        topology.scale_y = 0.75
+        if info["analysed"]:
+            topology.label(text="Components:         %d"
+                                % info["component_count"])
+            topology.label(text="Boundary edges:     {:,}".format(
+                info["boundary_edge_count"]))
+            row = topology.row()
+            row.alert = info["nonmanifold_edge_count"] > 0
+            row.label(text="Non-manifold edges: {:,}".format(
+                info["nonmanifold_edge_count"]))
+            row = topology.row()
+            row.alert = info["degenerate_triangle_count"] > 0
+            row.label(text="Degenerate tris:    {:,}".format(
+                info["degenerate_triangle_count"]))
+            topology.label(text="Coincident verts:   {:,}".format(
+                info["duplicate_vertex_count"]))
+        else:
+            topology.label(text="Topology not analyzed yet.", icon='INFO')
+        # The existing Analyze Topology operator, surfaced here. There is
+        # deliberately no second diagnostics path (sect. 0).
+        box.operator("bsmt.diagnose_topology", text="Analyze Scan",
+                     icon='VIEWZOOM')
+
+        appearance = box.column(align=True)
+        appearance.scale_y = 0.75
+        appearance.label(
+            text="UV map: %s" % (", ".join(info["uv_layers"])
+                                 if info["has_uv"] else "NONE"),
+            icon='CHECKMARK' if info["has_uv"] else 'DOT',
+        )
+        appearance.label(
+            text="Color attr: %s" % (", ".join(info["color_attribute_names"])
+                                     if info["has_color"] else "NONE"),
+            icon='CHECKMARK' if info["has_color"] else 'DOT',
+        )
+        appearance.label(
+            text="Materials: %s" % (", ".join(info["material_slots"])
+                                    if info["has_material"] else "NONE"),
+            icon='CHECKMARK' if info["has_material"] else 'DOT',
+        )
+        appearance.label(
+            text="Image texture: %s" % (", ".join(info["images"])
+                                        if info["has_image"] else "NONE"),
+            icon='CHECKMARK' if info["has_image"] else 'DOT',
+        )
+        if not (info["has_uv"] or info["has_color"] or info["has_image"]):
+            note = box.column(align=True)
+            note.scale_y = 0.7
+            note.enabled = False
+            for line in _wrap("This scan carries no appearance data, so the "
+                              "copy will show geometry only. That is not an "
+                              "error - some scans are geometry only.", 44):
+                note.label(text=line)
+
+        provenance = getattr(obj, "bsmt_scan", None)
+        if provenance is not None and provenance.is_measurement_copy:
+            made = box.column(align=True)
+            made.scale_y = 0.75
+            made.label(text="This is a measurement mesh", icon='DUPLICATE')
+            made.label(text="Source Mesh: %s" % provenance.source_name)
+            made.label(text=provenance.representation
+                            or preprocess.REPRESENTATION)
+
+        if info["triangle_count"] > props.dense_threshold_triangles:
+            warn = box.column(align=True)
+            warn.scale_y = 0.75
+            warn.alert = True
+            for line in _wrap(
+                preprocess.DENSE_SCAN_ADVICE
+                + " ({:,} triangles, operational threshold {:,} -"
+                  " not a mathematical limit.)".format(
+                    info["triangle_count"],
+                    props.dense_threshold_triangles), 44
+            ):
+                warn.label(text=line)
 
 
 class BSMT_UL_boundary_loops(bpy.types.UIList):

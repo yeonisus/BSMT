@@ -4,6 +4,66 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.21.0 — scan preprocessing v1
+
+Builds on the preprocessing shipped in 0.11.0 rather than replacing it. The
+non-destructive copy, target-count decimation, the before/after topology table
+and the provenance record were already there and are unchanged; what was
+missing was everything to do with **colour**, and a plain verdict.
+
+- **Colour attributes are now recorded, carried and verified.** This was the
+  real gap: a PLY scan normally arrives with no UV map, no material and no
+  image, and its entire appearance is a per-vertex colour attribute. The old
+  comparison looked only at UV layers, materials and image textures, so it
+  would have called such a scan "nothing to preserve" and reported a copy that
+  had lost its colour as measurement-ready. A lost colour attribute is now a
+  preprocessing FAILURE, exactly like a lost UV layer.
+- A changed colour **domain** or a changed **active** colour attribute is
+  reported as a note rather than a failure — the colour is still there.
+- **A material slot that no face uses any more is reported.** Measured on
+  Blender 4.5.13: a slot survives collapse decimation even when every face
+  that referenced it has been collapsed away, so slot presence alone is a
+  weaker check than it looks.
+- **New: a one-line measurement-ready verdict** — `MEASUREMENT READY`,
+  `WARNING` or `NOT READY` — computed from the existing topology diagnostics,
+  never from a second definition of them. NOT READY for non-manifold edges,
+  degenerate triangles, a canonical mesh that will not build, or lost
+  appearance data. WARNING for several components, boundary edges, or a copy
+  still above the density threshold. **Several connected components is
+  deliberately not a blocker**: a real scan can legitimately contain more than
+  one, and connectivity is a property of a landmark *pair*, enforced
+  per-measurement by the solver's own validation.
+- **The Scan Preprocessing panel now shows the whole picture**: mesh name,
+  vertices, triangles, connected components, boundary edges, non-manifold
+  edges, degenerate triangles, coincident vertices, UV maps, colour
+  attributes, materials and image textures — plus an *Analyze Scan* button
+  when the scan has not been analysed yet. The topology numbers are read from
+  the cached canonical mesh and never build one, so a redraw cannot cost
+  seconds on a dense scan.
+- **Explicit *Source* / *Measurement* / *Both* visibility buttons**, replacing
+  a single blind toggle, so silhouette, landmark regions and texture or colour
+  registration can be compared directly. Visibility only; nothing is deleted
+  or irreversibly hidden.
+- **Preprocessing now warns when the source already carries landmarks.** They
+  are never copied to the measurement mesh and never re-projected onto it — a
+  decimated mesh is a different polyhedral surface, so a stored triangle index
+  does not name the same point, and re-projecting one would move a
+  researcher's landmark silently. The report says so and asks for a re-pick.
+- Decimation and diagnostic elapsed times are recorded and shown.
+- The density threshold message now names it as operational, not mathematical,
+  and says what to do about it. The solver safety gate itself is unchanged.
+- Still no repair of any kind: no welding, no merge-by-distance, no hole
+  filling, no remeshing, no smoothing. Asserted by test.
+- Found while building the acceptance fixtures, and worth knowing: a Blender
+  UV sphere is watertight at 224, 3,968 and 65,024 triangles but reports **40
+  boundary edges at 1,046,528** — in the source mesh, before any decimation.
+  Collapse decimation did not open it further (40 → 30). Analyze the scan
+  before trusting it; a dense mesh that looks closed on screen may not be.
+- Tests: `tests/test_preprocess.py` grows from 107 to 147 offline checks, and
+  the new `tests/test_preprocess_blender.py` adds 110 checks under real
+  Blender covering scenarios A–D plus naming, provenance, landmark isolation
+  and panel draw. 2,282 offline checks in total, 0 failures.
+
 ## 0.20.0 — measurement path cache
 
 - **Fixed the real cause of slow measurement lines on large scans.** The

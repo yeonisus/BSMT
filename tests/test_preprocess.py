@@ -339,6 +339,179 @@ def test_comparison_table():
     check("non-manifold edges are shown for both", "Non-manifold edges" in text)
 
 
+# ---------------------------------------------------------------------------
+# colour attributes (Milestone 3.15) - a PLY scan's whole appearance
+# ---------------------------------------------------------------------------
+
+def colored(colors=(("Col", "POINT", "BYTE_COLOR"),), active="Col",
+            uv=(), materials=(), images=(), paths=(), used=()):
+    """A PLY-shaped source: point colours, no UV, no material, no image."""
+    return preprocess.texture_facts(uv, materials, images, paths,
+                                    color_attributes=colors,
+                                    active_color=active, used_materials=used)
+
+
+def test_color_attribute_preserved():
+    print("\n[color] a colour attribute that survives passes")
+    ok, problems, notes = preprocess.compare_texture(colored(), colored())
+    check("identical colour facts pass", ok, str(problems))
+    check("and the colour is reported as preserved",
+          any("color attribute(s) preserved" in note for note in notes),
+          str(notes))
+    check("a PLY-shaped source is not reported as untextured-and-fine only",
+          preprocess.has_appearance_data(colored()))
+    check("names are readable back out",
+          preprocess.color_attribute_names(colored()) == ["Col"])
+
+
+def test_color_attribute_loss_is_a_failure():
+    print("\n[color] losing the colour attribute FAILS preprocessing")
+    ok, problems, _notes = preprocess.compare_texture(
+        colored(), colored(colors=(), active=""))
+    check("a lost colour attribute fails", not ok)
+    check("and names it", "Col" in problems[0], problems[0])
+
+    # The case that matters: a PLY scan has nothing BUT colour, so the old
+    # UV/material/image comparison would have passed it happily.
+    before = colored()
+    after = colored(colors=())
+    ok, _problems, _notes = preprocess.compare_texture(before, after)
+    check("a colour-only source cannot lose its colour silently", not ok)
+
+
+def test_color_attribute_changes_are_notes_not_failures():
+    print("\n[color] a changed domain or active colour is a note, not a loss")
+    ok, problems, notes = preprocess.compare_texture(
+        colored(), colored(colors=(("Col", "CORNER", "BYTE_COLOR"),)))
+    check("a changed domain is not a failure", ok, str(problems))
+    check("but it is reported",
+          any("changed from POINT" in note for note in notes), str(notes))
+
+    ok, _problems, notes = preprocess.compare_texture(
+        colored(colors=(("Col", "POINT", "BYTE_COLOR"),
+                        ("Col2", "POINT", "BYTE_COLOR")), active="Col"),
+        colored(colors=(("Col", "POINT", "BYTE_COLOR"),
+                        ("Col2", "POINT", "BYTE_COLOR")), active="Col2"))
+    check("a changed active colour is not a failure", ok)
+    check("but it is reported",
+          any("active color attribute changed" in note for note in notes),
+          str(notes))
+
+
+def test_unused_material_slot_is_a_note():
+    print("\n[color] a slot no face uses any more is reported, not failed")
+    before = preprocess.texture_facts(("UVMap",), ("Body", "Patch"), (), (),
+                                      used_materials=("Body", "Patch"))
+    after = preprocess.texture_facts(("UVMap",), ("Body", "Patch"), (), (),
+                                     used_materials=("Body",))
+    ok, problems, notes = preprocess.compare_texture(before, after)
+    check("the slot surviving unused is not a failure", ok, str(problems))
+    check("but it is named",
+          any("no longer used by any face" in note and "Patch" in note
+              for note in notes), str(notes))
+
+
+def test_geometry_only_source():
+    print("\n[color] a source with no appearance data at all is honest")
+    bare = preprocess.texture_facts((), (), (), ())
+    check("has_appearance_data is False",
+          not preprocess.has_appearance_data(bare))
+    ok, _problems, notes = preprocess.compare_texture(bare, bare)
+    check("and it is not a failure", ok)
+    check("and the copy is described as geometry only",
+          any("geometry only" in note for note in notes), str(notes))
+
+
+# ---------------------------------------------------------------------------
+# measurement-ready classification (Milestone 3.15)
+# ---------------------------------------------------------------------------
+
+def test_ready_classification():
+    print("\n[ready] a clean copy is MEASUREMENT READY")
+    state, reasons = preprocess.classify_ready(report())
+    check("clean is READY", state == preprocess.MEASUREMENT_READY, state)
+    check("with no reasons", reasons == [], str(reasons))
+    check("and a human label exists",
+          preprocess.READY_LABELS[state] == "MEASUREMENT READY")
+
+
+def test_ready_not_ready_rules():
+    print("\n[ready] the blocking conditions")
+    state, reasons = preprocess.classify_ready(report(nonmanifold_edge_count=4))
+    check("non-manifold is NOT READY",
+          state == preprocess.MEASUREMENT_NOT_READY, state)
+    check("and says why", "non-manifold" in reasons[0], reasons[0])
+
+    state, reasons = preprocess.classify_ready(
+        report(degenerate_triangle_count=3))
+    check("degenerate triangles are NOT READY",
+          state == preprocess.MEASUREMENT_NOT_READY, state)
+
+    state, reasons = preprocess.classify_ready(report(), canonical_built=False)
+    check("a mesh whose canonical form will not build is NOT READY",
+          state == preprocess.MEASUREMENT_NOT_READY, state)
+    check("and that is the only reason given", len(reasons) == 1, str(reasons))
+
+    state, reasons = preprocess.classify_ready(
+        report(), appearance_ok=False,
+        appearance_problems=["UV layer(s) lost: UVMap"])
+    check("lost appearance data is NOT READY",
+          state == preprocess.MEASUREMENT_NOT_READY, state)
+    check("and the appearance problem is carried through",
+          "UVMap" in reasons[0], reasons[0])
+
+    state, _reasons = preprocess.classify_ready(report(triangle_count=0))
+    check("a mesh with no triangles is NOT READY",
+          state == preprocess.MEASUREMENT_NOT_READY, state)
+
+
+def test_ready_warning_rules():
+    print("\n[ready] the non-blocking conditions")
+    state, reasons = preprocess.classify_ready(report(component_count=3))
+    check("several components is a WARNING, never a refusal",
+          state == preprocess.MEASUREMENT_WARNING, state)
+    check("and it explains the per-pair rule",
+          "refused individually" in reasons[0], reasons[0])
+
+    state, reasons = preprocess.classify_ready(report(boundary_edge_count=120))
+    check("boundary edges are a WARNING",
+          state == preprocess.MEASUREMENT_WARNING, state)
+
+    state, reasons = preprocess.classify_ready(
+        report(triangle_count=2000000), dense_threshold=1000000)
+    check("staying above the density threshold is a WARNING",
+          state == preprocess.MEASUREMENT_WARNING, state)
+    check("and it is named operational, not mathematical",
+          "operational" in reasons[0], reasons[0])
+
+
+def test_components_never_block_readiness():
+    print("\n[ready] sect. 6: components == 1 is NOT required")
+    for count in (2, 5, 50):
+        state, _reasons = preprocess.classify_ready(
+            report(component_count=count))
+        check("%d components is not NOT_READY" % count,
+              state != preprocess.MEASUREMENT_NOT_READY, state)
+    text = open(os.path.join(PACKAGE, "preprocess.py")).read()
+    check("and the reason is documented",
+          "Deliberately NOT a rule" in text)
+    check("naming where connectivity IS enforced",
+          "property of a landmark PAIR" in text)
+
+
+def test_ready_lines():
+    print("\n[ready] the verdict renders")
+    state, reasons = preprocess.classify_ready(
+        report(component_count=2, boundary_edge_count=8))
+    lines = preprocess.ready_lines(state, reasons)
+    check("the first line is the verdict", lines[0] == "Status: WARNING",
+          lines[0])
+    check("every reason is listed", len(lines) == 1 + len(reasons), str(lines))
+    trimmed = preprocess.ready_lines(state, ["a", "b", "c", "d", "e"], limit=2)
+    check("and a long list is trimmed with a count",
+          trimmed[-1] == "  - and 3 more", str(trimmed))
+
+
 def test_no_welding_or_hole_filling_anywhere():
     print("\n[scope] nothing welds or fills holes")
     for name in ("preprocess.py", "scancopy.py"):
@@ -354,7 +527,7 @@ def test_no_welding_or_hole_filling_anywhere():
 
 
 def main():
-    print("BSMT Milestone 3.3 - preprocessing and safety gate tests")
+    print("BSMT preprocessing tests - Milestones 3.3 and 3.15")
     print("  python : %s" % sys.version.split()[0])
     for test in (
         test_target_count_to_ratio,
@@ -364,6 +537,16 @@ def main():
         test_texture_preserved,
         test_texture_loss_is_a_failure,
         test_texture_absent_in_source,
+        test_color_attribute_preserved,
+        test_color_attribute_loss_is_a_failure,
+        test_color_attribute_changes_are_notes_not_failures,
+        test_unused_material_slot_is_a_note,
+        test_geometry_only_source,
+        test_ready_classification,
+        test_ready_not_ready_rules,
+        test_ready_warning_rules,
+        test_components_never_block_readiness,
+        test_ready_lines,
         test_gate_refuses_non_manifold,
         test_gate_density_threshold,
         test_gate_warns_without_refusing,

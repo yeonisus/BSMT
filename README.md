@@ -17,7 +17,7 @@ the caveats in [Limitations](#limitations).
 | Stage | What happens |
 |---|---|
 | **Import** | A textured OBJ (with MTL and image) or a PLY with vertex colors |
-| **Scan Preprocessing** | Builds a lighter, still-textured *measurement mesh*. The source scan is never modified |
+| **Scan Preprocessing** | Analyzes a scan, then builds a lighter *measurement mesh* at a target triangle count. UV maps, colour attributes, materials and image textures are carried across and verified; the source scan is never modified |
 | **Mesh Repair** | Finds and conservatively repairs non-manifold edges and small holes, one region at a time, reverting anything that does not improve the topology |
 | **Alignment** | Rigidly aligns the scan to an anatomical frame, by hand or from four reference points. Object transform only — no vertex is moved |
 | **Landmarks** | Named points picked on the surface, stored as triangle + barycentric coordinates rather than as an XYZ, so they survive any rigid transform |
@@ -50,18 +50,36 @@ No Terminal or PowerShell is needed.
 
 ## Typical workflow
 
-1. Import the scan.
-2. **Scan Preprocessing** → *Create Measurement Mesh*. Work on the copy from
-   here on; the panel names which mesh a measurement belongs to.
-3. **Mesh Repair** → *Analyze Mesh*, then *Repair Local Defects* if the
-   readiness line reports non-manifold edges.
-4. **Alignment** → align the scan, if the study needs a common frame.
-5. **Landmark Manager** → add landmarks, pick each one on the surface.
-6. **Measurement Manager** → *Add Measurement*, choose From and To, then
+1. Import the scan (PLY, textured OBJ, or whatever your scanner writes).
+2. **Scan Preprocessing** → *Analyze Scan*. Read the vertex and triangle
+   counts, the connected components, the boundary and non-manifold edge
+   counts, and which appearance data the scan carries — UV maps, colour
+   attributes, materials, image textures.
+3. **Scan Preprocessing** → *Create Measurement Mesh*. Pick a target triangle
+   count first (High 500k / Standard 350k / Light 200k, or type your own).
+4. Review the result: the before → after topology table, the appearance
+   checks, and the one-line verdict — `MEASUREMENT READY`, `WARNING` or
+   `NOT READY`. Use *Source* / *Measurement* / *Both* to compare the two by
+   eye: silhouette, landmark regions, texture and colour registration.
+5. **Mesh Repair** → *Analyze Mesh*, then *Repair Local Defects* if the
+   verdict reports non-manifold edges.
+6. **Alignment** → align the scan, if the study needs a common frame.
+7. **Landmark Manager** → add landmarks, pick each one on the surface.
+   **Do this on the measurement mesh**, after preprocessing — see below.
+8. **Measurement Manager** → *Add Measurement*, choose From and To, then
    *Calculate All*.
-7. **Session and Export** → fill in Subject ID / Condition / Scan ID, then
-   *Measurements CSV* and *Landmarks CSV*.
-8. *Save Protocol* once, and load it for every later subject.
+9. **Surface paths only when you need one.** They are computed on request and
+   then cached, so showing, hiding or restyling one never re-solves.
+10. **Session and Export** → fill in Subject ID / Condition / Scan ID, then
+    *Measurements CSV* and *Landmarks CSV*.
+11. *Save Protocol* once, and load it for every later subject.
+
+**Preprocess before you landmark.** A decimated mesh is a different polyhedral
+surface, so a landmark's stored triangle and barycentric coordinates do not
+name the same point on it. BSMT therefore never copies landmarks onto a
+measurement mesh and never re-projects them — doing either would move a
+researcher's landmark silently. If the source already carries landmarks, the
+preprocessing report says so and asks you to re-pick them on the copy.
 
 The top of the sidebar shows a single readiness line — `READY FOR MEASUREMENT`
 or `NOT READY: <reason>` — which is the fastest way to find out what is
@@ -70,9 +88,22 @@ missing.
 ## Limitations
 
 - **The measurement mesh is a representation, not the scan.** Decimation
-  changes the polyhedral surface, so a surface distance on the copy is not
-  identical to one on the original. The triangle counts and the method are
-  recorded in every export.
+  changes the polyhedral surface representation. The measurement copy is not
+  mathematically identical to the source mesh, so a surface distance on the
+  copy is not identical to one on the original. The triangle counts, the
+  ratio and the method are recorded on the copy and in every export.
+- **The source scan is never modified.** Preprocessing runs entirely on a
+  duplicate object with its own mesh datablock, and the operator verifies the
+  source's counts and mesh name afterwards rather than merely promising it.
+- **Preprocessing does not repair anything.** It decimates and copies. No
+  welding, no merge-by-distance, no hole filling, no remeshing, no smoothing.
+  On a human scan those silently fuse anatomically distinct surfaces that
+  happen to touch — arm to torso, finger to finger, garment to skin — and a
+  fused surface produces a confidently wrong, systematically short geodesic.
+- **The 1,000,000-triangle density limit is operational, not mathematical.**
+  It is where the exact solver becomes slow and has been observed to be
+  unstable on real scans; it says nothing about what the MMP algorithm can
+  represent.
 - **Exact geodesic distance is exact for the mesh, not for the body.** It is
   the true shortest path across the triangulated surface it is given.
 - **Non-manifold topology is refused, not worked around.** BSMT will not
