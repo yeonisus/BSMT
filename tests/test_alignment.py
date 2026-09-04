@@ -428,7 +428,10 @@ def test_validation_lines_report_numbers():
             **{name: turn @ point for name, point in UPRIGHT.items()})))
     check("a failure says FAILED VALIDATION", "FAILED VALIDATION" in text, text)
     check("and lists the measured error, not an adjective",
-          "90.000 deg off world +Z" in text, text)
+          "90.000000 deg off world +Z" in text, text)
+    check("every criterion is listed with its own PASS or FAIL",
+          text.count("[PASS]") + text.count("[FAIL]") >= 7, text)
+    check("and the determinant is among them", "determinant" in text, text)
 
 
 def main():

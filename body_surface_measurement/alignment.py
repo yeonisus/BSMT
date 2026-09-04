@@ -65,8 +65,20 @@ RIGID_TOLERANCE = 1e-5
 #: and far tighter than anything a researcher could see in a viewport.
 AXIS_TOLERANCE_DEGREES = 0.05
 
-#: Orthonormality tolerance for the achieved basis, as max |B^T B - I|.
+#: Orthonormality tolerance for the achieved basis, as max |B^T B - I|, and
+#: for |det(B) - 1|. The basis is built by Gram-Schmidt in float64 from the
+#: reconstructed points, so it lands near 1e-16 at any residual.
 ORTHOGONALITY_TOLERANCE = 1e-6
+
+#: How far the raw RIGHT->LEFT . +X may sit from cos(residual). Both come from
+#: the same four points, so this is a check on the ROTATION, not on the picks.
+LATERAL_CONSISTENCY_TOLERANCE = 1e-6
+
+#: Position criteria are the only ones measured in world units rather than
+#: degrees, so they are the only ones that need to know the scale of the
+#: scene. See position_tolerance() for why a fixed absolute number is wrong.
+POSITION_RELATIVE_TOLERANCE = 1e-6
+POSITION_ABSOLUTE_FLOOR = 1e-9
 
 #: How far object scale may differ between axes before it counts as
 #: non-uniform, and from 1.0 before it is worth a warning.
@@ -268,8 +280,40 @@ def axis_error_degrees(vector, target):
     return float(np.degrees(np.arccos(cosine)))
 
 
+def position_tolerance(reach):
+    """How far a transformed point may miss an exact world target.
+
+    Scale-relative, because the error being bounded is scale-relative. Blender
+    stores an object transform as single-precision loc/rot/scale, so a point
+    that goes out through `matrix_world` comes back carrying about 1e-7 of the
+    magnitude of the coordinates involved - the mesh-local position AND the
+    translation column, not the size of the body.
+
+    The 0.25.0 check used a fixed 1e-4 world units, and that is not a
+    physically meaningful quantity: on a scan authored in metres it is a
+    tenth of a millimetre, and on a millimetre scan whose mesh data was never
+    recentred - object at (-28570, -2692, -176), local coordinates carrying
+    the matching offset, which is exactly the real case - it is a tenth of a
+    micrometre, ten times finer than the storage can hold. A correct
+    translation was rejected because the tolerance had no dimensions.
+
+    1e-6 of the coordinate reach is about eight times the single-precision
+    epsilon, so it clears the storage noise with room to spare while still
+    being a millionth of the scene: a translation that is actually wrong
+    misses by millimetres or metres, which is orders of magnitude outside it.
+    """
+    return max(POSITION_ABSOLUTE_FLOOR,
+               POSITION_RELATIVE_TOLERANCE * float(abs(reach)))
+
+
+def _criterion(key, label, measured, limit, ok, detail=""):
+    return {"key": key, "label": label, "measured": float(measured),
+            "limit": float(limit), "ok": bool(ok), "detail": detail}
+
+
 def validate_world_frame(left, right, superior, inferior,
-                         tolerance_degrees=AXIS_TOLERANCE_DEGREES):
+                         tolerance_degrees=AXIS_TOLERANCE_DEGREES,
+                         origin_reference=None, coordinate_reach=None):
     """Measure whether four WORLD reference points satisfy the contract.
 
     This is the postcondition, not the recipe. It is given the four reference
@@ -284,7 +328,9 @@ def validate_world_frame(left, right, superior, inferior,
     * **The frame.** The right->left and inferior->superior picks are turned
       into an orthonormal basis exactly as `anatomical_frame` does it. Those
       three axes are the contract, and after a correct Apply they must BE the
-      world axes. This is the hard postcondition.
+      world axes. This is the hard postcondition, and it is purely angular -
+      therefore free of scale, and the same tolerance is right for a scan in
+      metres and one in millimetres.
     * **The raw picks.** `lr_dot_x` is the dot product of the *unorthogonalised*
       RIGHT->LEFT direction with +X. It is cos(residual) and nothing else, so
       it is reported and checked for consistency, never required to be 1 -
@@ -299,18 +345,29 @@ def validate_world_frame(left, right, superior, inferior,
       body still faces the Top view after an alignment claimed to have
       succeeded.
 
-    Returns a dict; `ok` is True only when every hard postcondition holds.
+    `origin_reference` names the slot that Move To World Origin was asked to
+    put at (0,0,0) - the only criterion here measured in world units rather
+    than degrees, and therefore the only one that needs `coordinate_reach`:
+    the largest coordinate magnitude that passed through the object transform.
+    See `position_tolerance`.
+
+    Returns a dict. `criteria` is the list of individual PASS/FAIL judgements,
+    and `ok` is simply "every criterion passed" - there is no verdict reached
+    anywhere else, so the panel and the operator cannot disagree about what
+    failed.
     Raises AlignmentError only if the points cannot form a frame at all.
     """
     frame = anatomical_frame(left, right, superior, inferior)
 
-    left = np.asarray(left, dtype=np.float64)
-    right = np.asarray(right, dtype=np.float64)
-    superior = np.asarray(superior, dtype=np.float64)
-    inferior = np.asarray(inferior, dtype=np.float64)
+    points = {
+        'LEFT': np.asarray(left, dtype=np.float64),
+        'RIGHT': np.asarray(right, dtype=np.float64),
+        'SUPERIOR': np.asarray(superior, dtype=np.float64),
+        'INFERIOR': np.asarray(inferior, dtype=np.float64),
+    }
 
-    lateral = left - right
-    vertical = superior - inferior
+    lateral = points['LEFT'] - points['RIGHT']
+    vertical = points['SUPERIOR'] - points['INFERIOR']
     lateral_unit = lateral / np.linalg.norm(lateral)
     vertical_unit = vertical / np.linalg.norm(vertical)
 
@@ -320,14 +377,18 @@ def validate_world_frame(left, right, superior, inferior,
 
     basis = np.asarray(frame["matrix"], dtype=np.float64)
     orthogonality_error = float(np.abs(basis.T @ basis - np.eye(3)).max())
+    determinant = float(np.linalg.det(basis))
 
     lr_dot_x = float(np.dot(lateral_unit, WORLD_AXES["x"]))
     si_dot_z = float(np.dot(vertical_unit, WORLD_AXES["z"]))
 
-    # What lr_dot_x is ALLOWED to be: exactly cos(residual), because the only
-    # thing the alignment removed from the lateral pick was its component
-    # along superior-inferior. A disagreement here means the rotation did not
-    # do what the frame says it did.
+    # What lr_dot_x is ALLOWED to be: exactly cos(residual). The only thing
+    # the alignment removed from the lateral pick was its component along
+    # superior-inferior, so l . x_axis = sin(angle(l, z)) = cos(residual) as
+    # an identity of the construction - and when x_axis has landed on +X, as
+    # the axis criteria above require, l . +X is that same number. A
+    # disagreement therefore means the rotation did not do what the frame
+    # says it did. It is NOT a demand that the raw picks be perpendicular.
     residual = float(frame["residual_degrees"])
     expected_lr_dot_x = float(np.cos(np.radians(residual)))
     lateral_consistency = abs(lr_dot_x - expected_lr_dot_x)
@@ -336,40 +397,76 @@ def validate_world_frame(left, right, superior, inferior,
     # sin, not cos: the frontal normal must be PERPENDICULAR to world up.
     frontal_limit = float(np.sin(np.radians(tolerance_degrees)))
 
-    failures = []
-    if z_error > tolerance_degrees:
-        failures.append(
-            "INFERIOR->SUPERIOR is %.3f deg off world +Z (SI . +Z = %+.6f, "
-            "needs %+.6f)" % (z_error, si_dot_z,
-                              float(np.cos(np.radians(tolerance_degrees)))))
-    if x_error > tolerance_degrees:
-        failures.append(
-            "the subject's LEFT axis is %.3f deg off world +X" % x_error)
-    if y_error > tolerance_degrees:
-        failures.append(
-            "the POSTERIOR axis is %.3f deg off world +Y" % y_error)
-    if orthogonality_error > ORTHOGONALITY_TOLERANCE:
-        failures.append("the applied basis is not orthonormal (max |B^T B - I| "
-                        "= %.3e)" % orthogonality_error)
-    if lateral_consistency > 1e-6:
-        failures.append(
-            "RIGHT->LEFT . +X is %+.6f but the reported residual of %.2f deg "
-            "predicts %+.6f" % (lr_dot_x, residual, expected_lr_dot_x))
-    if abs(frontal_normal_dot_up) > frontal_limit:
-        failures.append(
-            "the frontal plane is %.3f deg from being the Top view "
-            "(anterior-posterior . +Z = %+.6f); if +Z were superior this "
-            "would be 0" % (90.0 - axis_error_degrees(frame["y_axis"],
-                                                      WORLD_AXES["z"]),
-                            frontal_normal_dot_up))
+    criteria = [
+        _criterion(
+            "si_axis", "INFERIOR->SUPERIOR lands on world +Z",
+            z_error, tolerance_degrees, z_error <= tolerance_degrees,
+            "SI . +Z = %+.9f, %.6f deg off world +Z" % (si_dot_z, z_error)),
+        _criterion(
+            "lr_axis", "the subject's LEFT axis lands on world +X",
+            x_error, tolerance_degrees, x_error <= tolerance_degrees,
+            "%.6f deg off +X" % x_error),
+        _criterion(
+            "posterior_axis", "the POSTERIOR axis lands on world +Y",
+            y_error, tolerance_degrees, y_error <= tolerance_degrees,
+            "%.6f deg off +Y" % y_error),
+        _criterion(
+            "orthonormal", "the applied basis is orthonormal",
+            orthogonality_error, ORTHOGONALITY_TOLERANCE,
+            orthogonality_error <= ORTHOGONALITY_TOLERANCE,
+            "max |B^T B - I| = %.3e" % orthogonality_error),
+        _criterion(
+            "right_handed", "the basis is right-handed (det = +1)",
+            abs(determinant - 1.0), ORTHOGONALITY_TOLERANCE,
+            abs(determinant - 1.0) <= ORTHOGONALITY_TOLERANCE,
+            "det = %+.12f" % determinant),
+        _criterion(
+            "lateral_consistency",
+            "RIGHT->LEFT . +X equals cos(residual), as the construction says",
+            lateral_consistency, LATERAL_CONSISTENCY_TOLERANCE,
+            lateral_consistency <= LATERAL_CONSISTENCY_TOLERANCE,
+            "measured %+.9f, cos(%.4f deg) = %+.9f"
+            % (lr_dot_x, residual, expected_lr_dot_x)),
+        _criterion(
+            "frontal_plane", "the frontal plane is not the Top view",
+            abs(frontal_normal_dot_up), frontal_limit,
+            abs(frontal_normal_dot_up) <= frontal_limit,
+            "anterior-posterior . +Z = %+.3e" % frontal_normal_dot_up),
+    ]
+
+    origin_distance = None
+    origin_limit = None
+    if origin_reference:
+        target = points[origin_reference]
+        origin_distance = float(np.linalg.norm(target))
+        if coordinate_reach is None:
+            # Nothing better was supplied, so bound the reach by the points
+            # themselves. It is a lower bound - the mesh-local coordinates may
+            # be larger - so a caller that knows them should pass them.
+            coordinate_reach = float(max(
+                np.abs(np.stack(list(points.values()))).max(),
+                float(np.linalg.norm(vertical))))
+        origin_limit = position_tolerance(coordinate_reach)
+        criteria.append(_criterion(
+            "origin", "the %s reference is at the world origin"
+                      % origin_reference,
+            origin_distance, origin_limit, origin_distance <= origin_limit,
+            "%.3e world units away; the limit is %.3e, which is %g of the "
+            "%.4g coordinate reach"
+            % (origin_distance, origin_limit, POSITION_RELATIVE_TOLERANCE,
+               coordinate_reach)))
+
+    failures = ["%s (%s)" % (item["label"], item["detail"])
+                for item in criteria if not item["ok"]]
 
     return {
         "ok": not failures,
         "failures": failures,
-        "left_world": left,
-        "right_world": right,
-        "superior_world": superior,
-        "inferior_world": inferior,
+        "criteria": criteria,
+        "left_world": points['LEFT'],
+        "right_world": points['RIGHT'],
+        "superior_world": points['SUPERIOR'],
+        "inferior_world": points['INFERIOR'],
         "lr_world": lateral_unit,
         "si_world": vertical_unit,
         "lr_dot_x": lr_dot_x,
@@ -381,10 +478,16 @@ def validate_world_frame(left, right, superior, inferior,
         "z_error_degrees": z_error,
         "worst_axis_error_degrees": max(x_error, y_error, z_error),
         "orthogonality_error": orthogonality_error,
+        "determinant": determinant,
         "residual_degrees": residual,
         "raw_angle_degrees": float(frame["raw_angle_degrees"]),
         "frontal_normal_dot_up": frontal_normal_dot_up,
         "tolerance_degrees": float(tolerance_degrees),
+        "origin_reference": origin_reference or "",
+        "origin_distance": origin_distance,
+        "origin_limit": origin_limit,
+        "coordinate_reach": (float(coordinate_reach)
+                             if coordinate_reach is not None else None),
         "frame": frame,
     }
 
@@ -392,11 +495,14 @@ def validate_world_frame(left, right, superior, inferior,
 def validation_lines(validation):
     """The measured postcondition, for the panel and the log.
 
-    Numbers first. A researcher who has been told "Aligned" once by a tool
-    that was not, is owed the measurement rather than the adjective.
+    Numbers first, and every criterion listed whether it passed or not. A
+    researcher who has been told "Aligned" once by a tool that was not, is
+    owed the measurement rather than the adjective - and a researcher whose
+    alignment was refused is owed the specific criterion rather than a
+    sentence that trails off.
     """
     def vector(name, value):
-        return "  %-9s %10.4f %10.4f %10.4f" % (
+        return "  %-9s %14.5f %14.5f %14.5f" % (
             name, value[0], value[1], value[2])
 
     lines = ["Applied-frame check (measured in world space)"]
@@ -406,24 +512,35 @@ def validation_lines(validation):
     lines.append(vector("INFERIOR", validation["inferior_world"]))
     lines.append(vector("LR unit", validation["lr_world"]))
     lines.append(vector("SI unit", validation["si_world"]))
-    lines.append("  LR . +X = %+.6f (raw picks; cos of the %.2f deg residual)"
-                 % (validation["lr_dot_x"], validation["residual_degrees"]))
-    lines.append("  SI . +Z = %+.6f (primary axis; must be +1)"
+    lines.append("  reference axes %.4f deg apart, residual %.4f deg"
+                 % (validation["raw_angle_degrees"],
+                    validation["residual_degrees"]))
+    lines.append("  LR . +X = %+.9f   expected %+.9f (cos of the residual)"
+                 % (validation["lr_dot_x"], validation["expected_lr_dot_x"]))
+    lines.append("  SI . +Z = %+.9f   (primary axis; must be +1)"
                  % validation["si_dot_z"])
-    lines.append("  axis error  X %.4f  Y %.4f  Z %.4f deg"
+    lines.append("  axis error  X %.6f  Y %.6f  Z %.6f deg"
                  % (validation["x_error_degrees"],
                     validation["y_error_degrees"],
                     validation["z_error_degrees"]))
-    lines.append("  basis orthogonality error %.3e"
-                 % validation["orthogonality_error"])
-    lines.append("  frontal plane vs Top view: normal . +Z = %+.6f (0 = they "
-                 "differ, as they must)" % validation["frontal_normal_dot_up"])
-    if validation["ok"]:
-        lines.append("  PASS - the world axes mean what the convention says")
-    else:
-        lines.append("  FAILED VALIDATION:")
-        for failure in validation["failures"]:
-            lines.append("    - " + failure)
+    lines.append("  basis orthogonality %.3e   determinant %+.9f"
+                 % (validation["orthogonality_error"],
+                    validation["determinant"]))
+    if validation["origin_reference"]:
+        lines.append("  %s is %.3e from the world origin (limit %.3e on a "
+                     "coordinate reach of %.4g)"
+                     % (validation["origin_reference"],
+                        validation["origin_distance"],
+                        validation["origin_limit"],
+                        validation["coordinate_reach"]))
+    for item in validation["criteria"]:
+        lines.append("  [%s] %s" % ("PASS" if item["ok"] else "FAIL",
+                                    item["label"]))
+        lines.append("         %s" % item["detail"])
+    lines.append("  %s" % ("PASS - the world axes mean what the convention says"
+                           if validation["ok"]
+                           else "FAILED VALIDATION on %d criterion/criteria"
+                                % len(validation["failures"])))
     return lines
 
 

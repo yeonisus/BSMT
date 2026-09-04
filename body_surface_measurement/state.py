@@ -1082,7 +1082,15 @@ class BSMT_Properties(bpy.types.PropertyGroup):
     # stored verdict about a pose the user can still change is exactly the
     # thing that lied before.
     align_validation: StringProperty(default="")
+    #: Whether Move To World Origin was part of what the applied
+    #: alignment was asked to do. The live status is judged against
+    #: this, not against the checkbox's current state.
+    align_origin_requested: BoolProperty(default=False)
     align_validation_report: StringProperty(default="")
+    #: Why the last Apply was refused, measured on the trial pose.
+    #: That pose no longer exists after the rollback, so this cannot
+    #: be re-derived and is the only record of it.
+    align_refusal_report: StringProperty(default="")
     align_lr_dot_x: FloatProperty(default=0.0)
     align_si_dot_z: FloatProperty(default=0.0)
     align_axis_error_degrees: FloatProperty(default=0.0)
@@ -2816,7 +2824,9 @@ def clear_alignment_state(props, keep_points=True):
     props.align_report = ""
     props.align_residual_degrees = 0.0
     props.align_validation = ""
+    props.align_origin_requested = False
     props.align_validation_report = ""
+    props.align_refusal_report = ""
     props.align_lr_dot_x = 0.0
     props.align_si_dot_z = 0.0
     props.align_axis_error_degrees = 0.0

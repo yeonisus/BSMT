@@ -5127,11 +5127,25 @@ def _apply_world_matrix(obj, matrix_rows):
     obj.matrix_world = Matrix([[float(v) for v in row] for row in matrix_rows])
 
 
-#: How close the origin reference must land to world (0,0,0), in world units,
-#: for "Move To World Origin" to count as done. A rigid translate is exact up
-#: to float error on the magnitudes involved; this is generous for a scan
-#: authored in millimetres far from the origin.
-_ORIGIN_TOLERANCE = 1e-4
+#: Status properties a refused Apply must put back exactly as it found them.
+_STATUS_PROPERTIES = (
+    "align_applied", "align_moved", "align_method", "align_created",
+    "align_object", "align_report", "align_validation",
+    "align_origin_requested", "align_validation_report", "align_lr_dot_x",
+    "align_si_dot_z", "align_axis_error_degrees", "align_orthogonality_error",
+    "align_residual_degrees", "align_previous_matrix", "align_applied_matrix",
+)
+
+
+def _capture_alignment_status(props):
+    return {name: (tuple(getattr(props, name))
+                   if name.endswith("_matrix") else getattr(props, name))
+            for name in _STATUS_PROPERTIES}
+
+
+def _restore_alignment_status(props, captured):
+    for name, value in captured.items():
+        setattr(props, name, value)
 
 
 def _axis_helper_length(frame):
@@ -5285,8 +5299,10 @@ class BSMT_OT_manual_align(bpy.types.Operator):
         # ARE references it is measured against them rather than trusted. With
         # no references there is nothing to measure, and the status says that
         # instead of implying a check that never happened.
-        validation, why = attach.validate_applied_alignment(props)
+        validation, why = attach.validate_applied_alignment(
+            props, require_origin=False)
         attach.store_validation(props, validation, why)
+        props.align_origin_requested = False
         if validation is not None:
             lines.append("")
             lines.extend(alignment.validation_lines(validation))
@@ -5445,6 +5461,15 @@ class BSMT_OT_apply_alignment(bpy.types.Operator):
 
         before_matrix = np.array(obj.matrix_world, dtype=np.float64)
         before_scale = alignment.linear_scale(before_matrix)
+        # The object's OWN stored transform, which is what a rollback has to
+        # put back. Restoring `matrix_world` instead would go out through
+        # Blender's single-precision loc/rot/scale decomposition and land
+        # about 1e-7 away from where it started - a rollback that does not
+        # quite roll back. matrix_basis IS the stored data, so writing it back
+        # is bit-exact, and it is also the only correct thing to restore on a
+        # parented or constrained object, whose world matrix is derived.
+        before_basis = Matrix(obj.matrix_basis)
+        status_before = _capture_alignment_status(props)
         _remember_pre_alignment(props, obj)
 
         pivot = points['INFERIOR']
@@ -5459,6 +5484,13 @@ class BSMT_OT_apply_alignment(bpy.types.Operator):
                         "refused" % (before_scale, after_scale))
             return {'CANCELLED'}
 
+        # ---- the transaction ---------------------------------------------
+        # From here the object is moved on trial. It keeps the new pose only
+        # if the measurement below says the pose means what the panel would
+        # claim it means; otherwise `before_matrix` goes back exactly, so a
+        # refused alignment leaves nothing behind to clean up. Leaving a scan
+        # transformed under a FAILED banner - which 0.25.0 did - hands the
+        # researcher a pose that is neither the original nor a valid one.
         _apply_world_matrix(obj, updated)
         # Blender must have settled before anything is measured: matrix_world
         # is a *request* on an object with a parent, a delta transform or a
@@ -5477,32 +5509,64 @@ class BSMT_OT_apply_alignment(bpy.types.Operator):
         lines.append("  mesh geometry, geometry hash and metric key unchanged")
         lines.append("  " + alignment.orthogonalisation_note(frame))
         props.align_residual_degrees = frame["residual_degrees"]
+        props.align_origin_requested = bool(props.align_move_to_origin)
 
         # ---- the postcondition -------------------------------------------
         # Everything above is what BSMT INTENDED. This is what it achieved,
         # measured from the four references reconstructed against the pose the
         # object is actually in. "Aligned" is now a result, not an assertion.
-        validation, why = attach.validate_applied_alignment(props)
+        # Every criterion, including Move To World Origin, is judged inside
+        # validate_world_frame, so there is exactly one list of failures and
+        # the message can never trail off with nothing after the dash.
+        validation, why = attach.validate_applied_alignment(
+            props, require_origin=props.align_move_to_origin)
         verdict = attach.store_validation(props, validation, why)
         lines.append("")
         lines.extend(alignment.validation_lines(validation)
                      if validation is not None
                      else ["Applied-frame check could not be made: " + why])
 
-        if props.align_move_to_origin and validation is not None:
-            landed = float(np.linalg.norm(validation["inferior_world"]))
-            lines.append("  Move To World Origin: INFERIOR landed %.3e world "
-                         "units from (0,0,0)%s"
-                         % (landed,
-                            "" if landed <= _ORIGIN_TOLERANCE
-                            else "  <- OUTSIDE TOLERANCE"))
-            if landed > _ORIGIN_TOLERANCE:
-                verdict = 'FAIL'
-                props.align_validation = 'FAIL'
+        if verdict != 'PASS':
+            # ---- rollback ------------------------------------------------
+            # A refused alignment must leave NOTHING behind: not the trial
+            # pose, and not a status describing it. The object goes back to
+            # `before_matrix` and every status property is restored to the
+            # value it had when execute() started, so the transaction either
+            # happened or it did not.
+            #
+            # The one thing that is kept is the evidence: the criterion table
+            # measured on the trial pose is what says why the alignment was
+            # refused, and the pose it describes no longer exists, so it
+            # cannot be re-derived from anything and has to be recorded.
+            refusal = (alignment.validation_lines(validation)
+                       if validation is not None
+                       else ["The applied-frame check could not be made:",
+                             "  " + why])
+            obj.matrix_basis = before_basis
+            context.view_layer.update()
+            attach.refresh(props, reason="alignment rolled back")
+            _restore_alignment_status(props, status_before)
+            props.align_refusal_report = "\n".join(
+                ["Apply Alignment was REFUSED and rolled back",
+                 "  '%s' is back at its pre-Apply transform" % obj.name]
+                + refusal)
+            props.align_report = "\n".join(
+                lines[:1] + ["  REFUSED - see Alignment Validation below"])
+            print("\n[BSMT] " + "\n".join(lines)
+                  + "\n[BSMT] rolled back; object restored\n")
+            detail = ("; ".join(validation["failures"])
+                      if validation is not None else why)
+            self.report(
+                {'ERROR'},
+                "BSMT: alignment REFUSED and rolled back - %s. The full "
+                "criterion table is in the Alignment Validation panel."
+                % (detail or "the postcondition could not be measured"))
+            return {'CANCELLED'}
+        props.align_refusal_report = ""
 
         _refresh_after_alignment(context, props, obj,
                                  alignment.METHOD_LANDMARK, lines,
-                                 applied=(verdict == 'PASS'))
+                                 applied=True)
 
         if props.align_preview:
             # Aligned means the anatomical frame IS the world frame, so the
@@ -5511,15 +5575,6 @@ class BSMT_OT_apply_alignment(bpy.types.Operator):
             visualization.show_alignment_axes(
                 context, np.zeros(3) if props.align_move_to_origin else pivot,
                 _axis_helper_length(frame), basis=np.eye(3))
-
-        if verdict != 'PASS':
-            self.report(
-                {'ERROR'},
-                "BSMT: '%s' moved, but the result FAILED validation - %s"
-                % (obj.name,
-                   "; ".join(validation["failures"]) if validation is not None
-                   else why))
-            return {'FINISHED'}
 
         self.report(
             {'WARNING'} if not frame["residual_ok"] else {'INFO'},
@@ -5583,7 +5638,8 @@ class BSMT_OT_flip_front_back(bpy.types.Operator):
 
         applied = props.align_applied
         if swapped:
-            validation, why = attach.validate_applied_alignment(props)
+            validation, why = attach.validate_applied_alignment(
+                props, require_origin=props.align_origin_requested)
             verdict = attach.store_validation(props, validation, why)
             lines.append("")
             lines.extend(alignment.validation_lines(validation)
@@ -5632,8 +5688,10 @@ class BSMT_OT_reset_alignment(bpy.types.Operator):
         props.align_applied = False
         props.align_moved = False
         props.align_preview = False
+        props.align_origin_requested = False
         props.align_validation = ""
         props.align_validation_report = ""
+        props.align_refusal_report = ""
         props.align_lr_dot_x = 0.0
         props.align_si_dot_z = 0.0
         props.align_axis_error_degrees = 0.0

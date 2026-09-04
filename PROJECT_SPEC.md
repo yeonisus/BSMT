@@ -4453,6 +4453,123 @@ checks in Blender. 0 failures.
 
 ---
 
+## 11aa. Milestone 3.23 — A tolerance with no dimensions (v0.25.1, 2026-09-04)
+
+### 11aa.1 The report
+
+On the real repaired PLY, with references BSMT itself rated **Good** — about
+0.4° off perpendicular — Apply Alignment moved the object and then reported
+*"'scan (1)_BSMT' moved, but the result FAILED validation - "*, with nothing
+after the dash. The 0.25.0 validation was doing its job in refusing to claim
+success it could not measure; the question was which criterion it had failed
+on, and whether the criterion was right.
+
+### 11aa.2 Which criterion, measured before anything was changed
+
+Reproduced by rebuilding the real geometry rather than guessing at it: a
+millimetre-scale body at `(-28570, -2692, -176)`, rotation `(90.1, -2.3, -0.6)`,
+scale 1, and — the part that turned out to matter — **mesh data that was never
+recentred**, so the vertices carry the matching offset. That is an ordinary
+scanner export, not a pathology.
+
+| criterion | measured | limit | verdict |
+|---|---|---|---|
+| SI · +Z off world +Z | 0.000000° | 0.05° | pass |
+| LEFT axis off +X | 0.000000° | 0.05° | pass |
+| POSTERIOR axis off +Y | 0.000000° | 0.05° | pass |
+| max \|BᵀB − I\| | 2.5e-19 | 1e-6 | pass |
+| LR · +X vs cos(residual) | 1.1e-12 | 1e-6 | pass |
+| anterior · +Z | −1.6e-11 | 8.7e-4 | pass |
+| **INFERIOR distance from world origin** | **1.008e-03** | **1e-4** | **FAIL** |
+
+Exactly one criterion, and every geometric one passed by ten or more orders of
+magnitude. **The transform formula was not involved.**
+
+### 11aa.3 Root cause: the only world-unit criterion had no dimensions
+
+`_ORIGIN_TOLERANCE` was a fixed `1e-4` world units. Every other criterion is an
+angle, and an angle has no scale — 0.05° means the same thing on a scan in
+metres and one in millimetres. A distance does not.
+
+Blender stores an object pose as single-precision loc/rot/scale (the same fact
+that made `metric_key` rotation-variant in 0.25.0, sect. 11z.6), so a point
+reconstructed as `R @ local + t` carries about 1e-7 of the **magnitude of the
+coordinates involved** — not of the size of the body. With `local` and `t` both
+near 30,000, that is ~1e-3 mm: one micrometre, on a thirty-metre scene.
+
+A fixed 1e-4 world units is a tenth of a millimetre on a scan authored in
+metres and a tenth of a **micrometre** on this one — ten times finer than the
+storage can hold. Even the fixtures that passed in 0.25.0 were consuming 31% of
+that budget; the acceptance suite had not been unlucky enough to cross it.
+
+`alignment.position_tolerance(reach)` replaces it with `1e-6` of the coordinate
+reach, supplied by `attach.live_reference_points_and_reach()` as the largest
+magnitude that actually passed through `matrix_world` — the mesh-local
+positions and the translation column. On the real scan: limit 2.9e-2 mm
+against a measured 1.0e-3, a 29× margin. It is about eight times the
+single-precision epsilon, so it clears the storage noise, and a translation
+that is genuinely wrong misses by millimetres or metres — orders of magnitude
+outside it. **This is not a loosened tolerance; it is a tolerance that finally
+has units.**
+
+### 11aa.4 Why the message trailed off
+
+The origin check lived in the *operator*, appended to the report and forcing
+the verdict from outside `validation`. So `validation["failures"]` was empty —
+every criterion the validator knew about had passed — and the message
+interpolated an empty string after the dash.
+
+Every criterion, the origin included, is now judged inside
+`validate_world_frame`, which returns a `criteria` list of individual PASS/FAIL
+judgements with the measured value, the limit and a detail line. `ok` is simply
+"every criterion passed". There is one verdict, reached in one place, so the
+operator report, the log and the panel cannot describe different failures.
+
+### 11aa.5 The panel says which criterion, persistently
+
+An operator report is a toast: one line, elided when long, gone by the time the
+researcher looks for it. The **Alignment Validation** section is re-measured
+every draw and shows the raw angle, the residual, LR · +X with its expected
+value and angular error, SI · +Z with its angular error, the posterior axis,
+anterior · +Z, max \|BᵀB − I\|, det(basis), the origin distance with its limit
+and the reach it came from, and then PASS/FAIL per criterion.
+
+### 11aa.6 Apply Alignment is transactional
+
+0.25.0 said *"moved, but the result FAILED validation"* and meant it: the scan
+was left transformed, in a pose that was neither the original nor a validated
+one. That is the worst of the three possible outcomes.
+
+A refusal now restores `obj.matrix_basis` — **not** `matrix_world`, which would
+go back out through the single-precision decomposition and land ~1.2e-7 away
+from where it started, and which is not even the authoritative data on a
+parented or constrained object — puts every status property back exactly as it
+found it, leaves the reference points untouched, and returns `CANCELLED`.
+
+The one thing kept is the evidence: the criterion table measured on the trial
+pose, in `align_refusal_report`, because that pose no longer exists and cannot
+be re-derived from anything.
+
+### 11aa.7 What is verified
+
+`tests/test_alignment_blender.py` grows to 221 checks.
+
+| Case | Asserted |
+|---|---|
+| M real repaired-PLY fixture: mm, un-recentred mesh at −28570, 0.33° residual, scale 1 | Apply is **accepted**; every criterion passes; the origin limit is scale-aware (> 1e-4) and derived from a reach > 20,000; the achieved miss is ≥ 5× inside the limit |
+| N scale sweep: metres / centimetres / millimetres, same geometry | accepted at every scale, origin criterion passing on its own scale |
+| O transactional failure, forced with a Copy Rotation constraint so Blender genuinely declines the requested pose — nothing stubbed | returns `CANCELLED`; `matrix_world` **bit-identical** to the pre-Apply matrix; status not ALIGNED; `align_method` unchanged; all four references valid with their triangles and local positions intact; the refusal names a real criterion; the panel renders both the refusal table and the live one |
+| P recovery | the SAME references align cleanly once the constraint is removed, and the refusal record is cleared |
+
+`tests/test_alignment.py` at 123 offline checks, including the per-criterion
+PASS/FAIL rendering and the determinant.
+
+Regression: 2,565 offline checks across twenty-one suites, plus 221 alignment,
+45 picking, 98 workflow-UI, 76 mesh-repair, 35 degenerate-policy, 110
+preprocessing and 90 path-visualisation checks in Blender. 0 failures.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~

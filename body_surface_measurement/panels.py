@@ -2216,35 +2216,99 @@ class BSMT_PT_alignment(bpy.types.Panel):
         # the live transform, and it is asked here every time the panel is
         # drawn. A scan rotated by hand after a good alignment used to keep
         # reporting "Aligned (Landmark)" while superior pointed along -Y.
-        text, verified, live = attach.alignment_status(props)
+        # Measured ONCE, then used for both the headline and the table below
+        # it, so the two can never describe different poses.
+        live, reason = attach.validation_criteria(props)
+        text, verified, _live = attach.alignment_status(props, live, reason)
         status = layout.box()
         row = status.row()
         row.alert = props.align_applied and not verified
         row.label(text="Status: %s" % text,
                   icon=('CHECKMARK' if verified else
                         ('ERROR' if props.align_applied else 'BLANK1')))
-        if live is not None:
-            numbers = status.column(align=True)
-            numbers.scale_y = 0.7
-            numbers.label(text="RIGHT->LEFT . +X        %+.6f  (= cos %.2f deg "
-                               "residual)" % (live["lr_dot_x"],
-                                              live["residual_degrees"]))
-            numbers.label(text="INFERIOR->SUPERIOR . +Z %+.6f"
-                               % live["si_dot_z"])
-            numbers.label(text="worst axis error %.4f deg, orthogonality %.1e"
-                               % (live["worst_axis_error_degrees"],
-                                  live["orthogonality_error"]))
-            for failure in live["failures"]:
-                for part in _wrap(failure, 42):
-                    line = numbers.row()
-                    line.alert = True
-                    line.label(text="  " + part, icon='ERROR')
+        self._draw_validation(layout, props, live, reason)
         if props.align_report:
             column = status.column(align=True)
             column.scale_y = 0.7
             for line in props.align_report.split("\n"):
                 if line.strip():
                     column.label(text=line)
+
+    @staticmethod
+    def _draw_validation(layout, props, live, reason):
+        """The measured criterion table. Persistent, and never truncated.
+
+        An operator report is a toast: it is one line, it is elided when it is
+        long, and it is gone by the time the researcher looks for it. A
+        refusal that says which criterion failed and by how much has to live
+        somewhere the researcher can read at leisure, so it lives here, and it
+        is re-measured every draw rather than replayed from what was stored.
+        """
+        box = layout.box()
+        if props.align_refusal_report:
+            # The pose this describes no longer exists - it was rolled back -
+            # so it is shown as history, above the live measurement, and never
+            # merged with it.
+            refused = box.column(align=True)
+            refused.scale_y = 0.75
+            for line in props.align_refusal_report.split("\n"):
+                if not line.strip():
+                    continue
+                row = refused.row()
+                row.alert = "FAIL" in line or "REFUSED" in line
+                row.label(text=line)
+            box.separator()
+        header = box.row()
+        header.label(text="Alignment Validation (current pose)",
+                     icon='CHECKMARK' if live is not None and live["ok"]
+                     else 'ERROR' if live is not None else 'INFO')
+        if live is None:
+            note = box.column(align=True)
+            note.scale_y = 0.7
+            note.enabled = False
+            for part in _wrap("Nothing to measure yet: %s" % reason, 44):
+                note.label(text=part)
+            return
+
+        figures = box.column(align=True)
+        figures.scale_y = 0.7
+        figures.label(text="reference axes  %.4f deg apart"
+                           % live["raw_angle_degrees"])
+        figures.label(text="residual        %.4f deg off perpendicular"
+                           % live["residual_degrees"])
+        figures.label(text="LR . +X         %+.9f" % live["lr_dot_x"])
+        figures.label(text="  expected      %+.9f  (cos of the residual)"
+                           % live["expected_lr_dot_x"])
+        figures.label(text="  LR ang. error %.6f deg" % live["x_error_degrees"])
+        figures.label(text="SI . +Z         %+.9f" % live["si_dot_z"])
+        figures.label(text="  SI ang. error %.6f deg" % live["z_error_degrees"])
+        figures.label(text="posterior +Y    %.6f deg off" % live["y_error_degrees"])
+        figures.label(text="anterior . +Z   %+.3e  (0 = not the Top view)"
+                           % live["frontal_normal_dot_up"])
+        figures.label(text="max |B^T B - I| %.3e" % live["orthogonality_error"])
+        figures.label(text="det(basis)      %+.9f" % live["determinant"])
+        if live["origin_reference"]:
+            figures.label(text="|%s| from origin  %.3e  (limit %.3e)"
+                               % (live["origin_reference"],
+                                  live["origin_distance"], live["origin_limit"]))
+            figures.label(text="  coordinate reach %.4g world units"
+                               % live["coordinate_reach"])
+        else:
+            figures.label(text="Move To World Origin was not requested")
+
+        table = box.column(align=True)
+        table.scale_y = 0.75
+        for item in live["criteria"]:
+            row = table.row()
+            row.alert = not item["ok"]
+            row.label(text="%s  %s" % ("PASS" if item["ok"] else "FAIL",
+                                       item["label"]),
+                      icon='CHECKMARK' if item["ok"] else 'ERROR')
+            for part in _wrap(item["detail"], 42):
+                detail = table.row()
+                detail.alert = not item["ok"]
+                detail.enabled = item["ok"]
+                detail.label(text="      " + part)
 
     @staticmethod
     def _draw_manual(layout, props):

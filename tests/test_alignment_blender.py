@@ -98,12 +98,17 @@ def props_of(context):
     return context.scene.bsmt
 
 
-def pick_reference(context, props, obj, slot, local_target):
+def pick_reference(context, props, obj, slot, local_target, inside=False):
     """Set one reference to the real surface point nearest `local_target`.
 
     Goes through `state.fill_surface_point` with a genuine canonical triangle
     and barycentric, exactly as the modal picker does, so the stored reference
     is the same kind of object the operator will meet in the field.
+
+    `inside` places the point WITHIN the nearest triangle instead of at its
+    centroid. Centroid snapping quantises a reference to the mesh resolution,
+    which on a body-scale fixture is tens of millimetres - far too coarse to
+    build the sub-degree residual a real careful pick produces.
     """
     from body_surface_measurement import geodesic, state
     canonical = geodesic.meshcache.get(context, obj, props.unit, rebuild=True)
@@ -111,6 +116,13 @@ def pick_reference(context, props, obj, slot, local_target):
     centroids = canonical.vertices_local[canonical.triangles].mean(axis=1)
     index = int(np.argmin(np.linalg.norm(centroids - target, axis=1)))
     bary = np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0])
+    if inside:
+        corners = canonical.triangle_corners_local(index)
+        solved, *_ = np.linalg.lstsq(
+            np.vstack([corners.T, np.ones(3)]), np.append(target, 1.0),
+            rcond=None)
+        solved = np.clip(solved, 1e-6, None)
+        bary = solved / solved.sum()
     local = canonical.local_from(index, bary)
     matrix = np.array(obj.matrix_world, dtype=np.float64)
     world = matrix[:3, :3] @ local + matrix[:3, 3]
@@ -125,6 +137,70 @@ def pick_all(context, props, obj, anatomy=None):
     anatomy = anatomy or ANATOMY_LOCAL
     return {slot: pick_reference(context, props, obj, slot, target)
             for slot, target in anatomy.items()}
+
+
+def make_real_scan(context, location, rotation, height=1700.0,
+                   local_offset=(0.0, 0.0, 0.0)):
+    """A body-scale scan whose MESH DATA was never recentred.
+
+    `local_offset` pushes the vertices away from the object origin, which is
+    what a scanner export that kept its own global frame looks like. It is the
+    part that matters: the reconstruction computes `R @ local + t` with both
+    terms near 30,000, so the absolute error on a world point is set by that
+    magnitude and not by the size of the body.
+    """
+    wipe()
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32, radius=1.0)
+    obj = context.object
+    obj.name = "scan (1)_BSMT"
+    obj.scale = (0.20 * height, 0.13 * height, 0.5 * height)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    if any(local_offset):
+        for vertex in obj.data.vertices:
+            vertex.co = (vertex.co[0] + local_offset[0],
+                         vertex.co[1] + local_offset[1],
+                         vertex.co[2] + local_offset[2])
+        obj.data.update()
+    obj.rotation_euler = rotation
+    obj.location = location
+    context.view_layer.objects.active = obj
+    context.view_layer.update()
+    from body_surface_measurement import state
+    state.clear_alignment_state(props_of(context), keep_points=False)
+    return obj
+
+
+def pick_body_references(context, props, obj, tilt_mm, height=1700.0,
+                         local_offset=(0.0, 0.0, 0.0)):
+    """Four good picks, with LEFT deliberately `tilt_mm` above RIGHT.
+
+    The tilt is what produces the residual: over a left-right span of about
+    0.4 * height, a rise of `tilt_mm` puts the two picked axes
+    atan(tilt / span) off perpendicular.
+    """
+    ox, oy, oz = local_offset
+    targets = {
+        'LEFT': (0.20 * height + ox, oy, 0.15 * height + tilt_mm + oz),
+        'RIGHT': (-0.20 * height + ox, oy, 0.15 * height + oz),
+        'SUPERIOR': (ox, oy, 0.5 * height + oz),
+        'INFERIOR': (ox, oy, -0.5 * height + oz),
+    }
+    return {slot: pick_reference(context, props, obj, slot, target, inside=True)
+            for slot, target in targets.items()}
+
+
+def apply_alignment():
+    """Run Apply Alignment, mapping a refusal to {'CANCELLED'}.
+
+    Blender turns an operator that reports ERROR into a RuntimeError when it
+    is driven from a script, so a refusal has to be caught rather than
+    returned. The operator reports ERROR exactly when it returns CANCELLED, so
+    the mapping is exact.
+    """
+    try:
+        return bpy.ops.bsmt.apply_alignment(), ""
+    except RuntimeError as exc:
+        return {'CANCELLED'}, str(exc)
 
 
 def world_references(props):
@@ -235,7 +311,7 @@ def run_case(context, props, label, rotation, location, move_to_origin,
         for i, a in enumerate(sorted(before_refs))
         for b in sorted(before_refs)[i + 1:]])
 
-    result = bpy.ops.bsmt.apply_alignment()
+    result, _refusal = apply_alignment()
     context.view_layer.update()
     check("%s: the operator finished" % label, result == {'FINISHED'},
           str(result))
@@ -312,8 +388,8 @@ def panel_text(panel_class, context):
 def main():
     import body_surface_measurement as bsmt
     bsmt.register()
-    from body_surface_measurement import (alignment, attach, state,
-                                          visualization)
+    from body_surface_measurement import (alignment, attach, panels,
+                                          state, visualization)
 
     context = bpy.context
     props = context.scene.bsmt
@@ -376,7 +452,7 @@ def main():
     residual = frame["residual_degrees"]
     check("E: the picks are visibly non-orthogonal (%.2f deg residual)"
           % residual, residual > 5.0)
-    bpy.ops.bsmt.apply_alignment()
+    _result, _refusal = apply_alignment()
     context.view_layer.update()
     validation = assert_contract("E non-orthogonal", props,
                                  expected_lr_dot_x=math.cos(math.radians(residual)))
@@ -422,7 +498,7 @@ def main():
     picked = pick_all(context, props, obj)
     props.align_move_to_origin = False
     pivot_before = world_references(props)['INFERIOR'].copy()
-    bpy.ops.bsmt.apply_alignment()
+    _result, _refusal = apply_alignment()
     context.view_layer.update()
     validation = assert_contract("G origin OFF", props)
     inferior = world_references(props)['INFERIOR']
@@ -441,7 +517,7 @@ def main():
     obj = make_body(context, (0, 0, 0), (0, 0, 0))
     pick_all(context, props, obj)
     props.align_move_to_origin = False
-    bpy.ops.bsmt.apply_alignment()
+    _result, _refusal = apply_alignment()
     context.view_layer.update()
     text, verified, _live = _status(props)
     check("H: right after Apply the status is verified", verified, text)
@@ -503,7 +579,7 @@ def main():
           not np.allclose(np.array(arms), np.eye(3), atol=1e-3),
           str(np.array(arms)))
 
-    bpy.ops.bsmt.apply_alignment()
+    _result, _refusal = apply_alignment()
     context.view_layer.update()
     helper = bpy.data.objects.get(visualization.ALIGN_AXES)
     if helper is not None:
@@ -527,7 +603,7 @@ def main():
     obj = make_body(context, (0, 0, 0), (0, 0, 0))
     pick_all(context, props, obj)
     props.align_move_to_origin = False
-    bpy.ops.bsmt.apply_alignment()
+    _result, _refusal = apply_alignment()
     context.view_layer.update()
     left_before = world_references(props)['LEFT'].copy()
     bpy.ops.bsmt.flip_front_back()
@@ -552,7 +628,7 @@ def main():
     pick_all(context, props, obj)
     before = np.array(obj.matrix_world, dtype=np.float64)
     props.align_move_to_origin = True
-    bpy.ops.bsmt.apply_alignment()
+    _result, _refusal = apply_alignment()
     context.view_layer.update()
     bpy.ops.bsmt.reset_alignment()
     context.view_layer.update()
@@ -570,7 +646,6 @@ def main():
 
     # ------------------------------------------------------------------ L --
     print("\nL. what the panel actually says, in each of the three states")
-    from body_surface_measurement import panels
     obj = make_body(context, (0.7, -1.1, 2.3), (1.0, 2.0, 3.0))
     text = panel_text(panels.BSMT_PT_alignment, context)
     check("L: with no alignment the panel says 'Not aligned'",
@@ -578,16 +653,17 @@ def main():
 
     pick_all(context, props, obj)
     props.align_move_to_origin = False
-    bpy.ops.bsmt.apply_alignment()
+    _result, _refusal = apply_alignment()
     context.view_layer.update()
     text = panel_text(panels.BSMT_PT_alignment, context)
     check("L: after a good Apply the panel says verified",
           "verified" in text, text)
     check("L: and shows the measured dot products, not just a tick",
-          "RIGHT->LEFT . +X" in text and "INFERIOR->SUPERIOR . +Z" in text,
-          text)
-    check("L: including the orthogonality error",
-          "orthogonality" in text, text)
+          "LR . +X" in text and "SI . +Z" in text, text)
+    check("L: including the orthogonality error and the determinant",
+          "max |B^T B - I|" in text and "det(basis)" in text, text)
+    check("L: and a PASS/FAIL line per criterion",
+          text.count("PASS  ") >= 7, text)
 
     obj.rotation_euler = (math.pi / 2, 0.0, 0.0)
     context.view_layer.update()
@@ -600,8 +676,181 @@ def main():
     check("L: and it names the axis that is wrong",
           "+Z" in text, text)
     check("L: the reported SI . +Z is the measured 0, not the stored 1",
-          "INFERIOR->SUPERIOR . +Z +0.000000" in text
-          or "INFERIOR->SUPERIOR . +Z -0.000000" in text, text)
+          any(line.startswith("SI . +Z") and abs(float(line.split()[-1])) < 1e-6
+              for line in text.split("\n")),
+          "\n".join(l for l in text.split("\n") if "SI . +Z" in l))
+    check("L: and the failing criterion is marked FAIL",
+          "FAIL  INFERIOR->SUPERIOR lands on world +Z" in text, text)
+
+    # ------------------------------------------------------------------ M --
+    print("\nM. the real repaired-PLY case: mm scan, never recentred, 0.4 deg")
+    #
+    # What the acceptance run actually met. The scan sat at
+    # (-28570, -2692, -176) in millimetres with mesh data carrying the
+    # matching offset, its references were good - about 0.4 deg off
+    # perpendicular - and Apply was refused. Nothing about that geometry is
+    # unusual for a scanner export, and it must align.
+    obj = make_real_scan(context, location=(-28570.0, -2692.0, -176.0),
+                         rotation=(math.radians(90.1), math.radians(-2.3),
+                                   math.radians(-0.6)),
+                         local_offset=(28570.0, 2692.0, 176.0))
+    picked = pick_body_references(context, props, obj, tilt_mm=4.5,
+                                  local_offset=(28570.0, 2692.0, 176.0))
+    props.align_move_to_origin = True
+
+    points = world_references(props)
+    frame = alignment.anatomical_frame(
+        points['LEFT'], points['RIGHT'],
+        points['SUPERIOR'], points['INFERIOR'])
+    residual = frame["residual_degrees"]
+    check("M: the references are GOOD - %.3f deg off perpendicular, which "
+          "alignment.quality() calls '%s'"
+          % (residual, alignment.quality(residual)[0]),
+          residual < 1.0 and alignment.quality(residual)[2] == 0,
+          "%.4f deg" % residual)
+    check("M: the object scale is exactly 1",
+          np.allclose(tuple(obj.scale), (1.0, 1.0, 1.0), atol=0),
+          str(tuple(obj.scale)))
+
+    result, _refusal = apply_alignment()
+    context.view_layer.update()
+    check("M: Apply is ACCEPTED, not refused", result == {'FINISHED'},
+          str(result) + " | " + props.align_refusal_report[:400])
+    validation = assert_contract("M real scan", props,
+                                 expected_lr_dot_x=math.cos(
+                                     math.radians(residual)))
+    check("M: every criterion passed", validation["ok"],
+          "; ".join(validation["failures"]))
+    inferior = world_references(props)['INFERIOR']
+    check("M: INFERIOR reached the world origin (%.3e, limit %.3e)"
+          % (float(np.linalg.norm(inferior)), validation["origin_limit"]),
+          float(np.linalg.norm(inferior)) <= validation["origin_limit"])
+    check("M: the origin limit is scale-aware, not a fixed 1e-4",
+          validation["origin_limit"] > 1e-4,
+          "limit %.3e on a reach of %.4g"
+          % (validation["origin_limit"], validation["coordinate_reach"]))
+    check("M: and the coordinate reach reflects the un-recentred mesh",
+          validation["coordinate_reach"] > 20000.0,
+          str(validation["coordinate_reach"]))
+    # The regression this pins: 0.25.0 measured 1.008e-03 against a hard 1e-4.
+    check("M: the achieved miss is far inside the limit (%.1fx margin)"
+          % (validation["origin_limit"]
+             / max(validation["origin_distance"], 1e-30)),
+          validation["origin_distance"] * 5.0 < validation["origin_limit"],
+          "%.3e vs %.3e" % (validation["origin_distance"],
+                            validation["origin_limit"]))
+    text, verified, _live = _status(props)
+    check("M: the panel reports it verified", verified, text)
+
+    print("\n  the criterion table this fixture produces:")
+    for item in validation["criteria"]:
+        print("    [%s] %-52s %s" % ("PASS" if item["ok"] else "FAIL",
+                                     item["label"], item["detail"]))
+
+    # ------------------------------------------------------------------ N --
+    print("\nN. a scale sweep - the same geometry in different units")
+    for label, height, distance in (("metres", 1.7, 28.57),
+                                    ("centimetres", 170.0, 2857.0),
+                                    ("millimetres", 1700.0, 28570.0)):
+        obj = make_real_scan(context, location=(-distance, 0.0, 0.0),
+                             rotation=(math.radians(90.1), 0.0, 0.0),
+                             height=height,
+                             local_offset=(distance, 0.0, 0.0))
+        pick_body_references(context, props, obj,
+                             tilt_mm=height * 0.0026, height=height,
+                             local_offset=(distance, 0.0, 0.0))
+        props.align_move_to_origin = True
+        result, _refusal = apply_alignment()
+        context.view_layer.update()
+        validation, _why = attach.validate_applied_alignment(props)
+        check("N: %s - accepted" % label, result == {'FINISHED'},
+              str(result) + " | " + props.align_refusal_report[:300])
+        check("N: %s - the origin criterion passes on its own scale" % label,
+              validation["origin_distance"] <= validation["origin_limit"],
+              "%.3e vs %.3e" % (validation["origin_distance"],
+                                validation["origin_limit"]))
+
+    # ------------------------------------------------------------------ O --
+    print("\nO. a failed post-validation is TRANSACTIONAL")
+    #
+    # A Copy Rotation constraint makes `matrix_world = M` a request Blender
+    # declines: the depsgraph overrides the rotation, so the pose Apply asked
+    # for is not the pose that results, and the postcondition must catch it.
+    # That is the honest way to force a failure - nothing about the check is
+    # stubbed or monkeypatched.
+    obj = make_body(context, (0.4, 0.9, -1.7), (3.0, 1.0, 2.0))
+    pick_all(context, props, obj)
+    props.align_move_to_origin = False
+    bpy.ops.object.empty_add()
+    blocker = context.object
+    blocker.name = "Blocker"
+    blocker.rotation_euler = (math.radians(37.0), math.radians(-11.0),
+                              math.radians(64.0))
+    context.view_layer.objects.active = obj
+    constraint = obj.constraints.new('COPY_ROTATION')
+    constraint.target = blocker
+    context.view_layer.update()
+
+    pre_matrix = np.array(obj.matrix_world, dtype=np.float64)
+    pre_points = {slot: tuple(state.align_point(props, slot).local_xyz)
+                  for slot in state.ALIGN_SLOTS}
+    pre_triangles = {slot: state.align_point(props, slot).triangle_index
+                     for slot in state.ALIGN_SLOTS}
+    pre_applied = props.align_applied
+    pre_status = props.align_method
+
+    result, _refusal = apply_alignment()
+    context.view_layer.update()
+
+    check("O: the operator REFUSES rather than reporting a moved failure",
+          result == {'CANCELLED'}, str(result))
+    post_matrix = np.array(obj.matrix_world, dtype=np.float64)
+    check("O: matrix_world is EXACTLY the pre-Apply matrix (max drift %.2e)"
+          % float(np.abs(post_matrix - pre_matrix).max()),
+          np.array_equal(post_matrix, pre_matrix),
+          "%s\nvs\n%s" % (post_matrix, pre_matrix))
+    check("O: the status is not ALIGNED",
+          not props.align_applied and props.align_applied == pre_applied,
+          "align_applied=%s" % props.align_applied)
+    check("O: align_method is left as it was",
+          props.align_method == pre_status, props.align_method)
+    check("O: the reference points are preserved",
+          {slot: tuple(state.align_point(props, slot).local_xyz)
+           for slot in state.ALIGN_SLOTS} == pre_points)
+    check("O: with their triangles intact",
+          {slot: state.align_point(props, slot).triangle_index
+           for slot in state.ALIGN_SLOTS} == pre_triangles)
+    check("O: and every reference is still valid",
+          all(state.align_point(props, slot).valid
+              for slot in state.ALIGN_SLOTS))
+    check("O: the refusal says WHICH criterion failed, persistently",
+          "[FAIL]" in props.align_refusal_report,
+          props.align_refusal_report[:400])
+    check("O: and it is a real criterion label, not an empty message",
+          any(name in props.align_refusal_report
+              for name in ("world +Z", "world +X", "world +Y")),
+          props.align_refusal_report[:400])
+    text, verified, _live = _status(props)
+    check("O: the panel says the last Apply was refused",
+          not verified and "REFUSED" in text, text)
+    panel = panel_text(panels.BSMT_PT_alignment, context)
+    check("O: the panel renders the refusal table", "[FAIL]" in panel,
+          panel[-600:])
+    check("O: the panel still renders the live criterion table",
+          "Alignment Validation (current pose)" in panel, panel[-600:])
+
+    obj.constraints.remove(constraint)
+    context.view_layer.update()
+
+    # ------------------------------------------------------------------ P --
+    print("\nP. after removing the obstruction the same picks align cleanly")
+    result, _refusal = apply_alignment()
+    context.view_layer.update()
+    check("P: Apply now succeeds with the SAME references",
+          result == {'FINISHED'}, str(result))
+    assert_contract("P recovered", props)
+    check("P: the refusal record is cleared once an Apply succeeds",
+          props.align_refusal_report == "", props.align_refusal_report[:200])
 
     print("\n%d checks, %d failure(s)" % (CHECKS[0], len(FAILURES)))
     for failure in FAILURES:

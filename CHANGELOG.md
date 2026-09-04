@@ -4,6 +4,77 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.25.1 — a tolerance with no dimensions refused a correct alignment
+
+**Reported:** on the real repaired PLY, with **good** references — about 0.4°
+off perpendicular, which BSMT itself calls *"Good — the references are close
+to perpendicular"* — Apply Alignment moved the object and then reported
+*"'scan (1)_BSMT' moved, but the result FAILED validation - "*, with nothing
+after the dash.
+
+**Which criterion failed, measured before changing anything.** Reproduced by
+rebuilding the real geometry: a millimetre-scale body at
+`(-28570, -2692, -176)` whose **mesh data was never recentred**, so the
+vertices carry the matching offset — an ordinary scanner export. Exactly one
+criterion failed, and every angular one passed by orders of magnitude:
+
+| criterion | measured | limit | |
+|---|---|---|---|
+| SI · +Z / LR · +X / posterior · +Y | 0.000000° off | 0.05° | pass |
+| max \|BᵀB − I\| | 2.5e-19 | 1e-6 | pass |
+| LR · +X vs cos(residual) | 1.1e-12 | 1e-6 | pass |
+| **INFERIOR distance from origin** | **1.008e-03** | **1e-4** | **FAIL** |
+
+**Root cause: the transform was right; the validator's one world-unit
+tolerance had no dimensions.** `_ORIGIN_TOLERANCE` was a fixed `1e-4` world
+units. Blender stores an object pose as single-precision loc/rot/scale, so a
+point reconstructed through `matrix_world` carries about 1e-7 of the
+*magnitude of the coordinates involved* — here `R @ local + t` with both terms
+near 30,000, giving ~1e-3 mm, one micrometre. A fixed 1e-4 is a tenth of a
+millimetre on a scan in metres and a tenth of a *micrometre* on this one, ten
+times finer than the storage can hold. Even the cases that passed in 0.25.0
+were using 31% of that budget.
+
+- **`alignment.position_tolerance(reach)`** replaces it: `1e-6` of the
+  coordinate reach — the largest magnitude that actually went through the
+  object transform, supplied by `attach.live_reference_points_and_reach()`.
+  On the real scan that is 2.9e-2 mm against a measured 1.0e-3, a 29× margin;
+  a translation that is genuinely wrong misses by millimetres or metres. The
+  angular criteria are unchanged and still 0.05°: an angle has no scale.
+- **The message could not say what failed** because the origin check lived in
+  the operator, outside `validation["failures"]`, so the list it printed was
+  empty. Every criterion — including the origin — is now judged inside
+  `validate_world_frame`, which returns a `criteria` list of individual
+  PASS/FAIL judgements, and `ok` is just "all of them passed". There is one
+  verdict, reached in one place.
+- **A persistent Alignment Validation panel section** shows the whole table:
+  raw angle, residual, LR · +X with its expected value and angular error,
+  SI · +Z with its angular error, the posterior axis, anterior · +Z,
+  max \|BᵀB − I\|, det(basis), the INFERIOR distance with its limit and the
+  reach it was derived from, then PASS/FAIL per criterion. Re-measured every
+  draw. A toast is not a report.
+- **Apply Alignment is now transactional.** 0.25.0 left the scan transformed
+  under a FAILED banner — neither the original pose nor a valid one. A refusal
+  now restores `matrix_basis` (bit-exact, unlike round-tripping `matrix_world`
+  through single precision, and the only correct thing to restore on a
+  parented or constrained object), puts every status property back as it found
+  it, keeps the reference points untouched, and returns `CANCELLED`. The
+  criterion table measured on the trial pose is kept in
+  `align_refusal_report`, because that pose no longer exists and cannot be
+  re-derived.
+- **`det(basis)` is checked and reported**, and the status names the failing
+  criteria by key rather than quoting one number.
+
+**Verified:** `tests/test_alignment_blender.py` grows to 221 checks. New: the
+real-scan fixture (mm, un-recentred, 0.4° residual, scale 1) must be
+*accepted*; a scale sweep in metres/centimetres/millimetres; and a
+transactional-failure case forced honestly with a Copy Rotation constraint —
+Blender declines the requested pose, validation catches it, and the test
+asserts `matrix_world` is bit-identical to the pre-Apply matrix, the status is
+not ALIGNED, the references survive, the refusal names the criterion, and the
+same references then align cleanly once the obstruction is removed.
+`tests/test_alignment.py` at 123 offline checks.
+
 ## 0.25.0 — alignment proves its own result
 
 **Reported:** BSMT said *Status: Aligned (Landmark)* while the viewport, still

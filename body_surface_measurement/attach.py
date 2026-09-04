@@ -464,40 +464,77 @@ def live_reference_points(props):
     Returns (points, reason). `points` is None when there is nothing to
     measure; `reason` says why in words a researcher can act on.
     """
+    points, reach, reason = live_reference_points_and_reach(props)
+    return points, reason
+
+
+def live_reference_points_and_reach(props):
+    """As `live_reference_points`, plus the coordinate reach of the transform.
+
+    The reach is the largest coordinate magnitude that actually passed through
+    `matrix_world`: the mesh-LOCAL positions of the references and the
+    translation column, not the size of the body. Blender stores an object
+    pose in single precision, so that magnitude - not the body's height - is
+    what sets the absolute error on a reconstructed world point, and it is
+    what any world-unit tolerance has to be measured against.
+
+    A scan whose mesh data was never recentred is the case that matters: the
+    real one sat at (-28570, -2692, -176) with local coordinates carrying the
+    matching offset, so points a millimetre apart were computed as differences
+    of numbers near 30,000.
+
+    Returns (points, reach, reason).
+    """
     names = state.align_objects(props)
     if len(names) > 1:
-        return None, ("the references are on different objects (%s)"
-                      % ", ".join(sorted(names)))
+        return None, 0.0, ("the references are on different objects (%s)"
+                           % ", ".join(sorted(names)))
     points = {}
+    reach = 0.0
     for slot in state.ALIGN_SLOTS:
         point = state.align_point(props, slot)
         if point is None or not point.valid:
-            return None, "the %s reference has not been picked" % slot
+            return None, 0.0, "the %s reference has not been picked" % slot
         obj = bpy.data.objects.get(point.source_object)
         if obj is None:
-            return None, ("the reference object '%s' is missing"
-                          % point.source_object)
+            return None, 0.0, ("the reference object '%s' is missing"
+                               % point.source_object)
         canonical = (geodesic.meshcache.peek(point.source_object)
                      if geodesic.MESHCACHE_AVAILABLE else None)
         local, _origin = local_position(point, canonical)
         matrix = np.array(obj.matrix_world, dtype=np.float64)
         points[slot] = matrix[:3, :3] @ local + matrix[:3, 3]
-    return points, ""
+        reach = max(reach, float(np.abs(local).max()),
+                    float(np.abs(matrix[:3, 3]).max()),
+                    float(np.abs(points[slot]).max()))
+    return points, reach, ""
 
 
-def validate_applied_alignment(props):
+def validate_applied_alignment(props, require_origin=None):
     """Measure the applied pose against the advertised contract.
+
+    `require_origin` says whether Move To World Origin was part of what was
+    asked for; when None it follows the current setting. Passing it explicitly
+    matters for a MANUAL alignment, which never moves anything to the origin
+    and must not be judged as though it had.
 
     Returns (validation, reason). `validation` is None when the measurement
     could not be made at all - which is itself never reported as success.
     """
-    points, reason = live_reference_points(props)
+    points, reach, reason = live_reference_points_and_reach(props)
     if points is None:
         return None, reason
+    if require_origin is None:
+        # What was ASKED FOR when Apply ran, not what the checkbox says now.
+        # Toggling the option afterwards must not retroactively invalidate an
+        # alignment that was never asked to move anything to the origin.
+        require_origin = bool(props.align_origin_requested)
     try:
         validation = alignment.validate_world_frame(
             points['LEFT'], points['RIGHT'],
-            points['SUPERIOR'], points['INFERIOR'])
+            points['SUPERIOR'], points['INFERIOR'],
+            origin_reference='INFERIOR' if require_origin else None,
+            coordinate_reach=reach)
     except alignment.AlignmentError as exc:
         return None, str(exc)
     return validation, ""
@@ -525,8 +562,26 @@ def store_validation(props, validation, reason=""):
     return props.align_validation
 
 
-def alignment_status(props):
+def validation_criteria(props):
+    """The live per-criterion PASS/FAIL table, or (None, reason).
+
+    Read by the panel every draw. Writes nothing.
+    """
+    validation, reason = validate_applied_alignment(props)
+    if validation is None:
+        return None, reason
+    return validation, ""
+
+
+_UNSET = object()
+
+
+def alignment_status(props, validation=_UNSET, reason=""):
     """The status line, MEASURED rather than remembered.
+
+    `validation` may be passed in when the caller has already measured - the
+    panel draws the criterion table from the same dict, and computing it twice
+    could only produce two answers to one question.
 
     Returns (text, ok, validation). `validation` is the live measurement, or
     None when none could be made - the panel shows those numbers rather than
@@ -546,18 +601,25 @@ def alignment_status(props):
     satisfy the contract - both of which are true things the old status could
     not express.
     """
+    if validation is _UNSET:
+        validation, reason = validate_applied_alignment(props)
+    if props.align_refusal_report:
+        # A refusal restores every other status property, so this is the only
+        # thing left that knows the last Apply was turned down.
+        return ("%s - the last Apply was REFUSED and rolled back"
+                % ("Aligned (%s)" % props.align_method.title()
+                   if props.align_applied else "Not aligned"),
+                False, validation)
     if not props.align_applied:
-        return "Not aligned", False, None
+        return "Not aligned", False, validation
     method = props.align_method.title() or "Manual"
-    validation, reason = validate_applied_alignment(props)
     if validation is None:
         return ("Aligned (%s) - NOT validated: %s" % (method, reason),
                 False, None)
     if validation["ok"]:
         return "Aligned (%s) - verified" % method, True, validation
-    return ("Alignment FAILED validation: SI . +Z = %+.4f, worst axis error "
-            "%.2f deg" % (validation["si_dot_z"],
-                          validation["worst_axis_error_degrees"]),
+    failed = [item["key"] for item in validation["criteria"] if not item["ok"]]
+    return ("Alignment FAILED validation on: %s" % ", ".join(failed),
             False, validation)
 
 
