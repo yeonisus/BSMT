@@ -16,7 +16,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 #: modern way. This constant is defined by the module itself, survives both
 #: packaging modes, and is what tools/build_release.py reads to stamp the
 #: extension manifest, so the two can never disagree.
-VERSION = (0, 24, 2)
+VERSION = (0, 25, 0)
 
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
@@ -49,7 +49,9 @@ bl_info = {
         "Milestone 3.18: one blocking-defect policy for readiness and the "
         "solver gate. "
         "Milestone 3.19: Mesh Repair v1 - bounded local repair of degenerate "
-        "triangles"
+        "triangles. "
+        "Milestone 3.22: alignment validates its own result against the "
+        "anatomical axis contract"
     ),
     "category": "3D View",
 }

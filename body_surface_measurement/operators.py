@@ -5127,18 +5127,42 @@ def _apply_world_matrix(obj, matrix_rows):
     obj.matrix_world = Matrix([[float(v) for v in row] for row in matrix_rows])
 
 
+#: How close the origin reference must land to world (0,0,0), in world units,
+#: for "Move To World Origin" to count as done. A rigid translate is exact up
+#: to float error on the magnitudes involved; this is generous for a scan
+#: authored in millimetres far from the origin.
+_ORIGIN_TOLERANCE = 1e-4
+
+
+def _axis_helper_length(frame):
+    """Length of the drawn axis arms, in WORLD units - what the helper uses."""
+    return max(float(frame["vertical_span"]) * 0.35, 1e-6)
+
+
 def _remember_pre_alignment(props, obj):
     """Record the transform to return to, once per alignment session."""
-    if not props.align_applied or props.align_object != obj.name:
+    if not props.align_moved or props.align_object != obj.name:
         props.align_previous_matrix = state.matrix_to_flat(obj.matrix_world)
         props.align_object = obj.name
 
 
-def _refresh_after_alignment(context, props, obj, method, lines):
-    """Re-derive helper positions and confirm nothing metric changed."""
+def _refresh_after_alignment(context, props, obj, method, lines,
+                             applied=True):
+    """Re-derive helper positions and confirm nothing metric changed.
+
+    `applied` is the measured verdict, not a formality: an alignment that
+    moved the object but failed its own postcondition must not leave the panel
+    saying "Aligned".
+    """
     import datetime
 
-    props.align_applied = True
+    props.align_applied = bool(applied)
+    # Separate from align_applied on purpose: this one records "BSMT has moved
+    # this object and holds a restore point for it", which stays true even
+    # when the result failed validation. Tying the restore point to the
+    # success verdict would let a second Apply overwrite the researcher's only
+    # way back to the original pose.
+    props.align_moved = True
     props.align_object = obj.name
     props.align_method = method
     props.align_created = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -5253,11 +5277,27 @@ class BSMT_OT_manual_align(bpy.types.Operator):
             label = "rotated %+.1f deg about world %s" % (self.degrees, self.axis)
 
         _apply_world_matrix(obj, updated)
+        context.view_layer.update()
         lines = ["Manual alignment of '%s'" % obj.name, "  " + label,
                  "  " + alignment.AXIS_DESCRIPTION]
+
+        # A manual nudge is still subject to the same contract, so when there
+        # ARE references it is measured against them rather than trusted. With
+        # no references there is nothing to measure, and the status says that
+        # instead of implying a check that never happened.
+        validation, why = attach.validate_applied_alignment(props)
+        attach.store_validation(props, validation, why)
+        if validation is not None:
+            lines.append("")
+            lines.extend(alignment.validation_lines(validation))
         _refresh_after_alignment(context, props, obj,
-                                 alignment.METHOD_MANUAL, lines)
-        self.report({'INFO'}, "BSMT: %s %s" % (obj.name, label))
+                                 alignment.METHOD_MANUAL, lines,
+                                 applied=True)
+        self.report({'INFO'}, "BSMT: %s %s%s"
+                    % (obj.name, label,
+                       "" if validation is None or validation["ok"]
+                       else " - the references do NOT satisfy the axis "
+                            "contract in this pose"))
         return {'FINISHED'}
 
 
@@ -5285,22 +5325,34 @@ class BSMT_OT_preview_alignment(bpy.types.Operator):
             self.report({'ERROR'}, "BSMT: " + reason)
             return {'CANCELLED'}
         try:
-            frame, _points = _build_frame(props)
+            frame, points = _build_frame(props)
         except alignment.AlignmentError as exc:
             self.report({'ERROR'}, "BSMT: %s" % exc)
             return {'CANCELLED'}
 
-        origin = np.array(state.align_point(props, 'INFERIOR').world_xyz,
-                          dtype=np.float64)
-        length = max(frame["vertical_mm"] * 0.35, 1.0) \
-            / measurement.unit_multiplier(props.unit)
-        visualization.show_alignment_axes(context, origin, length)
+        origin = points['INFERIOR']
+        # The span is already in world units - the axes are drawn in world
+        # space - so it must NOT be divided by the mm multiplier. Doing so
+        # made the preview axes 1000x too short on a scan authored in metres.
+        length = _axis_helper_length(frame)
+        # THE SAME BASIS Apply will use. Until now the preview drew the WORLD
+        # axes, which are identical whatever the references are: it could not
+        # disagree with a wrong alignment because it was not looking at the
+        # references at all. Drawn along `frame["matrix"]`, the arms point
+        # where the subject's left, posterior and superior currently are, so
+        # "does the blue arm run up the body?" is finally a real check.
+        visualization.show_alignment_axes(context, origin, length,
+                                          basis=frame["matrix"])
         props.align_preview = True
         props.align_residual_degrees = frame["residual_degrees"]
 
         lines = alignment.alignment_report(
-            frame, alignment.scale_report(obj.matrix_world))
+            frame, alignment.scale_report(obj.matrix_world),
+            multiplier=measurement.unit_multiplier(props.unit))
         lines.insert(1, "  preview only - nothing has been moved")
+        lines.append("  axes drawn along the frame Apply would use, at the "
+                     "INFERIOR reference")
+        lines.append("  " + alignment.orthogonalisation_note(frame))
         props.align_report = "\n".join(lines)
         print("\n[BSMT] " + "\n".join(lines) + "\n")
         self.report(
@@ -5330,15 +5382,19 @@ class BSMT_OT_clear_alignment_preview(bpy.types.Operator):
 
 
 def _build_frame(props):
-    """The anatomical frame from the four references, in world space."""
-    points = {}
-    for slot in state.ALIGN_SLOTS:
-        point = state.align_point(props, slot)
-        if not point.valid:
-            raise alignment.AlignmentError(
-                "the %s reference has not been picked" % slot
-            )
-        points[slot] = np.array(point.world_xyz, dtype=np.float64)
+    """The anatomical frame from the four references, in world space.
+
+    The world positions are reconstructed from the live `matrix_world`, not
+    read from the SurfacePoint's cached `world_xyz`. The cache is normally
+    correct - `attach.refresh` keeps it so - but "normally" is not a thing to
+    build a rotation on: any path that moves the object without reaching the
+    handler would have the frame describe a pose the object left, and the
+    resulting alignment would be wrong by exactly that missed motion while
+    reporting a clean residual.
+    """
+    points, reason = attach.live_reference_points(props)
+    if points is None:
+        raise alignment.AlignmentError(reason)
     frame = alignment.anatomical_frame(
         points['LEFT'], points['RIGHT'], points['SUPERIOR'], points['INFERIOR'])
     return frame, points
@@ -5404,29 +5460,75 @@ class BSMT_OT_apply_alignment(bpy.types.Operator):
             return {'CANCELLED'}
 
         _apply_world_matrix(obj, updated)
+        # Blender must have settled before anything is measured: matrix_world
+        # is a *request* on an object with a parent, a delta transform or a
+        # constraint, and the pose that matters is the one the depsgraph
+        # actually produced.
+        context.view_layer.update()
 
         lines = alignment.alignment_report(
-            frame, alignment.scale_report(obj.matrix_world))
+            frame, alignment.scale_report(obj.matrix_world),
+            multiplier=measurement.unit_multiplier(props.unit))
         lines.insert(1, "  object: %s" % obj.name)
         lines.append("  rotation applied about the INFERIOR reference")
         if props.align_move_to_origin:
             lines.append("  inferior reference moved to the world origin")
         lines.append("  rigid: rotation + translation only, no scale")
         lines.append("  mesh geometry, geometry hash and metric key unchanged")
+        lines.append("  " + alignment.orthogonalisation_note(frame))
         props.align_residual_degrees = frame["residual_degrees"]
+
+        # ---- the postcondition -------------------------------------------
+        # Everything above is what BSMT INTENDED. This is what it achieved,
+        # measured from the four references reconstructed against the pose the
+        # object is actually in. "Aligned" is now a result, not an assertion.
+        validation, why = attach.validate_applied_alignment(props)
+        verdict = attach.store_validation(props, validation, why)
+        lines.append("")
+        lines.extend(alignment.validation_lines(validation)
+                     if validation is not None
+                     else ["Applied-frame check could not be made: " + why])
+
+        if props.align_move_to_origin and validation is not None:
+            landed = float(np.linalg.norm(validation["inferior_world"]))
+            lines.append("  Move To World Origin: INFERIOR landed %.3e world "
+                         "units from (0,0,0)%s"
+                         % (landed,
+                            "" if landed <= _ORIGIN_TOLERANCE
+                            else "  <- OUTSIDE TOLERANCE"))
+            if landed > _ORIGIN_TOLERANCE:
+                verdict = 'FAIL'
+                props.align_validation = 'FAIL'
+
         _refresh_after_alignment(context, props, obj,
-                                 alignment.METHOD_LANDMARK, lines)
+                                 alignment.METHOD_LANDMARK, lines,
+                                 applied=(verdict == 'PASS'))
 
         if props.align_preview:
+            # Aligned means the anatomical frame IS the world frame, so the
+            # helper is drawn on the identity basis - and if that ever looks
+            # wrong, the validation above has already said so in numbers.
             visualization.show_alignment_axes(
                 context, np.zeros(3) if props.align_move_to_origin else pivot,
-                max(frame["vertical_mm"] * 0.35, 1.0)
-                / measurement.unit_multiplier(props.unit))
+                _axis_helper_length(frame), basis=np.eye(3))
+
+        if verdict != 'PASS':
+            self.report(
+                {'ERROR'},
+                "BSMT: '%s' moved, but the result FAILED validation - %s"
+                % (obj.name,
+                   "; ".join(validation["failures"]) if validation is not None
+                   else why))
+            return {'FINISHED'}
 
         self.report(
             {'WARNING'} if not frame["residual_ok"] else {'INFO'},
-            "BSMT: '%s' aligned - residual %.2f deg. %s"
-            % (obj.name, frame["residual_degrees"], alignment.AXIS_DESCRIPTION),
+            "BSMT: '%s' aligned and VERIFIED - SI.+Z = %+.6f, LR.+X = %+.6f "
+            "(cos of the %.2f deg residual), worst axis error %.4f deg. %s"
+            % (obj.name, validation["si_dot_z"], validation["lr_dot_x"],
+               frame["residual_degrees"],
+               validation["worst_axis_error_degrees"],
+               alignment.AXIS_DESCRIPTION),
         )
         return {'FINISHED'}
 
@@ -5459,19 +5561,42 @@ class BSMT_OT_flip_front_back(bpy.types.Operator):
         _remember_pre_alignment(props, obj)
         current = np.array(obj.matrix_world, dtype=np.float64)
         pivot = current[:3, 3].copy()
-        point = state.align_point(props, 'INFERIOR')
-        if point.valid:
-            pivot = np.array(point.world_xyz, dtype=np.float64)
+        live, _reason = attach.live_reference_points(props)
+        if live is not None:
+            pivot = live['INFERIOR']
         updated = alignment.compose(current, alignment.flip_matrix(),
                                     pivot=pivot)
         _apply_world_matrix(obj, updated)
+        context.view_layer.update()
 
         lines = ["Flip front/back on '%s'" % obj.name,
                  "  180 deg about Z - the correction for swapped left/right",
                  "  " + alignment.AXIS_DESCRIPTION]
+        swapped = False
+        if live is not None:
+            # The turn and the relabelling are one correction, not two. See
+            # state.swap_align_points().
+            state.swap_align_points(props, 'LEFT', 'RIGHT')
+            swapped = True
+            lines.append("  the LEFT and RIGHT references were exchanged with "
+                         "the body, so the labels still describe the subject")
+
+        applied = props.align_applied
+        if swapped:
+            validation, why = attach.validate_applied_alignment(props)
+            verdict = attach.store_validation(props, validation, why)
+            lines.append("")
+            lines.extend(alignment.validation_lines(validation)
+                         if validation is not None
+                         else ["Applied-frame check could not be made: " + why])
+            applied = verdict == 'PASS'
         _refresh_after_alignment(context, props, obj, props.align_method
-                                 or alignment.METHOD_MANUAL, lines)
-        self.report({'INFO'}, "BSMT: '%s' flipped front/back" % obj.name)
+                                 or alignment.METHOD_MANUAL, lines,
+                                 applied=applied)
+        self.report({'INFO'}, "BSMT: '%s' flipped front/back%s"
+                    % (obj.name,
+                       "" if not swapped or applied
+                       else " - the result does NOT satisfy the axis contract"))
         return {'FINISHED'}
 
 
@@ -5489,7 +5614,8 @@ class BSMT_OT_reset_alignment(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         props = state.get_props(context)
-        return props is not None and bool(props.align_object)
+        return (props is not None and bool(props.align_object)
+                and props.align_moved)
 
     def execute(self, context):
         props = state.get_props(context)
@@ -5504,7 +5630,14 @@ class BSMT_OT_reset_alignment(bpy.types.Operator):
         visualization.clear_alignment_helpers()
 
         props.align_applied = False
+        props.align_moved = False
         props.align_preview = False
+        props.align_validation = ""
+        props.align_validation_report = ""
+        props.align_lr_dot_x = 0.0
+        props.align_si_dot_z = 0.0
+        props.align_axis_error_degrees = 0.0
+        props.align_orthogonality_error = 0.0
         props.align_report = ("Alignment reset - '%s' restored to its "
                               "pre-alignment transform" % obj.name)
         print("[BSMT] " + props.align_report)

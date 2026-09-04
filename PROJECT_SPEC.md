@@ -4321,6 +4321,138 @@ mesh-repair, 35 degenerate-policy, 110 preprocessing and 90 path-visualisation c
 
 ---
 
+## 11z. Milestone 3.22 — Alignment proves its own result (v0.25.0, 2026-09-04)
+
+### 11z.1 The report
+
+On a real scan, BSMT reported **Status: Aligned (Landmark)** while the viewport, still in Top
+Orthographic, plainly showed the subject from the **front**. The panel's own convention says
+`+Z = superior`, and a Top view looks along +Z — so if the status were true, Top Orthographic
+would show the crown of the head, not a face. One of the two was lying, and an earlier session
+had also seen a residual of about 14.53°.
+
+### 11z.2 The rotation was correct. Measured before anything was changed.
+
+Instrumented in Blender 4.5.13 against the real operator, with the four references reconstructed
+in world space and the axes measured — never read off Euler angles:
+
+| Case | SI · +Z after Apply | LR · +X after Apply |
+|---|---|---|
+| Identity pose | +1.000000 | +1.000000 |
+| 90° about X | +1.000000 | +1.000000 |
+| Arbitrary XYZ | +1.000000 | +1.000000 |
+| Large translation + rotation | +1.000000 | +1.000000 |
+| Object with a **delta rotation** | +1.000000 | +0.999983 |
+| **Parented** object | +1.000000 | +0.999983 |
+
+`anatomical_frame` builds columns [left, posterior, superior] expressed in the current world;
+`rotation_to_world` transposes it, which for a rotation is its inverse and is therefore the
+world→anatomical map; `compose` left-multiplies, so `p_world_new = R p_world_old`, and
+`R x_axis = e_x` exactly. Superior-inferior is the primary axis and is never orthogonalised, so
+`SI · +Z` is `+1` to float error in every case. **There was no matrix bug.**
+
+### 11z.3 Root cause: the status was a latch, not a measurement
+
+`props.align_applied` was set to `True` by the fact that an operator had run. The panel read it as
+a statement about the object's **pose**. Those are different claims, and nothing ever re-checked
+the second one.
+
+Reproduced exactly: align correctly (`SI · +Z = +1.000000`), then rotate the scan 90° about X by
+hand. `SI · +Z` becomes `-0.000000` — superior now runs along −Y, which is precisely what a Top
+view renders as a frontal silhouette — and the panel still said **Aligned (Landmark)**. Undo, a
+parent moving, another add-on, or a second BSMT operation all reach the same state.
+
+A second, quieter part of the same defect: the contract has three axes, and only one of them was
+ever exact. `LR · +X` is `cos(residual)` by construction — at the reported 14.53° that is 0.968,
+i.e. the subject's left sitting 14.5° off +X. The residual was shown; this consequence of it
+never was.
+
+### 11z.4 The fix — the postcondition is measured, and the status is derived from it
+
+- **`alignment.validate_world_frame()`** (pure numpy) takes the four references *in world space*
+  and measures the contract: per-axis error against +X/+Y/+Z, `max |BᵀB − I|`, raw `LR · +X` and
+  `SI · +Z`, the raw angle between the two picked directions, and `frontal_normal_dot_up` — the
+  anterior-posterior axis dotted with world up, which is 0 when +Z really is superior and ±1 in
+  exactly the situation that was reported. Three things are kept separate on purpose: the
+  orthonormal frame (hard postcondition), the raw picks (`LR · +X` is checked to *equal*
+  `cos(residual)`, never required to be 1 — that would refuse every real landmark pair), and the
+  visual consequence.
+- **`attach.live_reference_points()`** reconstructs the four references from each SurfacePoint's
+  stored local position against the live `matrix_world`, never from the cached `world_xyz`. A
+  postcondition that reads the cache can only prove the cache self-consistent. `_build_frame` now
+  uses the same path, which removes the whole staleness class from the *input* to the rotation as
+  well as from the check on it.
+- **Apply Alignment** calls `view_layer.update()` before measuring — `matrix_world` is a *request*
+  on a parented, delta-transformed or constrained object — then validates, and only sets
+  "Aligned" when the measurement passes. A failure reports the numbers and returns `FINISHED`
+  with an `ERROR`: the object has moved and Reset is the way back, so pretending otherwise would
+  be worse.
+- **The panel status is re-measured every draw** (`attach.alignment_status`), so it can say
+  *Aligned (Landmark) — verified*, *Alignment FAILED validation: SI · +Z = …*, or
+  *Aligned — NOT validated: …*, and it prints the live dot products beside the words. Nothing
+  writes a property from `draw()`.
+- **Flip Front/Back now exchanges the LEFT and RIGHT references with the body.** It is the
+  correction for swapped labels; turning the body without relabelling would leave the stored LEFT
+  reference on the subject's right and make every later check read the correction as a 180° error.
+
+### 11z.5 Preview Axes could not disagree with anything
+
+`show_alignment_axes` drew the **world** axes — three arms along +X/+Y/+Z whatever the four
+references were. It therefore agreed with every alignment, including a wrong one, and the "look
+before you leap" check it exists for was decorative. It now takes the `basis` Apply will use, so
+in the pre-aligned pose the arms point where the subject's left, posterior and superior currently
+are. After Apply the same arms lie on the world axes, which is what agreement looks like.
+
+Two arithmetic errors surfaced beside it: the axis length divided a **world-unit** span by the
+millimetre multiplier (1000× too short on a scan authored in metres), and `alignment_report`
+printed those same world-unit spans labelled `mm`. Both are now unit-correct; the frame keys are
+`lateral_span` / `vertical_span` to stop the mistake recurring.
+
+### 11z.6 `metric_key` was not rotation-invariant, and the acceptance test caught it
+
+Sect. 6.3 says a rigid alignment leaves the metric state untouched, and `alignment.py` says so in
+its own docstring. Measured, it did not: after Apply the metric key changed, silently forcing
+every geodesic to be recomputed.
+
+`METRIC_QUANTISATION` was 1e-9 — **finer than the precision of its own input**. Blender stores an
+object transform in single precision, so a rotation read back out of `matrix_world` is orthonormal
+only to ~1e-7 relative, and squaring it into `T = LᵀL` doubles that: `T` came back as
+`diag(0.99999997, 0.99999997, 1.0)`. Quantising at 1e-6 sits above that noise floor and still
+separates any scale change a body scan could meaningfully have — 1 ppm is two micrometres on a
+two-metre subject. The magnitude term, previously kept to 12 significant digits, is quantised at
+the same resolution as the shape rather than a finer one.
+
+This is outside alignment, and it is recorded here because alignment is what exposed it and
+because "rigid-invariant metric state unchanged" is one of the invariants alignment claims.
+
+### 11z.7 What is verified
+
+`tests/test_alignment_blender.py` (new, 176 checks under Blender). Every successful case asserts
+the **transformed world reference vectors**; Euler angles are never used as evidence.
+
+| Case | Asserted |
+|---|---|
+| A identity, B 90° X, C three arbitrary XYZ, D large translation + rotation | `SI · +Z = 1`, `LR · +X = cos(residual)`, `max |BᵀB − I| ≤ 1e-9`, worst axis error ≤ 1e-4° |
+| B before Apply | contract **fails**, and `frontal_normal_dot_up > 0.99` — the frontal plane *is* the Top view |
+| E imperfect picks (29.75° residual) | frame still exactly orthonormal, `SI · +Z` still exact, `LR · +X` exactly `cos(residual)`, method named |
+| F origin ON | INFERIOR lands within 1e-4 of (0,0,0), **and** rotation correct independently |
+| G origin OFF | INFERIOR does not move at all; body not at the origin; rotation correct anyway |
+| H the reported defect | after a hand rotation the status stops claiming Aligned and reports the measured error |
+| I Preview | each drawn arm *is* the frame's axis; not the world axes on a rotated scan; agrees with the applied result |
+| J Flip | superior stays +Z, left stays +X, alignment stays verified |
+| K Reset | pre-alignment matrix restored to storage precision; the claim is dropped |
+| L Panel | the three status states, with live dot products, drawn headless |
+| every case | geometry hash, metric key, mesh vertices, SurfacePoint triangle/barycentric, object scale and all six pairwise reference distances unchanged |
+
+`tests/test_alignment.py` grows to 121 offline checks, including a body lying on its back failing
+validation with `z_error = 90°` and a mislabelled left/right failing with `LR · +X = −1`.
+
+Regression: 2,563 offline checks across twenty-one suites, plus 176 alignment, 45 picking, 98
+workflow-UI, 76 mesh-repair, 35 degenerate-policy, 110 preprocessing and 90 path-visualisation
+checks in Blender. 0 failures.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~

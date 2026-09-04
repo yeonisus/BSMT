@@ -11,7 +11,17 @@ import numpy as np
 
 # Relative rounding applied to the metric tensor before hashing, so that
 # floating point noise in matrix_world cannot spuriously invalidate a result.
-METRIC_QUANTISATION = 1e-9
+#
+# It has to be COARSER than the precision matrix_world actually has, and at
+# 1e-9 it was not. Blender stores an object transform in single precision, so
+# a rotation read back out is orthonormal only to ~1e-7 relative, and squaring
+# it into T = L^T L can double that. A pure rotation - which cannot change any
+# distance, and which is all Apply Alignment ever does - therefore produced a
+# different metric key, silently forcing every geodesic to be recomputed and
+# contradicting sect. 6.3. Quantising at 1e-6 sits above the noise floor of
+# the input and is still far finer than any scale change a body scan could
+# meaningfully have: 1 ppm is two micrometres on a two-metre subject.
+METRIC_QUANTISATION = 1e-6
 
 
 def to_solver_space(vertices_local, matrix_world, unit_multiplier):
@@ -65,7 +75,19 @@ def metric_key(linear, unit_multiplier):
 
       shape     T normalised by its own magnitude, coarsely quantised. Absorbs
                 floating point noise; invariant under uniform rescaling.
-      magnitude that magnitude, kept to 12 significant digits.
+      magnitude that magnitude, quantised to the SAME relative resolution as
+                the shape (METRIC_QUANTISATION). Twelve significant digits was
+                finer than the shape, and that asymmetry made the key
+                rotation-variant in practice: Blender stores an object pose as
+                loc/rot/scale, so reading `matrix_world` back after setting it
+                returns a linear part orthonormal only to ~1e-10, and
+                max|T| moved from 1.000000000000 to 1.000000000305. Alignment
+                - a pure rotation, which cannot change a distance - therefore
+                changed the metric key and forced every geodesic to be
+                recomputed. Resolving the magnitude no more finely than the
+                shape closes that gap while still separating any scale change
+                a body scan could meaningfully have (1e-9 relative is a
+                nanometre on a metre).
 
     Both are required. Hashing only the normalised shape would make the key
     scale-invariant, and a uniform scale would then wrongly reuse a cached
@@ -93,5 +115,7 @@ def metric_key(linear, unit_multiplier):
 
     digest = hashlib.blake2b(digest_size=8)
     digest.update(np.ascontiguousarray(shape, dtype=np.float64).tobytes())
-    digest.update(("%.12e" % magnitude).encode("utf-8"))
+    quantised_magnitude = round(magnitude / METRIC_QUANTISATION) \
+        * METRIC_QUANTISATION
+    digest.update(("%.12e" % quantised_magnitude).encode("utf-8"))
     return digest.hexdigest()

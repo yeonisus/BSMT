@@ -32,7 +32,8 @@ import bpy
 import numpy as np
 from bpy.app.handlers import persistent
 
-from . import geodesic, landmarks, measurement, state, visualization
+from . import (alignment, geodesic, landmarks, measurement, state,
+               visualization)
 
 # Movement below this (world units) is not worth a property write.
 _POSITION_EPSILON = 1e-9
@@ -93,7 +94,7 @@ def _changed(current, wanted):
     return float(difference.max()) > _POSITION_EPSILON
 
 
-def _local_position(point, canonical):
+def local_position(point, canonical):
     """Object-local position of a stored surface point, and where it came from.
 
     The canonical mesh is authoritative when it is cached AND still describes
@@ -149,7 +150,7 @@ def refresh_alignment_points(props, watched=None, multiplier=None):
             continue
         canonical = (meshcache.peek(point.source_object)
                      if meshcache is not None else None)
-        local, _origin = _local_position(point, canonical)
+        local, _origin = local_position(point, canonical)
         world = _apply(np.array(obj.matrix_world, dtype=np.float64), local)
         if _changed(point.world_xyz, world):
             point.world_xyz = tuple(float(v) for v in world)
@@ -306,7 +307,7 @@ def refresh(props, watched=None, reason="manual"):
         if meshcache is not None:
             canonical = meshcache.peek(point.source_object)
 
-        local, origin = _local_position(point, canonical)
+        local, origin = local_position(point, canonical)
         matrix = np.array(obj.matrix_world, dtype=np.float64)
         world = _apply(matrix, local)
         world_positions[slot] = world
@@ -438,6 +439,126 @@ def _describe_update(update):
         bool(getattr(update, "is_updated_transform", False)),
         bool(getattr(update, "is_updated_geometry", False)),
     )
+
+
+# ---------------------------------------------------------------------------
+# Alignment postcondition (Milestone 3.20)
+# ---------------------------------------------------------------------------
+#
+# These live here, not in operators.py, because the PANEL needs them too: the
+# alignment status has to be re-measured every draw rather than read from a
+# flag an operator set once. attach.py already owns the one way BSMT turns a
+# stored SurfacePoint back into a world position, so putting the check beside
+# it keeps a single reconstruction path.
+
+
+def live_reference_points(props):
+    """The four alignment references in world space, from the LIVE transform.
+
+    Deliberately NOT `point.world_xyz`. That field is a cache kept current by
+    `attach.refresh`, and a postcondition that reads the cache can only ever
+    prove the cache self-consistent. Reconstructing from the stored local
+    position and the object's current `matrix_world` is what makes the check
+    an independent measurement of the pose rather than a restatement of it.
+
+    Returns (points, reason). `points` is None when there is nothing to
+    measure; `reason` says why in words a researcher can act on.
+    """
+    names = state.align_objects(props)
+    if len(names) > 1:
+        return None, ("the references are on different objects (%s)"
+                      % ", ".join(sorted(names)))
+    points = {}
+    for slot in state.ALIGN_SLOTS:
+        point = state.align_point(props, slot)
+        if point is None or not point.valid:
+            return None, "the %s reference has not been picked" % slot
+        obj = bpy.data.objects.get(point.source_object)
+        if obj is None:
+            return None, ("the reference object '%s' is missing"
+                          % point.source_object)
+        canonical = (geodesic.meshcache.peek(point.source_object)
+                     if geodesic.MESHCACHE_AVAILABLE else None)
+        local, _origin = local_position(point, canonical)
+        matrix = np.array(obj.matrix_world, dtype=np.float64)
+        points[slot] = matrix[:3, :3] @ local + matrix[:3, 3]
+    return points, ""
+
+
+def validate_applied_alignment(props):
+    """Measure the applied pose against the advertised contract.
+
+    Returns (validation, reason). `validation` is None when the measurement
+    could not be made at all - which is itself never reported as success.
+    """
+    points, reason = live_reference_points(props)
+    if points is None:
+        return None, reason
+    try:
+        validation = alignment.validate_world_frame(
+            points['LEFT'], points['RIGHT'],
+            points['SUPERIOR'], points['INFERIOR'])
+    except alignment.AlignmentError as exc:
+        return None, str(exc)
+    return validation, ""
+
+
+def store_validation(props, validation, reason=""):
+    """Record what was measured, and let it - not the operator - set status."""
+    if validation is None:
+        props.align_validation = 'UNKNOWN'
+        props.align_lr_dot_x = 0.0
+        props.align_si_dot_z = 0.0
+        props.align_axis_error_degrees = 0.0
+        props.align_orthogonality_error = 0.0
+        props.align_validation_report = (
+            "Alignment could not be validated: %s" % reason)
+        return props.align_validation
+    props.align_validation = 'PASS' if validation["ok"] else 'FAIL'
+    props.align_lr_dot_x = float(validation["lr_dot_x"])
+    props.align_si_dot_z = float(validation["si_dot_z"])
+    props.align_axis_error_degrees = float(
+        validation["worst_axis_error_degrees"])
+    props.align_orthogonality_error = float(validation["orthogonality_error"])
+    props.align_validation_report = "\n".join(
+        alignment.validation_lines(validation))
+    return props.align_validation
+
+
+def alignment_status(props):
+    """The status line, MEASURED rather than remembered.
+
+    Returns (text, ok, validation). `validation` is the live measurement, or
+    None when none could be made - the panel shows those numbers rather than
+    the ones stored at Apply, so the text and the figures beside it can never
+    describe two different poses. Nothing here writes to `props`: this runs
+    from `draw()`, where writing a property is not allowed.
+
+
+    The defect this replaces: `align_applied` was a latch set by the fact that
+    an operator had run, and the panel read it as a statement about the
+    object's pose. Those are different claims. Rotate the scan by hand after a
+    correct alignment and the pose stops satisfying the contract while the
+    latch, and therefore the panel, still said "Aligned (Landmark)".
+
+    So the status is now re-derived from the live transform every draw. It can
+    say the object has moved since, and it can say the applied frame does not
+    satisfy the contract - both of which are true things the old status could
+    not express.
+    """
+    if not props.align_applied:
+        return "Not aligned", False, None
+    method = props.align_method.title() or "Manual"
+    validation, reason = validate_applied_alignment(props)
+    if validation is None:
+        return ("Aligned (%s) - NOT validated: %s" % (method, reason),
+                False, None)
+    if validation["ok"]:
+        return "Aligned (%s) - verified" % method, True, validation
+    return ("Alignment FAILED validation: SI . +Z = %+.4f, worst axis error "
+            "%.2f deg" % (validation["si_dot_z"],
+                          validation["worst_axis_error_degrees"]),
+            False, validation)
 
 
 @persistent

@@ -4,6 +4,77 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.25.0 — alignment proves its own result
+
+**Reported:** BSMT said *Status: Aligned (Landmark)* while the viewport, still
+in Top Orthographic, plainly showed the subject from the **front**. The panel's
+own convention says `+Z = superior`, and a Top view looks along +Z, so if the
+status were true the view would show the crown of the head. An earlier session
+had also seen a residual of about 14.53°.
+
+**The rotation was correct.** Measured in Blender 4.5.13 against the real
+operator, with the four references reconstructed in world space and the axes
+measured rather than read off Euler angles: `SI · +Z = +1.000000` after Apply
+in every case — identity, 90° about X, arbitrary XYZ, large translation plus
+rotation, an object with a delta rotation, and a parented object. There was no
+matrix bug to fix.
+
+**Root cause: the status was a latch, not a measurement.** `align_applied` was
+set by the fact that an operator had run, and the panel read it as a statement
+about the object's *pose*. Nothing ever re-checked the second claim. Align
+correctly, then rotate the scan 90° about X by hand: `SI · +Z` becomes
+`-0.000000` — superior now runs along −Y, which is exactly what a Top view
+renders as a frontal silhouette — and the panel still said *Aligned
+(Landmark)*. Undo, a parent moving, or any other add-on reach the same state.
+
+A quieter half of the same defect: only one of the three axes was ever exact.
+`LR · +X` is `cos(residual)` by construction — at 14.53° that is 0.968, the
+subject's left sitting 14.5° off +X. The residual was shown; this consequence
+of it never was.
+
+- **`alignment.validate_world_frame()`** measures the contract from the four
+  world reference points: per-axis error against +X/+Y/+Z, `max |BᵀB − I|`, raw
+  `LR · +X` and `SI · +Z`, the raw angle between the picked directions, and the
+  anterior-posterior axis dotted with world up — 0 when +Z really is superior,
+  ±1 in exactly the reported situation. `LR · +X` is checked to **equal**
+  `cos(residual)`, never required to be 1: that would refuse every real pair of
+  landmarks.
+- **The references are reconstructed from the live `matrix_world`**, never from
+  the cached `world_xyz`. A check that reads the cache can only prove the cache
+  self-consistent. The rotation is now built from the same live path.
+- **Apply Alignment validates before it claims anything**, after a
+  `view_layer.update()` — `matrix_world` is a *request* on a parented,
+  delta-transformed or constrained object. A failure reports the measured axis
+  errors instead of "Aligned".
+- **The panel status is re-measured every draw**, and prints the live dot
+  products beside the words: *verified*, *FAILED validation: SI · +Z = …*, or
+  *NOT validated: …*.
+- **Flip Front/Back exchanges the LEFT and RIGHT references with the body.** It
+  is the correction for swapped labels; turning without relabelling would leave
+  the stored LEFT reference on the subject's right.
+- **Preview Axes now draws the basis Apply will use.** It drew the *world* axes
+  — the same three arms whatever the references were — so it agreed with every
+  alignment, including a wrong one. Its length also divided a world-unit span
+  by the millimetre multiplier, making it 1000× too short on a scan in metres,
+  and `alignment_report` printed those world-unit spans labelled `mm`. Both are
+  unit-correct now.
+- **`metric_key` was not rigid-invariant**, contrary to sect. 6.3 and
+  alignment's own docstring: `METRIC_QUANTISATION` was 1e-9, finer than the
+  single precision Blender stores a transform in, so `T = LᵀL` came back as
+  `diag(0.99999997, 0.99999997, 1.0)` and a pure rotation silently forced every
+  geodesic to be recomputed. Quantised at 1e-6, above that noise floor and
+  still 1 ppm — two micrometres on a two-metre subject.
+
+**Verified:** `tests/test_alignment_blender.py` (new, 176 checks under
+Blender) covers identity, 90° X, arbitrary XYZ, large translation + rotation,
+non-orthogonal picks, Move To World Origin on and off, the reported status
+defect, Preview/Apply agreement, Flip, Reset and the panel text — asserting
+transformed world reference vectors throughout, plus the rigid invariants
+(geometry hash, metric key, mesh vertices, SurfacePoint triangle/barycentric,
+scale and all six pairwise reference distances). `tests/test_alignment.py`
+grows to 121 offline checks. Full regression 2,563 offline checks across
+twenty-one suites plus 630 in Blender across seven suites, 0 failures.
+
 ## 0.24.2 — picking says why, instead of blaming the cursor
 
 **Reported:** on a real preprocessed and repaired PLY measurement mesh at

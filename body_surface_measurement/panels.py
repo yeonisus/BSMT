@@ -22,7 +22,7 @@ import math
 
 import bpy
 
-from . import (alignment, export, geodesic, landmarks, measurement,
+from . import (alignment, attach, export, geodesic, landmarks, measurement,
                measurements, overlay, preprocess, readiness, repair, scancopy,
                state, timing, visualization, viz)
 
@@ -2210,11 +2210,35 @@ class BSMT_PT_alignment(bpy.types.Panel):
         row.operator("bsmt.flip_front_back", icon='ARROW_LEFTRIGHT')
         row.operator("bsmt.reset_alignment", icon='LOOP_BACK')
 
+        # MEASURED every draw, not read from a flag. `props.align_applied`
+        # only records that an alignment was applied; whether the object is
+        # STILL in a pose that satisfies the axis contract is a question about
+        # the live transform, and it is asked here every time the panel is
+        # drawn. A scan rotated by hand after a good alignment used to keep
+        # reporting "Aligned (Landmark)" while superior pointed along -Y.
+        text, verified, live = attach.alignment_status(props)
         status = layout.box()
-        status.label(text="Status: %s"
-                          % ("Aligned (%s)" % props.align_method.title()
-                             if props.align_applied else "Not aligned"),
-                     icon='CHECKMARK' if props.align_applied else 'BLANK1')
+        row = status.row()
+        row.alert = props.align_applied and not verified
+        row.label(text="Status: %s" % text,
+                  icon=('CHECKMARK' if verified else
+                        ('ERROR' if props.align_applied else 'BLANK1')))
+        if live is not None:
+            numbers = status.column(align=True)
+            numbers.scale_y = 0.7
+            numbers.label(text="RIGHT->LEFT . +X        %+.6f  (= cos %.2f deg "
+                               "residual)" % (live["lr_dot_x"],
+                                              live["residual_degrees"]))
+            numbers.label(text="INFERIOR->SUPERIOR . +Z %+.6f"
+                               % live["si_dot_z"])
+            numbers.label(text="worst axis error %.4f deg, orthogonality %.1e"
+                               % (live["worst_axis_error_degrees"],
+                                  live["orthogonality_error"]))
+            for failure in live["failures"]:
+                for part in _wrap(failure, 42):
+                    line = numbers.row()
+                    line.alert = True
+                    line.label(text="  " + part, icon='ERROR')
         if props.align_report:
             column = status.column(align=True)
             column.scale_y = 0.7

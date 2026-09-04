@@ -1062,6 +1062,9 @@ class BSMT_Properties(bpy.types.PropertyGroup):
 
     align_object: StringProperty(name="Aligned Object", default="")
     align_applied: BoolProperty(default=False)
+    #: BSMT has moved this object and holds a pre-alignment matrix
+    #: for it. True even when the alignment failed validation.
+    align_moved: BoolProperty(default=False)
     align_method: StringProperty(default="")
     align_created: StringProperty(default="")
     align_report: StringProperty(default="")
@@ -1072,6 +1075,18 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
     align_residual_degrees: FloatProperty(default=0.0)
+
+    # Milestone 3.20 - the MEASURED postcondition, kept beside the claim.
+    # 'PASS' / 'FAIL' / 'UNKNOWN' / '' (never applied). These are a record of
+    # what was measured at Apply; the panel re-measures every draw, because a
+    # stored verdict about a pose the user can still change is exactly the
+    # thing that lied before.
+    align_validation: StringProperty(default="")
+    align_validation_report: StringProperty(default="")
+    align_lr_dot_x: FloatProperty(default=0.0)
+    align_si_dot_z: FloatProperty(default=0.0)
+    align_axis_error_degrees: FloatProperty(default=0.0)
+    align_orthogonality_error: FloatProperty(default=0.0)
     align_fine_degrees: FloatProperty(
         name="Rotate By (deg)", default=5.0, min=-180.0, max=180.0,
         description="How far the X / Y / Z buttons below rotate the object",
@@ -2737,6 +2752,51 @@ def align_objects(props):
     return names
 
 
+def _copy_surface_point(source):
+    """A plain snapshot of a SurfacePoint's fields, for swapping slots."""
+    return {
+        "valid": bool(source.valid),
+        "source_object": source.source_object,
+        "geometry_hash": source.geometry_hash,
+        "triangle_index": int(source.triangle_index),
+        "barycentric": tuple(float(v) for v in source.barycentric),
+        "component_id": int(source.component_id),
+        "kind": source.kind,
+        "local_xyz": tuple(float(v) for v in source.local_xyz),
+        "world_xyz": tuple(float(v) for v in source.world_xyz),
+        "physical_mm_xyz": tuple(float(v) for v in source.physical_mm_xyz),
+        "reconstruction_error": float(source.reconstruction_error),
+    }
+
+
+def _restore_surface_point(point, data):
+    if not data["valid"]:
+        clear_surface_point(point)
+        return point
+    return fill_surface_point(
+        point, data["source_object"], data["geometry_hash"],
+        data["triangle_index"], data["barycentric"], data["component_id"],
+        data["kind"], data["local_xyz"], data["world_xyz"],
+        data["physical_mm_xyz"], data["reconstruction_error"])
+
+
+def swap_align_points(props, first, second):
+    """Exchange two alignment reference slots.
+
+    Flip Front/Back exists because the subject's left and right are easy to
+    label the wrong way round. Turning the body without also exchanging the
+    two LABELS would leave the stored LEFT reference sitting on the subject's
+    right, so every later check - including the applied-frame validation -
+    would measure the correction as a 180 degree error.
+    """
+    a = align_point(props, first)
+    b = align_point(props, second)
+    a_data, b_data = _copy_surface_point(a), _copy_surface_point(b)
+    _restore_surface_point(a, b_data)
+    _restore_surface_point(b, a_data)
+    return True
+
+
 def clear_align_points(props):
     for slot in ALIGN_SLOTS:
         point = align_point(props, slot)
@@ -2749,11 +2809,18 @@ def clear_alignment_state(props, keep_points=True):
     if not keep_points:
         clear_align_points(props)
     props.align_applied = False
+    props.align_moved = False
     props.align_object = ""
     props.align_method = ""
     props.align_created = ""
     props.align_report = ""
     props.align_residual_degrees = 0.0
+    props.align_validation = ""
+    props.align_validation_report = ""
+    props.align_lr_dot_x = 0.0
+    props.align_si_dot_z = 0.0
+    props.align_axis_error_degrees = 0.0
+    props.align_orthogonality_error = 0.0
     props.align_preview = False
 
 

@@ -768,23 +768,40 @@ ALIGN_AXIS_COLORS = {
 }
 
 
-def show_alignment_axes(context, origin_world, length, matrix_world=None):
-    """Draw the anatomical frame at `origin_world`. Returns the object."""
+def show_alignment_axes(context, origin_world, length, basis=None,
+                        matrix_world=None):
+    """Draw an anatomical frame at `origin_world`. Returns the object.
+
+    `basis` is a 3x3 whose COLUMNS are the +X (subject's left), +Y (posterior)
+    and +Z (superior) directions **expressed in world space** - exactly
+    `anatomical_frame()["matrix"]`. It defaults to the identity, which is the
+    frame after a successful Apply.
+
+    That default used to be the only behaviour, and it made Preview Axes
+    useless as a check: the arms pointed along the world axes whatever the
+    four references were, so the preview agreed with every alignment,
+    including a wrong one. Passing the real basis is what lets the preview
+    disagree - which is the entire reason to look at it before applying.
+
+    Built in world space with an identity object transform, so the helper
+    never inherits the scan's own rotation.
+    """
     existing = _existing_helper(ALIGN_AXES)
     if existing is not None:
         remove_object(existing)
     if length <= 0.0:
         return None
 
-    # Drawn in world space with an identity transform: the axes describe the
-    # WORLD anatomical frame the object has been aligned to, not the object's
-    # own local axes, so they must not inherit the object's rotation.
+    if basis is None:
+        columns = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    else:
+        basis = [[float(v) for v in row] for row in basis]
+        columns = [(basis[0][i], basis[1][i], basis[2][i]) for i in range(3)]
+
     points = [(0.0, 0.0, 0.0)]
     edges = []
-    for index, axis in enumerate(('X', 'Y', 'Z')):
-        direction = [0.0, 0.0, 0.0]
-        direction[index] = length
-        points.append(tuple(direction))
+    for column in columns:
+        points.append(tuple(component * length for component in column))
         edges.append((0, len(points) - 1))
 
     mesh = bpy.data.meshes.new(ALIGN_AXES + "_Mesh")

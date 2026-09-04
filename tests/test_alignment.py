@@ -150,8 +150,8 @@ def test_residual_is_reported_not_absorbed():
           alignment.RESIDUAL_WARN_DEGREES > 0)
 
     check("the span of each reference pair is reported",
-          abs(alignment.anatomical_frame(**UPRIGHT)["lateral_mm"] - 400.0) < 1e-9
-          and abs(alignment.anatomical_frame(**UPRIGHT)["vertical_mm"]
+          abs(alignment.anatomical_frame(**UPRIGHT)["lateral_span"] - 400.0) < 1e-9
+          and abs(alignment.anatomical_frame(**UPRIGHT)["vertical_span"]
                   - 1700.0) < 1e-9)
 
 
@@ -325,6 +325,112 @@ def test_report_lines():
           text)
 
 
+def test_validation_is_a_measurement_not_a_claim():
+    print("\n[validate] the postcondition, measured from world points")
+
+    aligned = alignment.validate_world_frame(**UPRIGHT)
+    check("a correctly aligned set passes", aligned["ok"],
+          "; ".join(aligned["failures"]))
+    check("LR . +X is +1 on a clean pick",
+          abs(aligned["lr_dot_x"] - 1.0) < 1e-12, aligned["lr_dot_x"])
+    check("SI . +Z is +1", abs(aligned["si_dot_z"] - 1.0) < 1e-12)
+    check("every axis error is zero",
+          aligned["worst_axis_error_degrees"] < 1e-12)
+    check("the basis is orthonormal",
+          aligned["orthogonality_error"] < 1e-12)
+    check("the frontal plane is not the Top view",
+          abs(aligned["frontal_normal_dot_up"]) < 1e-12)
+    check("the world reference points are reported back",
+          np.allclose(aligned["left_world"], UPRIGHT["left"]))
+
+    # The reported symptom, in numbers: the body still faces a Top view.
+    # Rotate the whole set 90 degrees about X - superior now runs along -Y.
+    turn = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
+    tipped = {name: turn @ point for name, point in UPRIGHT.items()}
+    bad = alignment.validate_world_frame(**tipped)
+    check("a body lying on its back FAILS validation", not bad["ok"])
+    check("and the failure is SI . +Z, measured", abs(bad["si_dot_z"]) < 1e-12,
+          bad["si_dot_z"])
+    check("the Z axis error is reported as 90 degrees",
+          abs(bad["z_error_degrees"] - 90.0) < 1e-9, bad["z_error_degrees"])
+    check("the frontal plane IS the Top view, which is the visible symptom",
+          abs(abs(bad["frontal_normal_dot_up"]) - 1.0) < 1e-12,
+          bad["frontal_normal_dot_up"])
+    check("the failure text names +Z",
+          any("+Z" in failure for failure in bad["failures"]),
+          str(bad["failures"]))
+    check("the basis is still orthonormal - the frame is not the problem",
+          bad["orthogonality_error"] < 1e-12)
+
+    # A pure left/right swap: 180 degrees about Z.
+    swapped = dict(UPRIGHT)
+    swapped["left"], swapped["right"] = UPRIGHT["right"], UPRIGHT["left"]
+    flipped = alignment.validate_world_frame(**swapped)
+    check("mislabelled left/right FAILS validation", not flipped["ok"])
+    check("with LR . +X = -1, which says exactly what went wrong",
+          abs(flipped["lr_dot_x"] + 1.0) < 1e-12, flipped["lr_dot_x"])
+    check("and superior is still correct", abs(flipped["si_dot_z"] - 1.0) < 1e-12)
+
+
+def test_imperfect_picks_are_reported_not_hidden():
+    print("\n[validate] non-orthogonal references")
+    tilted = dict(UPRIGHT)
+    tilted["left"] = np.array([200.0, 0.0, 1000.0])       # 100 mm high
+    expected = math.degrees(math.atan2(100.0, 400.0))
+
+    validation = alignment.validate_world_frame(**tilted)
+    check("an imperfect pick still PASSES - it is not a failed alignment",
+          validation["ok"], "; ".join(validation["failures"]))
+    check("the residual is reported (%.3f deg)" % validation["residual_degrees"],
+          abs(validation["residual_degrees"] - expected) < 1e-9)
+    check("the raw angle between the two picked axes is reported (%.3f deg)"
+          % validation["raw_angle_degrees"],
+          abs(validation["raw_angle_degrees"] - (90.0 - expected)) < 1e-9)
+    check("LR . +X is cos(residual), NOT 1 - the honest number",
+          abs(validation["lr_dot_x"]
+              - math.cos(math.radians(expected))) < 1e-12,
+          validation["lr_dot_x"])
+    check("and that is exactly what the validator predicted",
+          validation["lateral_consistency"] < 1e-12)
+    check("SI . +Z is still exactly 1 - it is the primary axis",
+          abs(validation["si_dot_z"] - 1.0) < 1e-12)
+    check("the FINAL basis is orthonormal despite the imperfect picks",
+          validation["orthogonality_error"] < 1e-12)
+
+    note = alignment.orthogonalisation_note(validation["frame"])
+    check("the orthogonalisation method is named, not just its result",
+          "Gram-Schmidt" in note and "primary axis" in note, note)
+    check("and so is the raw angle", "%.2f deg" % (90.0 - expected) in note,
+          note)
+
+    # A frame can be orthonormal and still be turned the wrong way. The two
+    # questions are separate, and validation asks both.
+    worst = dict(UPRIGHT)
+    worst["left"] = np.array([50.0, 0.0, 1600.0])
+    validation = alignment.validate_world_frame(**worst)
+    check("a badly conditioned pick is still orthonormal",
+          validation["orthogonality_error"] < 1e-12)
+    check("but its residual is large and said so",
+          not validation["frame"]["residual_ok"])
+
+
+def test_validation_lines_report_numbers():
+    print("\n[validate] what the researcher is shown")
+    text = "\n".join(alignment.validation_lines(
+        alignment.validate_world_frame(**UPRIGHT)))
+    for wanted in ("LEFT", "RIGHT", "SUPERIOR", "INFERIOR", "LR . +X",
+                   "SI . +Z", "orthogonality", "Top view", "PASS"):
+        check("the report states %r" % wanted, wanted in text, text)
+
+    turn = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
+    text = "\n".join(alignment.validation_lines(
+        alignment.validate_world_frame(
+            **{name: turn @ point for name, point in UPRIGHT.items()})))
+    check("a failure says FAILED VALIDATION", "FAILED VALIDATION" in text, text)
+    check("and lists the measured error, not an adjective",
+          "90.000 deg off world +Z" in text, text)
+
+
 def main():
     print("BSMT Milestone 3.6 - alignment tests")
     print("  python : %s" % sys.version.split()[0])
@@ -339,6 +445,9 @@ def main():
         test_scale_rules,
         test_compose,
         test_report_lines,
+        test_validation_is_a_measurement_not_a_claim,
+        test_imperfect_picks_are_reported_not_hidden,
+        test_validation_lines_report_numbers,
     ):
         test()
     print("\n%d checks, %d failure(s)" % (CHECKS[0], len(FAILURES)))
