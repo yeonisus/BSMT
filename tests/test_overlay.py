@@ -216,10 +216,65 @@ def test_selection_is_a_ring():
     else:
         check("every ring vertex is on the ring", True)
 
-    check("nothing is selected -> no ring",
+    check("nothing is emphasised -> no ring",
           overlay.marker_batches(
-              [dict(e, screen=(0.0, 0.0), selected=False)
+              [dict(e, screen=(0.0, 0.0), emphasised=False)
                for e in entries])[1] == [])
+
+
+def test_emphasis_can_be_switched_off_without_touching_the_markers():
+    print("\n[marker] the selection ring follows the workflow stage")
+    #
+    # The ring says "this is the row your next pick belongs to", which is only
+    # true while the researcher is in Landmark Manager. Once they are building
+    # measurements or exporting it marks one landmark out for no reason a
+    # reader of the viewport could reconstruct, so it goes - and NOTHING else
+    # about the landmarks may change with it.
+    props = FakeProps()
+    items = three_landmarks()
+    on = overlay.entries(props, items, 1)
+    off = overlay.entries(props, items, 1, emphasise=False)
+
+    check("the same landmarks are drawn either way", len(on) == len(off) == 3)
+    check("selection itself is unchanged - it is display state that moved",
+          [e["selected"] for e in off] == [False, True, False])
+    check("but nothing is emphasised",
+          [e["emphasised"] for e in off] == [False, False, False])
+    check("and with the emphasis on, exactly the selected one is",
+          [e["emphasised"] for e in on] == [False, True, False])
+
+    for index in range(3):
+        check("landmark %d keeps its configured radius" % index,
+              off[index]["radius"] == on[index]["radius"])
+        check("landmark %d keeps its colour" % index,
+              off[index]["marker_color"] == on[index]["marker_color"])
+        check("landmark %d keeps its world position" % index,
+              off[index]["world"] == on[index]["world"])
+        check("landmark %d still has its label" % index,
+              "text" in off[index] and off[index]["text"] == on[index]["text"])
+    check("only the SELECTED label loses its size bonus",
+          [e["label_size"] for e in off]
+          == [on[0]["label_size"],
+              on[1]["label_size"] - overlay.SELECTED_LABEL_BONUS,
+              on[2]["label_size"]])
+
+    drawn_on = [dict(e, screen=(100.0 + 30 * i, 200.0))
+                for i, e in enumerate(on)]
+    drawn_off = [dict(e, screen=(100.0 + 30 * i, 200.0))
+                 for i, e in enumerate(off)]
+    discs_on, rings_on = overlay.marker_batches(drawn_on)
+    discs_off, rings_off = overlay.marker_batches(drawn_off)
+    check("the ring batch is empty with the emphasis off", rings_off == [],
+          rings_off)
+    check("and present with it on", len(rings_on) == 1)
+    # Sect. 6 of the request: disable the highlight, do not rebuild markers.
+    check("the disc batches are byte-identical - no marker was rebuilt",
+          discs_off == discs_on)
+
+    check("SELECTED label scope still shows the selected label",
+          [e.get("text") for e in overlay.entries(
+              FakeProps(landmark_label_scope='SELECTED'), items, 1,
+              emphasise=False) if "text" in e] != [])
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +597,7 @@ def main():
         test_every_marker_is_identical,
         test_marker_size_is_pixels,
         test_selection_is_a_ring,
+        test_emphasis_can_be_switched_off_without_touching_the_markers,
         test_disc_geometry,
         test_batches_are_grouped,
         test_anchoring,

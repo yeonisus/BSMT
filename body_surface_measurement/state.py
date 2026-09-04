@@ -153,7 +153,96 @@ def _on_landmark_display_changed(self, context):
 
 
 #: Markers and labels are now the same overlay, so they refresh the same way.
-_on_landmark_label_changed = _on_landmark_display_changed
+#: Both are Landmark Manager controls, so both note the stage - see
+#: `_on_landmark_control_used`, defined below and bound at the bottom of this
+#: block once `enter_stage` exists.
+
+
+# ---------------------------------------------------------------------------
+# Which workflow stage the researcher is working in (display state only)
+# ---------------------------------------------------------------------------
+#
+# The selected landmark is emphasised with a ring so that, WHILE PICKING, it
+# is obvious which row the next click belongs to. Once the researcher has
+# moved on to building measurements, computing paths or exporting, that ring
+# is no longer telling them anything - it is a leftover from an earlier stage
+# marking one landmark out from its neighbours for no reason a reader of the
+# viewport could guess.
+#
+# So the emphasis follows the stage. `ui_stage` is display state and nothing
+# else: no landmark, no selection index, no SurfacePoint and no measurement
+# reads it, and changing it cannot invalidate a result or move a marker. The
+# landmarks themselves keep their configured size and colour throughout - it
+# is only the SELECTED ring, and the selected label's size bonus, that come
+# and go.
+
+
+def enter_stage(context_or_props, stage):
+    """Record which workflow stage the researcher is working in.
+
+    Display state. Accepts either props or a context so a caller does not have
+    to know which it holds. Returns the stage actually stored, or "" when
+    there were no props to store it on - a headless or half-registered scene
+    must not make an operator fail over a UI hint.
+    """
+    props = context_or_props
+    if props is not None and not hasattr(props, "ui_stage"):
+        props = get_props(props)
+    if props is None:
+        return ""
+    if props.ui_stage != stage:
+        props.ui_stage = stage
+        # The ring appears or disappears without any object changing, so
+        # nothing else would ask the viewport to repaint.
+        overlay.tag_redraw(None)
+    return stage
+
+
+def landmark_emphasis_visible(props):
+    """Whether the SELECTED-landmark ring should be drawn right now.
+
+    The decision itself is `readiness.landmark_emphasis_visible`; this is the
+    props-shaped way to ask it.
+    """
+    if props is None:
+        return False
+    return readiness.landmark_emphasis_visible(props.ui_stage)
+
+
+def _on_measurement_index_changed(self, context):
+    """Selecting a measurement row is working in Measurement Manager.
+
+    A UIList selection is a property change, not an operator, so this is the
+    only place it can be noticed.
+    """
+    enter_stage(self, readiness.STAGE_MEASUREMENTS)
+
+
+def _on_landmark_index_changed(self, context):
+    """Selecting a landmark row is working in Landmark Manager.
+
+    Note that Blender fires an update only when the value actually CHANGES, so
+    clicking the row that is already active does not come through here. That
+    is why every Landmark Manager control says the same thing - see
+    `_on_landmark_control_used` - and why the landmark operators say it too:
+    the researcher coming back to this stage will touch one of them.
+    """
+    _on_landmark_control_used(self, context)
+
+
+def _on_landmark_control_used(self, context):
+    """Any Landmark Manager display control: repaint, and note the stage.
+
+    Marker size, colour, label scope, visibility mode and the selected row all
+    belong to Landmark Manager and to nothing else, so touching one of them is
+    a plain statement of where the researcher is working.
+    """
+    enter_stage(self, readiness.STAGE_LANDMARKS)
+    _on_landmark_display_changed(self, context)
+
+
+#: Markers and labels are the same overlay and the same stage.
+_on_landmark_label_changed = _on_landmark_control_used
 
 
 class BSMT_Landmark(bpy.types.PropertyGroup):
@@ -879,8 +968,9 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         min=0,
         # Selecting a different row changes which marker is emphasised and
         # which label is drawn in SELECTED scope, and neither is something
-        # Blender would repaint on its own.
-        update=_on_landmark_display_changed,
+        # Blender would repaint on its own. It is also the plainest possible
+        # statement that the researcher is working in Landmark Manager.
+        update=_on_landmark_index_changed,
     )
     landmark_next_id: IntProperty(
         name="Next Stable ID",
@@ -903,7 +993,7 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         description="Show the landmark markers in the viewport. Independent "
                     "of the Point A/B markers",
         default=True,
-        update=_on_landmark_display_changed,
+        update=_on_landmark_control_used,
     )
     landmark_marker_size_px: IntProperty(
         name="Marker Size (px)",
@@ -913,7 +1003,7 @@ class BSMT_Properties(bpy.types.PropertyGroup):
                     "moves a landmark",
         default=overlay.DEFAULT_MARKER_SIZE,
         min=2, max=20,
-        update=_on_landmark_display_changed,
+        update=_on_landmark_control_used,
     )
     landmark_marker_color: FloatVectorProperty(
         name="Marker Color",
@@ -923,7 +1013,7 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         subtype='COLOR', size=4,
         default=visualization.LANDMARK_COLOR,
         min=0.0, max=1.0,
-        update=_on_landmark_display_changed,
+        update=_on_landmark_control_used,
     )
     show_landmark_labels: BoolProperty(
         name="Show Labels",
@@ -965,6 +1055,11 @@ class BSMT_Properties(bpy.types.PropertyGroup):
         default=True,
         update=_on_landmark_label_changed,
     )
+    #: Which workflow stage the researcher is working in. DISPLAY STATE
+    #: ONLY - see enter_stage(). Defaults to LANDMARKS so a scene that has
+    #: never left the stage behaves exactly as it did before this existed.
+    ui_stage: StringProperty(default=readiness.STAGE_LANDMARKS)
+
     show_landmark_display: BoolProperty(
         name="Landmark Display",
         description="Show the landmark marker and label settings",
@@ -982,7 +1077,7 @@ class BSMT_Properties(bpy.types.PropertyGroup):
              "of it"),
         ),
         default='ALWAYS',
-        update=_on_landmark_display_changed,
+        update=_on_landmark_control_used,
     )
     landmark_label_scope: EnumProperty(
         name="Show",
@@ -1022,6 +1117,7 @@ class BSMT_Properties(bpy.types.PropertyGroup):
     # ------------------------------------------------------------------
     measurement_index: IntProperty(
         name="Active Measurement", default=0, min=0,
+        update=_on_measurement_index_changed,
     )
     measurement_next_id: IntProperty(
         name="Next Measurement ID", default=1, min=1,

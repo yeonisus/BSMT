@@ -4,6 +4,55 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.25.2 — the selection ring belongs to Landmark Manager
+
+**Reported:** the selected landmark keeps its emphasis ring after the
+researcher has moved on to Measurement Manager, Measurement Visualization or
+Results and Export.
+
+The ring says *"this is the row your next pick belongs to"*. That is worth
+saying while landmarks are being picked and worth nothing afterwards — in a
+later stage it marks one landmark out from its neighbours for a reason nobody
+looking at the viewport could reconstruct.
+
+- **The emphasis now follows the workflow stage.** `props.ui_stage` records
+  which stage is being worked in, `readiness.landmark_emphasis_visible()`
+  answers the one question that reads it, and the overlay draws the ring only
+  in `LANDMARKS`.
+- **Selection and emphasis are now two different things** in
+  `overlay.entries`. `selected` is still which row the list is on and still
+  decides what SELECTED label scope means — suppressing it would have hidden a
+  label, which is a different change. `emphasised` is only the ring and the
+  selected label's size bonus.
+- **Nothing is rebuilt and nothing is hidden.** Every disc is still built at
+  its configured radius and colour; the ring batch simply comes back empty.
+  The test asserts the disc batches are identical either way.
+- **No data changes.** `landmark_index` is untouched, and the test asserts
+  `enter_stage` writes exactly one property and calls nothing from the
+  measurement or geodesic modules. No geodesic recomputation, no measurement
+  invalidation, no SurfacePoint change.
+- **The stage is recorded by a table applied once at registration** rather
+  than by a line added to thirty operator bodies, which keeps a viewport
+  decoration out of the operators that do the work and makes the rule readable
+  in one place. An operator the table does not name leaves the stage alone, so
+  omitting one is inert rather than wrong. Selecting a row in either list is a
+  property change rather than an operator, so the two index callbacks say it
+  too.
+
+One consequence worth knowing: Blender fires a property update only when the
+value actually *changes*, so clicking the landmark row that is already active
+does not by itself bring the ring back. Every other Landmark Manager control —
+marker size, colour, label settings, visibility mode, a different row, or any
+landmark operator — does.
+
+**Verified:** `tests/test_overlay.py` at 147 offline checks, including that
+the emphasis can be switched off with byte-identical disc batches, unchanged
+radii, colours, positions and labels. `tests/test_workflow_ui.py` at 126
+checks in Blender: select a landmark → ring visible; interact with Measurement
+Manager → ring gone, landmark still drawn at its configured size, selection
+data untouched; calculating, visualisation and export likewise; return to
+Landmark Manager → ring back for the still-selected landmark.
+
 ## 0.25.1 — a tolerance with no dimensions refused a correct alignment
 
 **Reported:** on the real repaired PLY, with **good** references — about 0.4°

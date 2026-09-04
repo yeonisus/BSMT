@@ -67,6 +67,22 @@ STAGE_MEASUREMENTS = 'MEASUREMENTS'
 STAGE_VISUALIZATION = 'VISUALIZATION'
 STAGE_EXPORT = 'EXPORT'
 
+def landmark_emphasis_visible(ui_stage):
+    """Whether the SELECTED-landmark ring belongs on screen at this stage.
+
+    It does while Landmark Manager is what the researcher is working in, and
+    not afterwards: once they are building measurements, computing paths or
+    exporting, a ring around one landmark is a leftover from an earlier stage
+    that marks it out for a reason nobody looking at the viewport could
+    reconstruct.
+
+    Lives here because the stage vocabulary lives here, and because this
+    module imports nothing - which lets the overlay ask the question without
+    reaching for `state`, whose own import of `overlay` would close a cycle.
+    """
+    return str(ui_stage) == STAGE_LANDMARKS
+
+
 #: Stages in the order the sidebar shows them. The panel order is derived
 #: from this, so the two cannot drift apart.
 STAGE_ORDER = (

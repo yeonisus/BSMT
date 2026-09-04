@@ -12,8 +12,8 @@ from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
 
 from . import (alignment, attach, export, geodesic, landmarks, measurement,
                measurements, meshrepair, overlay, pathcache, picking,
-               preprocess, protocol, repair, scancopy, state, timing,
-               visualization, viz)
+               preprocess, protocol, readiness, repair, scancopy, state,
+               timing, visualization, viz)
 
 def _addon_version():
     # VERSION, not bl_info: Blender strips bl_info from an extension module.
@@ -6053,7 +6053,126 @@ classes = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Which stage each operator means the researcher is working in
+# ---------------------------------------------------------------------------
+#
+# DISPLAY STATE ONLY. The single thing this decides is whether the SELECTED
+# landmark keeps its emphasis ring (see state.enter_stage). No measurement,
+# landmark, SurfacePoint or cached path reads it, and no geodesic is
+# recomputed because of it.
+#
+# It is a table applied once at registration rather than a line added to
+# thirty operator bodies. That keeps a viewport-decoration concern out of the
+# operators that do the actual work, and it makes the rule readable in one
+# place instead of inferable from thirty. An operator that is not listed
+# leaves the stage exactly as it found it, so omitting one is inert.
+
+STAGE_BY_OPERATOR = {
+    # Landmark Manager - picking, naming and checking landmarks. This is the
+    # only stage in which the emphasis ring is telling the researcher
+    # something: which row the next click belongs to.
+    "bsmt.add_landmark": readiness.STAGE_LANDMARKS,
+    "bsmt.remove_landmark": readiness.STAGE_LANDMARKS,
+    "bsmt.clear_landmark_position": readiness.STAGE_LANDMARKS,
+    "bsmt.clear_landmarks": readiness.STAGE_LANDMARKS,
+    "bsmt.validate_landmarks": readiness.STAGE_LANDMARKS,
+    "bsmt.pick_landmark": readiness.STAGE_LANDMARKS,
+    "bsmt.guided_picking": readiness.STAGE_LANDMARKS,
+    "bsmt.save_protocol": readiness.STAGE_LANDMARKS,
+    "bsmt.load_protocol": readiness.STAGE_LANDMARKS,
+
+    # Measurement Manager - defining and computing measurements.
+    "bsmt.add_measurement": readiness.STAGE_MEASUREMENTS,
+    "bsmt.cancel_measurement_draft": readiness.STAGE_MEASUREMENTS,
+    "bsmt.remove_measurement": readiness.STAGE_MEASUREMENTS,
+    "bsmt.clear_measurements": readiness.STAGE_MEASUREMENTS,
+    "bsmt.remove_invalid_measurements": readiness.STAGE_MEASUREMENTS,
+    "bsmt.calculate_measurement": readiness.STAGE_MEASUREMENTS,
+    "bsmt.calculate_all_measurements": readiness.STAGE_MEASUREMENTS,
+    "bsmt.clear_measurement_results": readiness.STAGE_MEASUREMENTS,
+    "bsmt.refresh_measurements": readiness.STAGE_MEASUREMENTS,
+    "bsmt.save_measurement_template": readiness.STAGE_MEASUREMENTS,
+    "bsmt.load_measurement_template": readiness.STAGE_MEASUREMENTS,
+
+    # Measurement Visualization.
+    "bsmt.compute_surface_path": readiness.STAGE_VISUALIZATION,
+    "bsmt.refresh_visualization": readiness.STAGE_VISUALIZATION,
+    "bsmt.clear_visualization": readiness.STAGE_VISUALIZATION,
+    "bsmt.toggle_surface_path": readiness.STAGE_VISUALIZATION,
+    "bsmt.clear_cached_path": readiness.STAGE_VISUALIZATION,
+    "bsmt.path_timing_report": readiness.STAGE_VISUALIZATION,
+    "bsmt.clear_all_visualizations": readiness.STAGE_VISUALIZATION,
+
+    # Results and export.
+    "bsmt.export_measurements": readiness.STAGE_EXPORT,
+    "bsmt.export_landmarks": readiness.STAGE_EXPORT,
+    "bsmt.save_study_protocol": readiness.STAGE_EXPORT,
+    "bsmt.load_study_protocol": readiness.STAGE_EXPORT,
+}
+
+#: Marks a method this module has already wrapped, so a re-register - which
+#: Blender does on every "Reload Scripts" - cannot wrap it a second time.
+_STAGE_WRAPPED = "_bsmt_stage_wrapped"
+
+
+def _note_stage(context, stage):
+    """Record the stage, and never let a viewport hint break the work."""
+    try:
+        state.enter_stage(context, stage)
+    except Exception:                                 # pragma: no cover
+        traceback.print_exc()
+
+
+def _wrap_for_stage(method, stage, name):
+    """`method` with a stage note recorded before it runs.
+
+    Before, not after: `pick_point` is modal and returns RUNNING_MODAL, so
+    "after it finishes" is not a moment this wrapper is present for. Recording
+    on entry is also the honest reading - the researcher is in that stage from
+    the moment they press the button.
+
+    The two shapes are spelled out rather than taken as *args because Blender
+    INSPECTS the argument count when registering an operator and rejects a
+    class whose `invoke` does not take exactly (self, context, event).
+    """
+    if name == "invoke":
+        def wrapped(self, context, event):
+            _note_stage(context, stage)
+            return method(self, context, event)
+    else:
+        def wrapped(self, context):
+            _note_stage(context, stage)
+            return method(self, context)
+
+    wrapped.__name__ = getattr(method, "__name__", name)
+    wrapped.__doc__ = method.__doc__
+    setattr(wrapped, _STAGE_WRAPPED, True)
+    return wrapped
+
+
+def _apply_stage_notes(operator_classes):
+    """Attach the stage note to every operator the table names.
+
+    Returns how many methods were wrapped, which is what the test asserts
+    against the table rather than against a hand-copied number.
+    """
+    wrapped = 0
+    for cls in operator_classes:
+        stage = STAGE_BY_OPERATOR.get(getattr(cls, "bl_idname", ""))
+        if stage is None:
+            continue
+        for name in ("execute", "invoke"):
+            method = cls.__dict__.get(name)
+            if method is None or getattr(method, _STAGE_WRAPPED, False):
+                continue
+            setattr(cls, name, _wrap_for_stage(method, stage, name))
+            wrapped += 1
+    return wrapped
+
+
 def register():
+    _apply_stage_notes(classes)
     for cls in classes:
         bpy.utils.register_class(cls)
 

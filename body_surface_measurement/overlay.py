@@ -39,7 +39,7 @@ import math
 
 import bpy
 
-from . import geodesic, landmarks, visualization
+from . import geodesic, landmarks, readiness, visualization
 
 #: The draw handler lives in the driver namespace rather than a module global
 #: so it survives Blender's "Reload Scripts", which re-imports this module and
@@ -117,15 +117,27 @@ def status_color(status, base_color):
             float(base_color[3]))
 
 
-def entries(props, collection, active_index=-1):
+def entries(props, collection, active_index=-1, emphasise=True):
     """Everything the draw callback needs for one landmark, as plain data.
 
     One entry per landmark carries BOTH its marker and its label, because the
     two share a single projection and must never be able to separate.
 
-    Returns dicts with `world`, `radius`, `marker_color`, `selected`, and -
-    when labels are on and this landmark is in scope - `text`, `label_color`
-    and `label_size`.
+    Returns dicts with `world`, `radius`, `marker_color`, `selected`,
+    `emphasised`, and - when labels are on and this landmark is in scope -
+    `text`, `label_color` and `label_size`.
+
+    `selected` and `emphasised` are deliberately two different things.
+    `selected` is which row the Landmark Manager list is on, and it decides
+    what SELECTED label scope means - suppressing it would hide a label, which
+    is a different change entirely. `emphasised` is only whether that landmark
+    is drawn with the selection RING and the larger label, and it is switched
+    off once the researcher has moved on to another workflow stage, where the
+    ring marks one landmark out for a reason nobody looking at the viewport
+    could reconstruct.
+
+    Nothing about the ordinary markers changes either way: same radius, same
+    colour, same set of landmarks drawn.
     """
     if collection is None:
         return []
@@ -154,6 +166,7 @@ def entries(props, collection, active_index=-1):
             "world": (float(point.world_xyz[0]), float(point.world_xyz[1]),
                       float(point.world_xyz[2])),
             "selected": selected,
+            "emphasised": selected and bool(emphasise),
             "show_marker": show_markers,
             # Every marker is the same radius. The selection is shown with a
             # ring, never with a bigger core (sect. 4).
@@ -163,17 +176,18 @@ def entries(props, collection, active_index=-1):
         if show_labels and not (labels_selected_only and not selected):
             entry["text"] = label_text(item.label, item.status)
             entry["label_color"] = status_color(item.status, label_base)
-            entry["label_size"] = label_size + (SELECTED_LABEL_BONUS
-                                                if selected else 0)
+            entry["label_size"] = label_size + (
+                SELECTED_LABEL_BONUS if entry["emphasised"] else 0)
         result.append(entry)
         if len(result) >= MAX_LANDMARKS:
             break
     return result
 
 
-def labelled(props, collection, active_index=-1):
+def labelled(props, collection, active_index=-1, emphasise=True):
     """Only the landmarks that will get a label. Convenience over `entries`."""
-    return [entry for entry in entries(props, collection, active_index)
+    return [entry
+            for entry in entries(props, collection, active_index, emphasise)
             if "text" in entry]
 
 
@@ -262,7 +276,11 @@ def marker_batches(drawn):
     """(disc groups, ring groups) for a list of projected entries.
 
     `drawn` is a list of dicts with `screen`, `radius`, `marker_color` and
-    `selected`. Pure: it returns vertex lists, and draws nothing.
+    `emphasised`. Pure: it returns vertex lists, and draws nothing.
+
+    The ring is the only thing `emphasised` removes. Every disc is still
+    built, at the configured radius and colour, so switching the emphasis off
+    never rebuilds or hides a marker - the ring batch simply comes back empty.
     """
     discs = []
     rings = []
@@ -271,7 +289,7 @@ def marker_batches(drawn):
             continue
         discs.append((entry["marker_color"],
                       disc_triangles(entry["screen"], entry["radius"])))
-        if entry.get("selected"):
+        if entry.get("emphasised"):
             rings.append((SELECTED_RING_COLOR,
                           ring_lines(entry["screen"],
                                      selected_ring_radius(entry["radius"]))))
@@ -407,7 +425,11 @@ def _draw():
         return
 
     collection = getattr(context.scene, "bsmt_landmarks", None)
-    wanted = entries(props, collection, props.landmark_index)
+    # The selection index is read unchanged - the emphasis is a display
+    # decision layered on top of it, never a change to what is selected.
+    wanted = entries(props, collection, props.landmark_index,
+                     emphasise=readiness.landmark_emphasis_visible(
+                         getattr(props, "ui_stage", readiness.STAGE_LANDMARKS)))
     if not wanted:
         return
 

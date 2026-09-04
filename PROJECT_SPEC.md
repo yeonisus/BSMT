@@ -4570,6 +4570,103 @@ preprocessing and 90 path-visualisation checks in Blender. 0 failures.
 
 ---
 
+## 11ab. Milestone 3.24 — The selection ring belongs to one stage (v0.25.2, 2026-09-04)
+
+### 11ab.1 The report
+
+The selected landmark keeps its emphasis ring after the researcher has moved
+on to Measurement Manager, Measurement Visualization or Results and Export.
+
+### 11ab.2 Why it is wrong, rather than merely untidy
+
+The ring is not decoration; it is an answer to a question. *Which row does my
+next pick belong to?* is a live question while landmarks are being picked and a
+dead one afterwards. In a later stage the ring still marks one landmark out
+from its neighbours, but there is no longer anything in the viewport from which
+a reader could work out why — and a marker that is emphasised for no
+discoverable reason is worse than one that is not emphasised at all.
+
+### 11ab.3 Selection and emphasis are two different things
+
+They had been one flag. Splitting them is what makes this safe:
+
+* `selected` — which row the Landmark Manager list is on. It decides what
+  SELECTED **label scope** means, so suppressing it would have hidden a label.
+  Unchanged, and still driven by `landmark_index`.
+* `emphasised` — whether that landmark is drawn with the selection ring and the
+  larger label. This is the only thing the stage switches.
+
+`marker_batches` reads `emphasised` alone. Every disc is still built at its
+configured radius and colour; the ring batch simply comes back empty. Nothing
+is rebuilt, nothing is hidden, and `tests/test_overlay.py` asserts the disc
+batches are byte-identical with the emphasis on and off.
+
+### 11ab.4 `ui_stage`, and where the decision lives
+
+`props.ui_stage` is display state and nothing else — no landmark, selection
+index, SurfacePoint, measurement or cached path reads it, and changing it
+cannot invalidate a result or move a marker. It defaults to `LANDMARKS`, so a
+scene that has never left the stage behaves exactly as it did before.
+
+`readiness.landmark_emphasis_visible()` is the single question. It lives in
+`readiness` because the stage vocabulary does, and because that module imports
+nothing — which lets `overlay` ask it without reaching for `state`, whose own
+import of `overlay` would close a cycle.
+
+### 11ab.5 A table, not thirty edits
+
+`operators.STAGE_BY_OPERATOR` maps operator idname to stage, and
+`_apply_stage_notes()` wraps `execute`/`invoke` once at registration. That
+keeps a viewport-decoration concern out of the operators that do the actual
+work and makes the rule readable in one place instead of inferable from thirty
+call sites. An operator the table does not name leaves the stage exactly as it
+found it, so omitting one is inert rather than wrong.
+
+Two details the implementation had to respect. The wrappers spell out
+`(self, context)` and `(self, context, event)` rather than taking `*args`,
+because **Blender inspects the argument count** when registering an operator
+and rejects a class whose `invoke` does not take exactly three. And the note is
+recorded on entry rather than on completion, because `pick_point` is modal and
+returns `RUNNING_MODAL` — "after it finishes" is not a moment the wrapper is
+present for. Entry is also the honest reading: the researcher is in that stage
+from the moment they press the button.
+
+Selecting a row in either list is a property change rather than an operator, so
+`landmark_index` and `measurement_index` carry the note in their update
+callbacks. Every Landmark Manager display control does the same, through
+`state._on_landmark_control_used`.
+
+### 11ab.6 A known edge, stated rather than hidden
+
+Blender fires a property update only when the value actually **changes**, so
+clicking the landmark row that is already active does not by itself bring the
+ring back. Every other route into the stage does: a different row, any
+Landmark Manager display control, or any landmark operator. This is why the
+display controls carry the note at all.
+
+### 11ab.7 What is verified
+
+`tests/test_overlay.py` (147 offline checks): the emphasis switches off with
+byte-identical disc batches and unchanged radii, colours, world positions and
+label text; only the selected label loses its size bonus; SELECTED label scope
+still shows its label.
+
+`tests/test_workflow_ui.py` (126 checks in Blender), section J: select a
+landmark in Landmark Manager and the ring is drawn; interact with Measurement
+Manager and no ring is drawn, the landmark is still there at its configured
+size, the discs are identical and `landmark_index` is unchanged; the same holds
+while calculating, visualising and exporting; returning to Landmark Manager
+brings the ring back for the still-selected landmark. Section J5 asserts the
+mechanism itself: `enter_stage` writes exactly one property and mentions no
+meshcache, solver, invalidation or SurfacePoint, and every operator the table
+names both exists and maps to a real stage.
+
+Regression: 2,586 offline checks across twenty-one suites, plus 221 alignment,
+45 picking, 126 workflow-UI, 76 mesh-repair, 35 degenerate-policy, 110
+preprocessing and 90 path-visualisation checks in Blender. 0 failures.
+
+---
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~
