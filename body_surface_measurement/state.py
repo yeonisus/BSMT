@@ -2378,12 +2378,21 @@ def invalidate_all_measurement_results(context, reason):
 
 
 def session_metadata(props):
-    """The researcher's session fields. Metadata only, never read elsewhere."""
+    """The researcher's session fields. Metadata only, never read elsewhere.
+
+    The two protocol names are included because an exported measurement is
+    only reproducible if the reader knows WHICH protocol produced it - a
+    landmark called "Acromion" means one thing under one protocol and
+    something slightly different under another. They are recorded when a
+    protocol or template is loaded, so nothing here is invented.
+    """
     return {
         "subject_id": props.session_subject_id.strip(),
         "condition": props.session_condition.strip(),
         "scan_id": props.session_scan_id.strip(),
         "notes": props.session_notes.strip(),
+        "landmark_protocol": props.protocol_name.strip(),
+        "measurement_protocol": props.measurement_protocol_name.strip(),
     }
 
 
@@ -2429,9 +2438,15 @@ def measurement_export_record(context, item):
     """
     source, target = resolve_measurement_landmarks(context, item)
     return {
+        "stable_id": int(item.stable_id),
         "protocol_id": item.protocol_id,
         "name": item.name,
         "notes": item.notes,
+        # The stable id is read from the DEFINITION, not from the resolved
+        # landmark: it is what the definition points at, and it stays
+        # meaningful even when the landmark it names has been deleted.
+        "from_landmark_stable_id": int(item.source_stable_id),
+        "to_landmark_stable_id": int(item.target_stable_id),
         "from_landmark_id": (source.protocol_id if source is not None
                              else item.source_protocol_id),
         "from_landmark_name": (source.label if source is not None
@@ -2459,6 +2474,7 @@ def landmark_export_record(item):
     """One landmark as plain values, ready for export.landmark_row."""
     point = item.surface_point
     return {
+        "stable_id": int(item.stable_id),
         "protocol_id": item.protocol_id,
         "name": item.label,
         "status": item.status,

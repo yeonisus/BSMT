@@ -192,8 +192,25 @@ def test_columns_are_stable():
     for column in required:
         check("measurements carry %s" % column,
               column in export.MEASUREMENT_COLUMNS)
-    check("the first three are the session", export.MEASUREMENT_COLUMNS[:3]
-          == ("subject_id", "condition", "scan_id"))
+    check("the layout version leads every row",
+          export.MEASUREMENT_COLUMNS[0] == "schema_version"
+          and export.LANDMARK_COLUMNS[0] == "schema_version")
+    check("then the session block", export.MEASUREMENT_COLUMNS[1:6]
+          == ("subject_id", "condition", "scan_id", "landmark_protocol",
+              "measurement_protocol"))
+    # A protocol id is the researcher's OPTIONAL code, so it cannot be the
+    # only identifier: a scene where nobody filled one in would export rows
+    # that cannot be told apart.
+    for column in ("measurement_stable_id", "from_landmark_stable_id",
+                   "to_landmark_stable_id"):
+        check("measurements carry %s, which is never blank" % column,
+              column in export.MEASUREMENT_COLUMNS)
+    check("landmarks carry landmark_stable_id",
+          "landmark_stable_id" in export.LANDMARK_COLUMNS)
+    check("both files name the protocols that produced them",
+          "landmark_protocol" in export.MEASUREMENT_COLUMNS
+          and "measurement_protocol" in export.MEASUREMENT_COLUMNS
+          and "landmark_protocol" in export.LANDMARK_COLUMNS)
     check("no column is repeated",
           len(set(export.MEASUREMENT_COLUMNS))
           == len(export.MEASUREMENT_COLUMNS))
@@ -216,6 +233,153 @@ def test_columns_are_stable():
     check("a landmark row does too",
           set(row) == set(export.LANDMARK_COLUMNS),
           set(row) ^ set(export.LANDMARK_COLUMNS))
+
+
+def test_newlines_and_parsed_round_trip():
+    print("\n[export] the file parses the same on macOS and on Windows")
+    #
+    # Sect. 5 of the validation milestone: compare PARSED ROWS, not raw text.
+    # Raw text differs by line terminator between platforms and between
+    # editors that "helpfully" normalise a file, and a golden test that
+    # compares bytes would fail for a reason that has nothing to do with the
+    # data. What has to be identical is what a reader gets back.
+    records = [
+        measurement(),
+        measurement(protocol_id="M02", name="Waist girth",
+                    surface_valid=False, status="READY"),
+        measurement(protocol_id="M03", name="Neck girth",
+                    straight_valid=False, surface_valid=False,
+                    status="STALE"),
+    ]
+    rows = [row_of(record) for record in records]
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "rows.csv")
+        export.write_csv(path, export.MEASUREMENT_COLUMNS, rows)
+        raw = open(path, "rb").read()
+
+        check("the writer emits CRLF, which is what RFC 4180 and Excel expect",
+              b"\r\n" in raw)
+        check("and no bare LF outside a CRLF pair",
+              raw.replace(b"\r\n", b"") .count(b"\n") == 0)
+
+        def parse(data):
+            handle = io.StringIO(data.decode("utf-8-sig"), newline="")
+            return list(csv.DictReader(handle))
+
+        crlf = parse(raw)
+        # A file that has been through a tool that rewrote the line endings -
+        # git with autocrlf off, a text editor, an email attachment.
+        lf = parse(raw.replace(b"\r\n", b"\n"))
+        cr = parse(raw.replace(b"\r\n", b"\r"))
+        check("CRLF parses to three rows", len(crlf) == 3, len(crlf))
+        check("LF-normalised parses identically", lf == crlf)
+        check("CR-normalised parses identically", cr == crlf)
+
+        # The golden expectation: what a reader must see, field by field, for
+        # the fields whose value is the point of the file.
+        golden = [
+            {"measurement_id": "M01", "measurement_name": "Neck to Waist",
+             "straight_distance_mm": "292.586700",
+             "surface_distance_mm": "304.282837",
+             "status": "VALID", "schema_version": "2"},
+            {"measurement_id": "M02", "measurement_name": "Waist girth",
+             "straight_distance_mm": "292.586700",
+             "surface_distance_mm": "",
+             "status": "READY", "schema_version": "2"},
+            {"measurement_id": "M03", "measurement_name": "Neck girth",
+             "straight_distance_mm": "", "surface_distance_mm": "",
+             "status": "STALE", "schema_version": "2"},
+        ]
+        for index, expected in enumerate(golden):
+            for column, value in expected.items():
+                check("row %d %s == %r" % (index, column, value),
+                      crlf[index][column] == value, crlf[index][column])
+
+
+def test_row_order_is_the_collection_order():
+    print("\n[export] row order is deterministic")
+    records = [measurement(protocol_id="M%02d" % n, name="m%d" % n)
+               for n in (3, 1, 2)]
+    rows = [row_of(record) for record in records]
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "order.csv")
+        export.write_csv(path, export.MEASUREMENT_COLUMNS, rows)
+        with open(path, newline="", encoding="utf-8-sig") as handle:
+            parsed = list(csv.DictReader(handle))
+    check("rows come out in the order they were given - never sorted",
+          [row["measurement_id"] for row in parsed] == ["M03", "M01", "M02"],
+          [row["measurement_id"] for row in parsed])
+
+    # Same input, twice: byte for byte, so a diff between two exports is a
+    # difference in the DATA and never in the writer.
+    with tempfile.TemporaryDirectory() as folder:
+        first = os.path.join(folder, "a.csv")
+        second = os.path.join(folder, "b.csv")
+        export.write_csv(first, export.MEASUREMENT_COLUMNS, rows)
+        export.write_csv(second, export.MEASUREMENT_COLUMNS, rows)
+        check("two exports of the same rows are byte-identical",
+              open(first, "rb").read() == open(second, "rb").read())
+
+
+def test_no_status_can_smuggle_a_number():
+    print("\n[export] no status can be mistaken for a measured zero")
+    #
+    # The failure mode this exists for: a downstream mean() over a column
+    # where "not computed" arrived as 0.0. Exhaustive over every status the
+    # measurement manager can produce, in both validity combinations.
+    statuses = ("VALID", "READY", "STALE", "DRAFT", "FAILED", "NOT_COMPUTED",
+                "UNRESOLVED", "")
+    for status in statuses:
+        for straight_valid in (True, False):
+            for surface_valid in (True, False):
+                row = row_of(measurement(
+                    status=status,
+                    straight_valid=straight_valid, straight_mm=0.0,
+                    surface_valid=surface_valid, surface_mm=0.0,
+                    ratio=0.0))
+                for field, valid in (("straight_distance_mm", straight_valid),
+                                     ("surface_distance_mm", surface_valid)):
+                    if valid:
+                        check("%s/%s %s writes its zero as a number"
+                              % (status or "(blank)", field, valid),
+                              row[field] == "0.000000", row[field])
+                    else:
+                        check("%s/%s an invalid value is BLANK, never 0"
+                              % (status or "(blank)", field),
+                              row[field] == "", row[field])
+                check("%s: the ratio needs BOTH distances" % (status or "(blank)"),
+                      (row["surface_to_straight_ratio"] != "")
+                      == bool(straight_valid and surface_valid),
+                      row["surface_to_straight_ratio"])
+                check("%s: the status is always written" % (status or "(blank)"),
+                      row["status"] == status, row["status"])
+
+    # A NaN that reached the record - a solver that returned one, a corrupted
+    # file - must not become a number either.
+    row = row_of(measurement(straight_mm=float("nan"), straight_valid=True))
+    check("a NaN exports blank, not 'nan'", row["straight_distance_mm"] == "",
+          row["straight_distance_mm"])
+
+
+def test_units_are_explicit_everywhere():
+    print("\n[export] every quantity says what unit it is in")
+    for column in export.MEASUREMENT_COLUMNS:
+        if "distance" in column:
+            check("%s names its unit" % column, column.endswith("_mm"), column)
+    row = landmark_row_of(landmark(), unit="M")
+    check("a landmark's world coordinates carry their coordinate unit",
+          row["coordinate_unit"] == "M", row["coordinate_unit"])
+    check("and the millimetre columns are named as millimetres",
+          all(column.startswith("physical_mm_")
+              for column in export.LANDMARK_COLUMNS
+              if column.startswith("physical")))
+    blank = landmark_row_of(landmark(valid=False))
+    check("an unpicked landmark states no unit either",
+          blank["coordinate_unit"] == "", blank["coordinate_unit"])
+    check("  and no coordinate", blank["world_x"] == "" == blank["physical_mm_x"])
+    check("  but keeps its definition row",
+          blank["landmark_name"] == "Neck_F" and blank["landmark_id"] == "L01")
 
 
 def test_written_file():
@@ -575,6 +739,10 @@ def main():
         test_status_is_preserved,
         test_columns_are_stable,
         test_written_file,
+        test_newlines_and_parsed_round_trip,
+        test_row_order_is_the_collection_order,
+        test_no_status_can_smuggle_a_number,
+        test_units_are_explicit_everywhere,
         test_unicode_and_punctuation,
         test_empty_session_metadata,
         test_landmark_rows,

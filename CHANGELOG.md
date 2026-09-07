@@ -4,6 +4,91 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.26.0 — Milestone 3.25, the tool states what it has actually been tested for
+
+Two things arrive together, because neither is worth much alone: an export
+format a second reader can trust, and a written record of what has and has not
+been verified about the numbers in it.
+
+### CSV export, schema v2
+
+- **Every row now carries `schema_version`, as its first column.** A reader
+  that has to guess which columns a file has is a reader that will one day
+  guess wrong; a script can now refuse a layout it does not know instead of
+  silently reading the wrong field. This is version **2**; 0.18.0's layout was
+  version 1.
+- **Stable ids are exported alongside protocol ids.** `measurement_id` is the
+  researcher's protocol code and is *optional* — a scene where nobody filled
+  it in used to export rows that could not be told apart. `measurement_stable_id`,
+  `from_landmark_stable_id`, `to_landmark_stable_id` and `landmark_stable_id`
+  are BSMT's own monotonic ids, never reused within a scene and never blank.
+  Both are exported, so a row can always be identified and a protocol code can
+  still be the join key when there is one.
+- **The landmark stable ids on a measurement row come from the definition**,
+  not from the resolved landmark, so they stay meaningful after the landmark
+  they name has been deleted.
+- **Both files name the protocols that produced them** (`landmark_protocol`,
+  `measurement_protocol`). An exported measurement is only reproducible if the
+  reader knows *which* protocol produced it — a landmark called "Acromion"
+  means one thing under one protocol and something slightly different under
+  another. These are recorded when a protocol or template is loaded, so
+  nothing is invented.
+- Layout is now 33 measurement columns and 27 landmark columns. Nothing that
+  existed in version 1 was renamed or removed.
+
+### docs/VALIDATION.md — a validation record, with its limits stated
+
+New document separating **software verification** (does the program do what it
+is specified to do) from **numerical validation** (how does the computed number
+relate to a mathematically known answer), and marking every section with
+whether it was executed, authored but not run, not implemented, or needs human
+data. Executed evidence, all on Blender 4.5.13 / macOS ARM64:
+
+- **Analytic geometry** (`tests/test_analytic_validation.py`, 50 checks). Plane,
+  cylinder and sphere against closed-form answers. On the tested planar
+  fixtures the surface distance matched the analytic diagonal to zero absolute
+  error. On the cylinder and sphere the gap to the smooth surface shrank at
+  every refinement, at a rate consistent with second order over the tested
+  range. Recorded as what it is: the solver is exact **on the polyhedral mesh
+  it is given**, and the remaining gap is the mesh's discretisation, not solver
+  error.
+- **Rigid-transform invariance** (`tests/test_invariance_blender.py`, 63
+  checks). Surface distances bit-identical under pure translation and pure
+  rotation; worst deviation anywhere 1.5e-05 mm with the scan 28 m from the
+  origin. Geometry hash unchanged across every pose, and the solver called
+  **zero** times after a transform.
+- **Decimation sensitivity** (`tests/test_decimation_sensitivity.py`, 28
+  checks). Four paths at 608k / 500k / 350k / 200k triangles; worst deviation
+  0.0081 mm (0.0023%). Recorded explicitly as **characterisation, not
+  validation** — the fixture is a torus, not a body, and most of the measured
+  differences sit below the noise floor of re-attaching a landmark. It does
+  **not** establish 350k as a validated default.
+- **Failure and stale-state policy** (`tests/test_stale_state_blender.py`, 68
+  checks — new). Geometry edit, scale change, unit change, landmark re-pick,
+  density guard, cross-component pair and blocking topology, each asserted to
+  reach the state the policy specifies, to drop rather than reuse the old
+  number, and — where the operation is meant to be refused before solving — to
+  construct pygeodesic **zero** times.
+- **Repair locality** (`tests/test_repair_locality_blender.py`, 40 checks —
+  new). A repair confined to one cap of a sphere: the source scan stayed
+  bit-identical, no vertex outside the repaired region moved at all, and a
+  measurement 119 mm away returned a bit-identical distance afterwards.
+  Separates the **global** data-state invalidation policy (every landmark on a
+  repaired mesh goes non-VALID; nothing is re-projected) from the **local**
+  geometric reality.
+
+**Not validated, and said so in the document:** real-scan repeatability, intra-
+and inter-rater landmark reproducibility, comparison against reference
+software or manual anthropometry, and the scientific justification of any
+default decimation target. None of these can be settled by code, and BSMT does
+not claim them.
+
+### Also
+
+- The workflow-order test's prose said "seven stages" and "no eighth panel"
+  while asserting against the correct eight-stage tuple. Wording only; the
+  assertion and the panel order were already right.
+
 ## 0.25.2 — the selection ring belongs to Landmark Manager
 
 **Reported:** the selected landmark keeps its emphasis ring after the

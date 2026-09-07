@@ -16,7 +16,7 @@ Nothing here is legal advice.
 | Kirsanov exact-geodesic C++ | bundled inside pygeodesic | **MIT**, per the pygeodesic README: *"licensed under MIT license similar to the original Kirsanov C++ code, rather than GPL"* | Yes, inside the wheel |
 | NumPy | 1.26.4 | BSD-3-Clause | **No** — Blender provides it; BSMT never bundles or installs NumPy |
 | Blender Python API (`bpy`, `bmesh`, `mathutils`, `gpu`, `blf`) | 4.5 | GPL-2.0-or-later (Blender itself) | No — provided by Blender at runtime |
-| BSMT's own source | 0.24.2 | **undecided** | Yes |
+| BSMT's own source | 0.26.0 | **undecided** | Yes |
 
 MIT is permissive and GPL-compatible. Redistributing the pygeodesic wheel is
 allowed under any licence BSMT chooses, **provided the MIT notice travels with

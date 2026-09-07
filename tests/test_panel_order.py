@@ -67,9 +67,9 @@ def top_level():
 def test_workflow_order():
     print("\n[order] the sidebar is the workflow, top to bottom")
     got = [cls.bl_label for cls in top_level()]
-    check("the seven stages are in workflow order",
+    check("the eight stages are in workflow order",
           tuple(got) == EXPECTED_STAGES, got)
-    check("and there is no eighth top-level panel",
+    check("and there is no ninth top-level panel",
           len(got) == len(EXPECTED_STAGES), got)
 
 

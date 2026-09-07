@@ -51,6 +51,18 @@ _UNSAFE = re.compile(r"[^\w.-]+", re.UNICODE)
 #: than to claim precision.
 DECIMALS = 6
 
+#: Layout version of these files, written as the first column of every row.
+#:
+#: A reader that has to guess which columns a file has is a reader that will
+#: one day guess wrong. This is bumped when a column is added, removed or
+#: renamed, so a script can refuse a layout it does not know instead of
+#: silently reading the wrong field.
+#:
+#: 1  0.18.0 - the original layout.
+#: 2  0.26.0 - stable ids and protocol names added, so that every row can be
+#:    identified without relying on an OPTIONAL protocol id.
+SCHEMA_VERSION = 2
+
 
 class ExportError(Exception):
     """The export cannot be written as asked."""
@@ -62,16 +74,29 @@ class ExportError(Exception):
 # ---------------------------------------------------------------------------
 
 MEASUREMENT_COLUMNS = (
+    "schema_version",
+
     "subject_id",
     "condition",
     "scan_id",
+    "landmark_protocol",
+    "measurement_protocol",
 
+    # Two identifiers, and they are not interchangeable. `measurement_id` is
+    # the researcher's protocol code and is OPTIONAL - a scene where nobody
+    # filled it in exports rows that cannot be told apart. `stable_id` is
+    # BSMT's own monotonic id, never reused within a scene, always present.
+    # Both are exported so a row can always be identified and so a protocol
+    # code can still be the join key when there is one.
+    "measurement_stable_id",
     "measurement_id",
     "measurement_name",
     "notes",
 
+    "from_landmark_stable_id",
     "from_landmark_id",
     "from_landmark_name",
+    "to_landmark_stable_id",
     "to_landmark_id",
     "to_landmark_name",
 
@@ -99,10 +124,15 @@ MEASUREMENT_COLUMNS = (
 )
 
 LANDMARK_COLUMNS = (
+    "schema_version",
+
     "subject_id",
     "condition",
     "scan_id",
+    "landmark_protocol",
+    "measurement_protocol",
 
+    "landmark_stable_id",
     "landmark_id",
     "landmark_name",
     "status",
@@ -194,16 +224,28 @@ def measurement_row(session, measurement, mesh, version, exported):
                    bool(straight) and bool(surface))
 
     return {
+        "schema_version": str(SCHEMA_VERSION),
+
         "subject_id": text(session.get("subject_id")),
         "condition": text(session.get("condition")),
         "scan_id": text(session.get("scan_id")),
+        "landmark_protocol": text(session.get("landmark_protocol")),
+        "measurement_protocol": text(session.get("measurement_protocol")),
 
+        "measurement_stable_id": integer(measurement.get("stable_id"),
+                                         measurement.get("stable_id")),
         "measurement_id": text(measurement.get("protocol_id")),
         "measurement_name": text(measurement.get("name")),
         "notes": text(measurement.get("notes")),
 
+        "from_landmark_stable_id": integer(
+            measurement.get("from_landmark_stable_id"),
+            measurement.get("from_landmark_stable_id")),
         "from_landmark_id": text(measurement.get("from_landmark_id")),
         "from_landmark_name": text(measurement.get("from_landmark_name")),
+        "to_landmark_stable_id": integer(
+            measurement.get("to_landmark_stable_id"),
+            measurement.get("to_landmark_stable_id")),
         "to_landmark_id": text(measurement.get("to_landmark_id")),
         "to_landmark_name": text(measurement.get("to_landmark_name")),
 
@@ -255,10 +297,16 @@ def landmark_row(session, landmark, mesh, version, exported, unit=""):
         return number(values[index], True)
 
     return {
+        "schema_version": str(SCHEMA_VERSION),
+
         "subject_id": text(session.get("subject_id")),
         "condition": text(session.get("condition")),
         "scan_id": text(session.get("scan_id")),
+        "landmark_protocol": text(session.get("landmark_protocol")),
+        "measurement_protocol": text(session.get("measurement_protocol")),
 
+        "landmark_stable_id": integer(landmark.get("stable_id"),
+                                      landmark.get("stable_id")),
         "landmark_id": text(landmark.get("protocol_id")),
         "landmark_name": text(landmark.get("name")),
         "status": text(landmark.get("status")),

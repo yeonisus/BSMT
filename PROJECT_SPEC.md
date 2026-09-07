@@ -4667,6 +4667,153 @@ preprocessing and 90 path-visualisation checks in Blender. 0 failures.
 
 ---
 
+## 11ac. Milestone 3.25 — What the tool has actually been tested for (v0.26.0, 2026-09-07)
+
+### 11ac.1 The problem
+
+BSMT could compute a surface distance and export it, and could say nothing
+about how far that number could be trusted. Two gaps, and they compound:
+
+1. **The CSV could not always identify its own rows.** `measurement_id` is the
+   researcher's protocol code and is optional. A scene where nobody filled it
+   in exported rows that were indistinguishable, and a reader had no way to
+   tell which column layout they were looking at.
+2. **There was no validation record.** Correctness claims lived in test
+   docstrings and in this document, in the assistant's prose, and nowhere a
+   researcher could cite. Worse, there was no written line between *verified by
+   code* and *not verified by anything* — which is exactly the line a reviewer
+   asks about.
+
+### 11ac.2 CSV schema v2
+
+`export.SCHEMA_VERSION = 2`, written as the **first column of every row** in
+both files. Bumped when a column is added, removed or renamed, so a reader can
+refuse a layout rather than misread one.
+
+Two identifiers per entity, and they are not interchangeable:
+
+* `measurement_id` / `landmark_id` — the researcher's protocol code.
+  **Optional**, and the natural join key when a study has one.
+* `measurement_stable_id` / `landmark_stable_id` / `from_landmark_stable_id` /
+  `to_landmark_stable_id` — BSMT's own monotonic id. Never reused within a
+  scene, never blank.
+
+The landmark stable ids on a measurement row are read from the **definition**,
+not from the resolved landmark, so a row stays identifiable after the landmark
+it names has been deleted.
+
+Both files also carry `landmark_protocol` and `measurement_protocol`. An
+exported measurement is reproducible only if the reader knows which protocol
+produced it; a landmark called "Acromion" means one thing under one protocol
+and something slightly different under another. Both are recorded when a
+protocol or template is loaded, so neither is invented.
+
+Nothing from version 1 was renamed or removed. The layout is now 33
+measurement columns and 27 landmark columns.
+
+### 11ac.3 The distinction the validation record is built on
+
+`docs/VALIDATION.md` separates three questions that are easy to conflate:
+
+* **Software verification** — does the program do what it is specified to do?
+  Decidable by code; a passing suite settles it. (Rigid invariance, repair
+  locality, CSV export, protocol round-trip, failure/stale state, packaging.)
+* **Numerical validation** — how does the computed number relate to a
+  mathematically known answer? Decidable by code *only where a closed form
+  exists*, which is why the fixtures are analytic surfaces and not bodies.
+  (Analytic geometry, decimation sensitivity.)
+* **Neither** — does the number correspond to the anatomical quantity the
+  researcher intends to measure? **No section of the document answers this**,
+  and the document says so.
+
+Every section carries one of four statuses — EXECUTED, AUTHORED BUT NOT
+EXECUTED, NOT IMPLEMENTED, REQUIRES HUMAN DATA — so an authored test is never
+reported as a validated result.
+
+### 11ac.4 The terminology rule
+
+The backend computes an **exact geodesic on the input triangular mesh**. That
+is the whole claim.
+
+It is *not* an exact geodesic on the underlying smooth surface, and not an
+exact measurement of a smooth anatomical surface. A triangulated approximation
+of a curved surface is a chord approximation lying inside it, so its geodesics
+are shorter. Reporting that difference as "solver error" would be wrong twice
+over: it blames the solver for the mesh, and it implies an error budget the
+solver does not have.
+
+The plane is the one fixture family where the polyhedral surface coincides
+with the smooth one, so agreement there is exactness; the cylinder and sphere
+measure discretisation, and their convergence is reported as an observed trend
+over the tested range rather than as a theorem.
+
+### 11ac.5 Stale state, and where refusals happen
+
+`tests/test_stale_state_blender.py` closes the gap that
+`refresh_measurement_status`, `_path_cache_state` and the three
+`invalidate_*` entry points had no direct coverage at all.
+
+The rule proved is one sentence: **a number computed against one configuration
+is never shown, reused or exported once that configuration has changed.**
+Geometry edit, scale change, unit change and landmark re-pick each drop the
+stored number rather than rescaling or keeping it; a rigid motion, as the
+control, changes nothing.
+
+Where an operation is meant to be refused *before* solving — blocking
+topology, cross-component pair, density guard — the refusal is proved by
+counting constructions of `PyGeodesicAlgorithmExact`, the only door to the
+native solver. Nine such blocks, all zero. "The gate refuses it" is a claim
+about control flow, and control flow is what drifts; counting turns it into a
+measurement.
+
+One asymmetry is recorded rather than assumed. A cached **path** stores its own
+endpoint record and verifies it passively. A stored **result** does not, and is
+invalidated by the **event** instead — every production path that can move a
+landmark calls `invalidate_measurements_for_landmark`. There is no reachable
+path where a landmark moves and a dependent result stays valid, but the
+invariant is maintained by callers rather than by comparison, and whoever next
+changes landmark handling should know that.
+
+### 11ac.6 Repair: global invalidation, local geometry
+
+These two are both true and are constantly confused:
+
+* **Data-state invalidation is global.** Repair changes the mesh, the geometry
+  hash changes, and `landmarks.classify` marks *every* landmark on that object
+  non-VALID — not only those near the repair. Nothing is re-projected, because
+  silently re-attaching a researcher's landmark would move their data.
+* **Geometric locality is strict.** With defects confined to one cap of a
+  sphere, no vertex outside that cap moved *at all* — worst delta exactly zero
+  — the source scan stayed bit-identical, and a measurement 119 mm from the
+  nearest defect returned a bit-identical distance afterwards.
+
+They do not conflict: the first says the researcher must re-pick and recompute,
+the second says that when they do, they get the same answer. Because the first
+holds, locality cannot be shown by carrying a SurfacePoint across a repair —
+the product refuses that, correctly — so it is shown geometrically, by
+re-attaching the same positions as a re-picking researcher would.
+
+Repair remains **conservative under a narrow defect policy**: exactly
+coincident vertices producing zero-area triangles are merged; slivers, fan
+collapses, holes and non-manifold junctions are refused. There is no distance
+or tolerance argument anywhere on that path, so it cannot widen into a global
+weld.
+
+### 11ac.7 What this milestone does not establish
+
+Listed in `docs/VALIDATION.md` §I and repeated here because it is the part most
+easily lost: real human-scan repeatability, intra-rater and inter-rater
+landmark reproducibility, comparison against reference software or manual
+anthropometry, real-scan decimation sensitivity, and the scientific
+justification of any default triangle target. None is decidable by code. The
+decimation figures are **characterisation** and must not be cited as validating
+350,000 triangles.
+
+BSMT's verified claim after this milestone is bounded to: *it computes an exact
+geodesic on the mesh it is given, invariantly under rigid motion, refuses the
+cases it cannot compute safely, and exports the result without corrupting it.*
+
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~
