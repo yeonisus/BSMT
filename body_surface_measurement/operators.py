@@ -3995,7 +3995,8 @@ class BSMT_OT_show_non_manifold(bpy.types.Operator):
             visualization.show_repair_edges(
                 context, props, visualization.REPAIR_NON_MANIFOLD,
                 [], [], obj.matrix_world,
-                visualization.REPAIR_NON_MANIFOLD_COLOR)
+                visualization.REPAIR_NON_MANIFOLD_COLOR,
+                _defect_highlight_radius(canonical))
             self.report({'INFO'}, "BSMT: no non-manifold edges to show")
             return {'FINISHED'}
 
@@ -4006,9 +4007,85 @@ class BSMT_OT_show_non_manifold(bpy.types.Operator):
         visualization.show_repair_edges(
             context, props, visualization.REPAIR_NON_MANIFOLD,
             points, local_edges, obj.matrix_world,
-            visualization.REPAIR_NON_MANIFOLD_COLOR)
+            visualization.REPAIR_NON_MANIFOLD_COLOR,
+            _defect_highlight_radius(canonical))
         self.report({'INFO'},
                     "BSMT: highlighted %d non-manifold edge(s)"
+                    % edges.shape[0])
+        return {'FINISHED'}
+
+
+class BSMT_OT_focus_non_manifold(bpy.types.Operator):
+    """Frame the viewport on the non-manifold edges.
+
+    Moves the VIEW only. The scan is never moved, rotated or scaled
+    """
+
+    bl_idname = "bsmt.focus_non_manifold"
+    bl_label = "Focus Non-Manifold Edges"
+    bl_description = ("Point the 3D view at the non-manifold edges. The scan"
+                      " itself is never moved")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return _repair_target(context)[0] is not None
+
+    def execute(self, context):
+        # Deliberately a separate press, not something Show Edges does on its
+        # own: BSMT never moves a researcher's view as a side effect. But a
+        # defect one mesh edge long is about 0.3% of a subject's height, and
+        # a highlight that is honest about its size is still something you
+        # have to be looking at the right part of the body to see. This is
+        # the same answer the degenerate-triangle stage already gives.
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        geodesic.ensure_loaded()
+        canonical = _canonical_arrays(context, props, obj, rebuild=False)
+        edges = repair.classify_edges(canonical.triangles,
+                                      canonical.vertex_count)["non_manifold"]
+        if edges.shape[0] == 0:
+            self.report({'INFO'}, "BSMT: no non-manifold edges on '%s'"
+                        % obj.name)
+            return {'CANCELLED'}
+
+        used = np.unique(edges)
+        points = [obj.matrix_world @ Vector(
+            (float(p[0]), float(p[1]), float(p[2])))
+            for p in canonical.vertices_local[used]]
+        center = Vector((0.0, 0.0, 0.0))
+        for point in points:
+            center += point
+        center /= len(points)
+        extent = max((point - center).length for point in points)
+
+        # Every non-manifold edge in one view. With the usual handful of
+        # edges in one place that is a close-up; with defects scattered over
+        # the body it frames all of them, which is still an answer.
+        scale = float(obj.matrix_world.to_scale().length / 3.0 ** 0.5)
+        distance = max(extent * 4.0,
+                       _defect_highlight_radius(canonical) * scale * 20.0,
+                       1.0)
+        moved = 0
+        for area in getattr(context.screen, "areas", ()) or ():
+            if area.type != 'VIEW_3D':
+                continue
+            for space in area.spaces:
+                if space.type != 'VIEW_3D' or space.region_3d is None:
+                    continue
+                space.region_3d.view_location = center
+                space.region_3d.view_distance = distance
+                moved += 1
+            area.tag_redraw()
+        if not moved:
+            self.report({'WARNING'},
+                        "BSMT: no 3D viewport to focus; the edges are around "
+                        "(%.1f, %.1f, %.1f)" % (center.x, center.y, center.z))
+            return {'CANCELLED'}
+        self.report({'INFO'}, "BSMT: framed %d non-manifold edge(s)"
                     % edges.shape[0])
         return {'FINISHED'}
 
@@ -4056,7 +4133,8 @@ class BSMT_OT_show_boundary_loop(bpy.types.Operator):
             context, props, visualization.REPAIR_BOUNDARY,
             canonical.vertices_local[used],
             [(remap[int(a)], remap[int(b)]) for a, b in edges],
-            obj.matrix_world, visualization.REPAIR_BOUNDARY_COLOR)
+            obj.matrix_world, visualization.REPAIR_BOUNDARY_COLOR,
+            _defect_highlight_radius(canonical))
         self.report({'INFO'}, "BSMT: highlighted loop %d (%d edges, %.1f mm)"
                     % (loop["loop_id"], loop["edge_count"],
                        loop["perimeter_mm"]))
@@ -4089,11 +4167,46 @@ def _chosen_defects(props, defects):
     return list(defects)
 
 
+def _local_length(canonical, length_mm):
+    """A physical millimetre length, expressed in the object's LOCAL units.
+
+    Highlight sizes are decided in millimetres, against the scan's own
+    bounding box, because that is the only scale a researcher can reason
+    about. The helper meshes, though, are built in object-local coordinates
+    and then given the object's world matrix - so a size in millimetres has
+    to come back through both the unit multiplier and the object's scale. A
+    highlight that is the right size only when the scan happens to be stored
+    in millimetres with scale 1 is not the right size; it is a coincidence.
+    """
+    multiplier = float(getattr(canonical, "unit_multiplier", 1.0) or 1.0)
+    matrix = np.asarray(canonical.matrix_world, dtype=np.float64)
+    scale = float(np.mean([np.linalg.norm(matrix[:3, column])
+                           for column in range(3)]))
+    if scale <= 0.0:
+        scale = 1.0
+    return float(length_mm) / multiplier / scale
+
+
 def _defect_marker_size(canonical):
     """Marker size for a defect cross: small against the body, still visible."""
     report = canonical.topology or {}
     diagonal = float(report.get("bbox_diagonal", 0.0) or 0.0)
-    return max(diagonal * 0.005, 1.0)
+    return _local_length(canonical, max(diagonal * 0.005, 1.0))
+
+
+def _defect_highlight_radius(canonical):
+    """Rod radius for a defect highlight, in the object's local units.
+
+    0.4% of the scan's bounding-box diagonal, floored at 0.5 mm: a 7 mm
+    radius on a 1.7 m body, so the mark is about three times the diameter of
+    a landmark marker and reads at the zoom a researcher looks at a whole
+    scan from, while staying slender enough not to bury the surface under it.
+    Only the thickness is exaggerated - a highlight's endpoints are always
+    the defect's own.
+    """
+    report = canonical.topology or {}
+    diagonal = float(report.get("bbox_diagonal", 0.0) or 0.0)
+    return _local_length(canonical, max(diagonal * 0.004, 0.5))
 
 
 class BSMT_OT_show_degenerate_triangles(bpy.types.Operator):
@@ -4140,6 +4253,7 @@ class BSMT_OT_show_degenerate_triangles(bpy.types.Operator):
         visualization.show_repair_markers(
             context, visualization.REPAIR_DEGENERATE, locals_all, size,
             obj.matrix_world, visualization.REPAIR_DEGENERATE_COLOR,
+            _defect_highlight_radius(canonical),
         )
         self._mark_active(context, props, canonical, defects, obj, size)
         self.report({'INFO'}, "BSMT: marked %d degenerate triangle(s)"
@@ -4161,6 +4275,7 @@ class BSMT_OT_show_degenerate_triangles(bpy.types.Operator):
             context, visualization.REPAIR_DEGENERATE_ACTIVE, [point],
             size * 2.0, obj.matrix_world,
             visualization.REPAIR_DEGENERATE_ACTIVE_COLOR,
+            _defect_highlight_radius(canonical) * 1.5,
         )
 
 
@@ -4248,8 +4363,12 @@ class BSMT_OT_focus_degenerate_defect(bpy.types.Operator):
                     continue
                 # Only the view's own pivot and zoom. Nothing on the object.
                 space.region_3d.view_location = world
+                # view_distance is a WORLD length, so the marker size -
+                # which is local - comes back through the object's scale.
                 space.region_3d.view_distance = max(
-                    _defect_marker_size(canonical) * 20.0, 1.0
+                    _defect_marker_size(canonical)
+                    * float(obj.matrix_world.to_scale().length / 3.0 ** 0.5)
+                    * 20.0, 1.0
                 )
                 moved += 1
             area.tag_redraw()
@@ -6061,6 +6180,7 @@ classes = (
     BSMT_OT_preview_degenerate_repair,
     BSMT_OT_repair_degenerate_local,
     BSMT_OT_show_non_manifold,
+    BSMT_OT_focus_non_manifold,
     BSMT_OT_show_boundary_loop,
     BSMT_OT_clear_repair_highlight,
     BSMT_OT_fill_boundary_loop,

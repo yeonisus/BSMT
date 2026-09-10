@@ -4967,6 +4967,128 @@ Existing suites unchanged in behaviour: the draw-path change is a guard, and the
 delegation of the same conditions in the same order.
 
 
+## 11ae. Milestone 3.27 — A defect highlight you can see (v0.26.2, 2026-09-10)
+
+Everything about the highlight was correct except that it was invisible.
+
+### 11ae.1 The report
+
+A measurement mesh whose diagnostics report exactly one non-manifold edge. Repair blocked on it,
+Weld Non-Manifold Region correctly attempting the repair and rolling it back when the count stayed
+1 → 1, and **Show Edges** producing no visible highlight at all.
+
+### 11ae.2 What was measured, before anything was changed
+
+The audit ran on a body-scale measurement mesh — 1.7 m tall in millimetre coordinates, rotated and
+translated the way an aligned scan is — carrying exactly one non-manifold edge:
+
+| Question from the report | Measured answer |
+|---|---|
+| Does Show Edges identify the same edge as diagnostics? | **Yes.** `classify_edges` returns 1, diagnostics report 1 |
+| Is the helper geometry created? | **Yes**, two vertices and one edge |
+| Is it linked to `BSMT_Helpers`, and is that in the scene? | **Yes** to both |
+| Is it excluded or hidden by view-layer state? | **No** — `exclude` and `hide_viewport` both false |
+| Is the object itself hidden? | **No** — viewport, render and `hide_get()` all false |
+| Is it built in local instead of world coordinates? | **No** — endpoints within 1.5e-5 mm of the true edge |
+| Are the object's transforms applied? | **Yes** — the helper takes the scan's `matrix_world` |
+| Does depth testing bury it? | **No** — `show_in_front` was already set |
+
+Every property the existing suite could assert was already true. So the defect was not in *where*
+the highlight was; it was in *what was drawn*.
+
+### 11ae.3 Root cause: a colourless hairline
+
+The highlight was an **edge-only mesh with no material**, `display_type = 'WIRE'`. Three things
+follow, and together they make it unseeable:
+
+1. **No colour.** Blender paints a wire object in the theme's wire colour. The alarming magenta-red
+   in `REPAIR_NON_MANIFOLD_COLOR` reaches `obj.color`, which the viewport only consults when its
+   *wireframe* colour mode is switched to Object — not the default, and not a setting a researcher
+   has any reason to touch. Measured directly: forcing the viewport's colour mode left the line
+   dark.
+2. **No thickness.** A wire is one pixel wide at every zoom.
+3. **No scale awareness.** What was drawn was the mesh's own edge — about **5 mm** on a
+   350,000-triangle body scan, **0.3%** of the subject's height.
+
+A near-black hairline a few pixels long, lying on a grey body. The screenshot of the pre-fix state
+shows it only because the fixture's edge is 72 mm and the view is 400 mm from it.
+
+The degenerate-triangle stage had already met this problem and solved it — a zero-area triangle has
+nothing to draw, so `_defect_marker_size` sizes a cross against the scan's bounding box. The
+non-manifold and boundary highlights, which do have geometry to draw, never got the same treatment,
+and drawing the true geometry turned out to be exactly what made them invisible.
+
+### 11ae.4 The fix, and what it is careful not to do
+
+Solid rods, six-sided, one per defect edge, carrying a material in the defect's colour:
+
+- **The material is what makes the colour appear.** Solid shading paints a material's diffuse
+  colour by default; this is the mechanism the landmark markers have always used, and the repair
+  highlights simply never used it.
+- **Radius is 0.4% of the scan's bounding-box diagonal**, floored at 0.5 mm — about 7 mm on a 1.7 m
+  body, roughly three times a landmark marker's diameter, still slender enough not to bury the
+  surface it lies on.
+- **Only the thickness is exaggerated.** The rod's axis runs between the defect's own endpoints, so
+  the highlight can never misstate where a defect is or how far it runs. The regression asserts
+  both halves of that: it reaches both true endpoints, and it does not overstate the extent.
+- `show_in_front` is kept, so a defect on the far side of the body is still visible — the
+  depth-independent display the report asked for, without offsetting the geometry and thereby
+  lying about position.
+
+**A size in millimetres now converts properly.** Highlight sizes are decided in millimetres against
+the bounding box, which is solver space, and then built into a mesh in object-local coordinates —
+so they must come back through both the unit multiplier and the object's scale (`_local_length`).
+The previous marker size did neither: it was right only for a scan stored in millimetres at scale
+1, and silently wrong by a factor of 1000 for a scan in metres.
+
+### 11ae.5 Framing is a press, not a side effect
+
+A highlight that is honest about its size is still a 5 mm mark on a 1.7 m body: findable once you
+are looking at the right region, easy to miss when you are not. The answer is the one this project
+already gave for degenerate triangles — an explicit **Focus** button, which frames every
+non-manifold edge in one view and moves nothing but the view.
+
+Deliberately not automatic. "Show me" and "take me there" are different requests, and a tool that
+moves a researcher's viewport as a side effect of being asked to display something is a tool they
+stop trusting with the viewport.
+
+### 11ae.6 Cost
+
+Measured on the rod builder, since a boundary loop can carry thousands of edges:
+
+| Defect edges | Vertices | Faces | Build |
+|---|---|---|---|
+| 100 | 1,200 | 800 | 2 ms |
+| 2,000 | 24,000 | 16,000 | 34 ms |
+| 20,000 | 240,000 | 160,000 | 357 ms |
+
+A button press, not a redraw, so this is comfortably inside what a press may cost.
+
+### 11ae.7 What is verified
+
+`tests/test_repair_highlight_blender.py` — 38 checks in Blender, on a rotated, translated,
+body-scale measurement mesh with exactly one known non-manifold edge:
+
+- **A** diagnostics and the visualization path count the same single edge, and the mesh is NOT
+  READY because of it;
+- **B** the helper exists, is centred on the defect's own world position, reaches both true
+  endpoints, and does not overstate the edge's extent;
+- **C** helper flag, helper collection, view-layer inclusion, not hidden, in front, unselectable;
+- **D** it has faces, a material, the right colour in both the material and the object, a
+  millimetre-scale radius, and a thickness proportionate to the scan — the checks that would have
+  caught the report;
+- **E** the measurement mesh's vertices, faces and topology verdict are unchanged by highlighting;
+- **F** Clear Highlight removes it and leaves the scan alone;
+- **G** the same holds at a different object scale, which is what catches the unit conversion;
+- **H** Focus never moves the scan;
+- **I** a clean mesh gets no highlight, and Focus refuses rather than framing nothing.
+
+Run against the 0.26.1 code the suite fails at **D1** — the first check of what actually reaches
+the screen.
+
+No repair policy, readiness verdict, solver gate or topology analysis changed.
+
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~

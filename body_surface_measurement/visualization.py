@@ -5,6 +5,8 @@ linked into a dedicated collection. Deletion only ever touches objects that
 carry that tag, so a user's body scan can never be removed by this add-on.
 """
 
+import math
+
 import bmesh
 import bpy
 from mathutils import Vector
@@ -681,24 +683,114 @@ def _edge_mesh(name, points_local, edges):
     return mesh
 
 
+def _solid_mesh(name, vertices, faces):
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata([tuple(float(v) for v in vertex) for vertex in vertices],
+                     [], [tuple(int(i) for i in face) for face in faces])
+    mesh.update()
+    mesh[HELPER_FLAG] = True
+    return mesh
+
+
+#: Sides on a highlight rod. Six reads as a rod from any angle and keeps a
+#: thousand-edge highlight to a few thousand faces.
+HIGHLIGHT_TUBE_SIDES = 6
+
+
+def _tube_geometry(points, edges, radius, sides=HIGHLIGHT_TUBE_SIDES):
+    """Vertices and faces for a solid rod along each edge.
+
+    A highlight has to be findable on a human body scan, and an edge-only wire
+    is not. The defect it marks is one mesh edge - about 5 mm long on a
+    350,000-triangle body, 0.3% of the subject's height - and Blender draws a
+    wire object one pixel wide in the theme's wire colour, ignoring the
+    object colour unless the researcher has changed a viewport shading
+    setting they have no reason to know about. The result is a dark hairline
+    over a grey body: drawn, and invisible.
+
+    A rod of a stated millimetre radius, carrying a material, is the same
+    location drawn so that it can be seen. THE ENDPOINTS STAY EXACT - only
+    the thickness is exaggerated - so the highlight never misstates where the
+    defect is or how far it runs.
+    """
+    vertices = []
+    faces = []
+    if radius <= 0.0 or sides < 3:
+        return vertices, faces
+    for first, second in edges:
+        start = Vector(tuple(float(v) for v in points[int(first)]))
+        end = Vector(tuple(float(v) for v in points[int(second)]))
+        axis = end - start
+        length = axis.length
+        if length <= 0.0:
+            # A zero-length edge has no direction to build a rod around.
+            # `show_repair_markers` is what marks a defect with no extent.
+            continue
+        axis = axis / length
+        across = axis.orthogonal().normalized() * radius
+        up = axis.cross(across).normalized() * radius
+        base = len(vertices)
+        for step in range(sides):
+            angle = 2.0 * math.pi * step / sides
+            offset = across * math.cos(angle) + up * math.sin(angle)
+            vertices.append(tuple(start + offset))
+            vertices.append(tuple(end + offset))
+        for step in range(sides):
+            next_step = (step + 1) % sides
+            faces.append((base + 2 * step, base + 2 * next_step,
+                          base + 2 * next_step + 1, base + 2 * step + 1))
+        # Caps, so a rod seen end-on is still a solid mark rather than a ring.
+        faces.append(tuple(base + 2 * step for step in range(sides)))
+        faces.append(tuple(base + 2 * step + 1
+                           for step in reversed(range(sides))))
+    return vertices, faces
+
+
+def _colored_helper(context, name, vertices, faces, color):
+    """A solid, coloured, in-front helper object built from a face soup.
+
+    The material is what makes the colour appear at all: `obj.color` is only
+    consulted when the viewport's shading colour is set to Object, which is
+    not the default, while a material's diffuse colour is what Solid shading
+    draws by default - the same mechanism the landmark markers already use.
+    """
+    mesh = _solid_mesh(name + "_Mesh", vertices, faces)
+    mesh.materials.append(get_material("BSMT_Material_" + name, color))
+    obj = new_helper_object(context, name, mesh, color)
+    obj.show_in_front = True          # a defect hidden inside the scan is
+    return obj                        # exactly the one you need to see
+
+
 def show_repair_edges(context, props, name, points_local, edges, matrix_world,
-                      color):
-    """Draw a set of edges over a scan. Returns the helper object, or None."""
+                      color, radius=0.0):
+    """Draw a set of edges over a scan. Returns the helper object, or None.
+
+    `radius` is in the LOCAL units the points are given in - see
+    `operators._defect_highlight_radius`, which decides it in millimetres
+    against the scan's own bounding box. A radius of zero falls back to the
+    bare wire, which is honest about position but very hard to see.
+    """
     existing = _existing_helper(name)
     if existing is not None:
         remove_object(existing)
     if len(edges) == 0:
         return None
-    mesh = _edge_mesh(name + "_Mesh", points_local, edges)
-    obj = new_helper_object(context, name, mesh, color)
-    obj.show_in_front = True          # a defect hidden inside the scan is
-    obj.display_type = 'WIRE'         # exactly the one you need to see
+    vertices, faces = _tube_geometry(points_local, edges, radius)
+    if faces:
+        obj = _colored_helper(context, name, vertices, faces, color)
+    else:
+        # No usable radius, or every edge had zero length. A hairline is worth
+        # more than nothing at all.
+        mesh = _edge_mesh(name + "_Mesh", points_local, edges)
+        obj = new_helper_object(context, name, mesh, color)
+        obj.show_in_front = True
+        obj.display_type = 'WIRE'
     obj.matrix_world = matrix_world
     return obj
 
 
 def show_repair_markers(context, name, points_local, size, matrix_world,
-                        color):
+                        color, radius=0.0):
     """Draw a 3D cross at each location. Returns the helper object, or None.
 
     Degenerate triangles need this rather than `show_repair_edges`: a
@@ -707,9 +799,11 @@ def show_repair_markers(context, name, points_local, size, matrix_world,
     nothing at all. A cross of a fixed size at the defect's centroid is what
     makes an invisible defect findable on a body.
 
-    Wire, drawn in front, never selectable, and in the BSMT helper
-    collection like every other helper, so it cannot be mistaken for the scan
-    or reach canonical mesh construction (sect. 18).
+    The arms are rods of `radius` for the same reason the edge highlight is:
+    a wire cross is drawn one pixel wide in the theme colour and disappears
+    into the scan behind it. Drawn in front, never selectable, and in the
+    BSMT helper collection like every other helper, so it cannot be mistaken
+    for the scan or reach canonical mesh construction (sect. 18).
     """
     existing = _existing_helper(name)
     if existing is not None:
@@ -730,10 +824,14 @@ def show_repair_markers(context, name, points_local, size, matrix_world,
                                  point[2] + offset[2]))
             edges.append((base + axis * 2, base + axis * 2 + 1))
 
-    mesh = _edge_mesh(name + "_Mesh", vertices, edges)
-    obj = new_helper_object(context, name, mesh, color)
-    obj.show_in_front = True
-    obj.display_type = 'WIRE'
+    rod_vertices, faces = _tube_geometry(vertices, edges, radius)
+    if faces:
+        obj = _colored_helper(context, name, rod_vertices, faces, color)
+    else:
+        mesh = _edge_mesh(name + "_Mesh", vertices, edges)
+        obj = new_helper_object(context, name, mesh, color)
+        obj.show_in_front = True
+        obj.display_type = 'WIRE'
     obj.matrix_world = matrix_world
     return obj
 

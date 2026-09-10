@@ -5,11 +5,11 @@ executed, what exists but has not been run, what has not been written, and
 what cannot be settled by code at all. Nothing here is a claim about human
 body measurement accuracy.
 
-- **Software version under test:** BSMT 0.26.1 (`body_surface_measurement.VERSION`)
+- **Software version under test:** BSMT 0.26.2 (`body_surface_measurement.VERSION`)
 - **Host:** macOS (darwin 25.5.0), Apple Silicon / ARM64
 - **Blender:** 4.5.13 LTS (hash `daeeeca98fb0`, built 2026-08-25)
 - **Geodesic backend:** pygeodesic (MMP), bundled
-- **Runs recorded here:** 2026-09-07 and 2026-09-10, from the working tree (see
+- **Runs recorded here:** 2026-09-07 and 2026-09-10 (0.26.1, then 0.26.2), from the working tree (see
   [Development note](#development-note--repository-and-release-state))
 
 ---
@@ -77,7 +77,7 @@ means the closed-form value on the ideal surface the mesh was sampled from.
 | E | CSV export | Software verification | **EXECUTED** — 312/312 pass at source; package-level validated in §H | 2026-09-07 |
 | F | Protocol round-trip | Software verification | **EXECUTED** — 53/53 pass | 2026-09-07 |
 | G | Failure / stale-state | Software verification | **EXECUTED** — 68/68 pass (new suite) + 6 supporting suites | 2026-09-07 |
-| H | Clean packaged install | Software verification | **EXECUTED** — 79/79 pass from a clean 0.26.1 extraction | 2026-09-10 |
+| H | Clean packaged install | Software verification | **EXECUTED** — 79/79 pass from a clean 0.26.2 extraction | 2026-09-10 |
 | I | Researcher-run validation | Empirical | **REQUIRES HUMAN DATA** — none performed | — |
 
 ### 0.5 Reproducing these runs
@@ -970,12 +970,12 @@ installs. This section extracts the released ZIP into a temporary directory
 
 ### H.1 Artefacts under test
 
-Built by `python3 tools/build_release.py` from `VERSION = (0, 26, 1)`:
+Built by `python3 tools/build_release.py` from `VERSION = (0, 26, 2)`:
 
 | Package | Bytes | SHA256 |
 |---|---|---|
-| `dist/bsmt-0.26.1.zip` (Blender extension) | 1,892,180 | `5ea642a6df9ff81d1d731eede9c0a94080ac9cd7ca9ce9d9cf562d018167db7c` |
-| `dist/body_surface_measurement-0.26.1.zip` (legacy add-on) | 285,971 | `a65ec395a4dc1c402dc25459e96fa86eca613a6fb794d48a872b9ad913e3f24e` |
+| `dist/bsmt-0.26.2.zip` (Blender extension) | 1,896,657 | `cbc7fa4148a29393b332f3644abdf12153c6cb5760f757ecc78594b71d15fb9a` |
+| `dist/body_surface_measurement-0.26.2.zip` (legacy add-on) | 288,710 | `64b53e5412da963951180159dae1ebb828764c355f26844571362da81bb73032` |
 
 ### H.2 Import isolation — asserted, not assumed
 
@@ -996,9 +996,9 @@ isolation is verified four ways:
 
 | Check | Result |
 |---|---|
-| `VERSION == (0, 26, 1)` | **PASS** |
+| `VERSION == (0, 26, 2)` | **PASS** |
 | `export.SCHEMA_VERSION == 2` | **PASS** |
-| Extension manifest declares `version = "0.26.1"` | **PASS** |
+| Extension manifest declares `version = "0.26.2"` | **PASS** |
 | Manifest declares `platforms = ["macos-arm64", "windows-x64"]` | **PASS** |
 
 ### H.4 Registration and clean unregistration
@@ -1132,14 +1132,14 @@ given anatomical measurement is outside what has been validated.
 
 ## Development note — release and provenance
 
-- **Release under test: 0.26.1**, built 2026-09-10 by
-  `python3 tools/build_release.py` from `VERSION = (0, 26, 1)`, which is the
+- **Release under test: 0.26.2**, built 2026-09-10 by
+  `python3 tools/build_release.py` from `VERSION = (0, 26, 2)`, which is the
   single source of truth the build reads to stamp the extension manifest.
   SHA256 digests are recorded in §H.1.
 - **Release metadata is reconciled.** `VERSION`, the generated
-  `blender_manifest.toml`, `CHANGELOG.md` (0.26.1), `PROJECT_SPEC.md`
-  (§11ad, Milestone 3.26), `INSTALL.md`, `docs/LICENSING.md` and
-  `docs/windows_acceptance.md` all name 0.26.1. `export.SCHEMA_VERSION`
+  `blender_manifest.toml`, `CHANGELOG.md` (0.26.2), `PROJECT_SPEC.md`
+  (§11ae, Milestone 3.27), `INSTALL.md`, `docs/LICENSING.md` and
+  `docs/windows_acceptance.md` all name 0.26.2. `export.SCHEMA_VERSION`
   remains **2**, as designed — it versions the CSV layout, not the release.
 - **What 0.26.1 changed, and why none of the evidence below moves.** It is a
   sidebar release: a guard that stops the Scan Preprocessing panel rendering
@@ -1150,15 +1150,26 @@ given anatomical measurement is outside what has been validated.
   readiness policy, no topology analysis and no decimation code was touched;
   `preprocess.preflight` still refuses a non-manifold mesh, which §B of
   `tests/test_preprocess_panel_blender.py` now asserts directly.
+- **What 0.26.2 changed on top of that.** Repair highlights are drawn as
+  coloured solid rods instead of colourless one-pixel wires, sized in
+  millimetres against the scan's own bounding box, with a Focus button that
+  frames the non-manifold edges. Visualization only: no repair, readiness,
+  solver-gate or topology code was touched, and
+  `tests/test_repair_highlight_blender.py` asserts that a highlight leaves
+  the measurement mesh's vertices, faces and topology verdict unchanged. The
+  one non-cosmetic correction is that highlight sizes now convert out of
+  solver millimetres through the unit multiplier and the object scale, which
+  was wrong for any scan not stored in millimetres at scale 1 — it affects
+  where a marker is drawn, never what is measured.
 - **Every suite in this document was re-executed on 2026-09-10**, including
   the decimation suite (§C, ~700 s) and the packaged-install suite (§H)
-  against the 0.26.1 ZIP. Sections A, B, C, D, E, F and G were executed from
+  against the 0.26.2 ZIP. Sections A, B, C, D, E, F and G were executed from
   the working tree at the commit this release was prepared from; **Section H
-  was executed from the built ZIP**. Full regression across all thirty
-  suites: **3,855 checks, 0 failures** — 2,753 offline and 1,102 in Blender.
+  was executed from the built ZIP**. Full regression across all thirty-one
+  suites: **3,893 checks, 0 failures** — 2,753 offline and 1,140 in Blender.
 - **The manifest licence is provisional** (`SPDX:GPL-3.0-or-later`). The build
   prints a warning on every run. It is a placeholder pending the project
   owner's decision — see `docs/LICENSING.md`.
 
 Anyone citing a number from this document should cite it together with the
-release it was produced from: **BSMT 0.26.1**.
+release it was produced from: **BSMT 0.26.2**.

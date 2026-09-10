@@ -4,6 +4,101 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.26.2 — Milestone 3.27, a defect highlight you can see
+
+Reported: on a measurement mesh whose diagnostics report exactly one
+non-manifold edge — repair blocked, Weld Non-Manifold Region correctly
+attempting and rolling back at 1 → 1 — pressing **Show Edges** produced no
+visible highlight in the viewport.
+
+### What was measured before anything was changed
+
+Audited on a body-scale measurement mesh (1.7 m tall in millimetre
+coordinates, rotated and translated like an aligned scan) carrying exactly one
+non-manifold edge:
+
+| Checked | Result |
+|---|---|
+| Show Edges finds the same edge diagnostics counted | **yes**, 1 = 1 |
+| Helper geometry created | **yes** |
+| Linked to `BSMT_Helpers`, collection in the scene | **yes** |
+| Layer collection excluded or hidden | **no**, neither |
+| Object hidden, in viewport or render | **no** |
+| Placed in world coordinates, with the object's transform | **yes**, within 1.5e-5 mm of the true edge |
+| Occluded by the surface it lies on | **no** — `show_in_front` was already set |
+
+Everything the existing suite could have asserted was already true. The
+highlight was drawn. It just could not be seen.
+
+### Root cause: a colourless hairline
+
+The highlight was an **edge-only mesh with no material**, displayed as `WIRE`:
+
+- **No colour.** Blender draws a wire object in the theme's wire colour
+  (near-black). `obj.color` — the alarming magenta-red this add-on sets — is
+  only consulted when the viewport's *wireframe* colour is switched to
+  Object, which is not the default and not something a researcher has any
+  reason to change. Verified by forcing the viewport's colour mode and
+  watching the line stay dark.
+- **No thickness.** A wire is one pixel wide at any zoom.
+- **No scale awareness.** What it drew was the mesh's own edge: about 5 mm
+  long on a 350,000-triangle body scan, 0.3% of the subject's height.
+
+A dark hairline, a few pixels long, over a grey body. The degenerate-triangle
+stage had already met and solved this problem — it marks defects with crosses
+sized against the scan's bounding box — but the non-manifold and boundary
+highlights never got the same treatment.
+
+### The fix — visualization only
+
+- **Highlights are drawn as solid rods**, six-sided, along each defect edge,
+  carrying a **material** in the defect's colour. A material is what makes
+  Solid shading paint it at all; it is the same mechanism the landmark
+  markers have always used.
+- **The rod's radius is 0.4% of the scan's own bounding-box diagonal**
+  (floored at 0.5 mm) — about 7 mm on a 1.7 m body, roughly three times the
+  diameter of a landmark marker. **Only the thickness is exaggerated.** The
+  rod's endpoints are the defect's own, so a highlight never misstates where
+  a defect is or how far it runs.
+- **Sizes now convert out of millimetres properly.** They are decided in
+  millimetres against the bounding box, then divided by the unit multiplier
+  *and* the object's scale to reach the local coordinates the helper mesh is
+  built in. The old marker size was correct only for a scan stored in
+  millimetres at scale 1; anything else was off by that factor.
+- **A Focus button**, next to Show Edges. The highlight is honest about its
+  size, which means a 5 mm defect on a 1.7 m body is still something you have
+  to be looking at the right part of the scan to see. Focus frames every
+  non-manifold edge in one view — the same explicit control the
+  degenerate-triangle stage already has. It is deliberately **not** something
+  Show Edges does on its own: BSMT does not move a researcher's view as a
+  side effect of being asked to show something.
+- The boundary-loop and degenerate-triangle highlights share the same drawing
+  code and are fixed with it: blue rods and amber crosses that are now
+  actually blue and amber.
+
+### What did not change
+
+No repair policy, no readiness verdict, no solver gate, no topology analysis.
+The highlight still touches nothing: the measurement mesh's vertex and face
+counts, and its topology verdict, are asserted unchanged across a highlight.
+Weld Non-Manifold Region still rolls back when the count does not improve.
+
+### Verified
+
+`tests/test_repair_highlight_blender.py` (new): 38 checks in Blender, on a
+rotated, translated, body-scale measurement mesh with exactly one known
+non-manifold edge — the highlight marks the same edge diagnostics counted, at
+its true world position, reaching both endpoints without overstating the
+extent; it has faces, a material and the right colour; its thickness is
+millimetres and proportionate to the scan; it is in front, in the helper
+collection, unselectable; the mesh and its verdict are untouched; Clear
+Highlight removes it; the same holds at a different object scale; Focus never
+moves the scan; and a clean mesh gets no highlight and a refused Focus. On the
+0.26.1 code the suite fails at the first check of what reaches the screen.
+
+Highlight build cost, measured: 100 edges 2 ms, 2,000 edges 34 ms, 20,000
+edges 357 ms. It is a button press, not a redraw.
+
 ## 0.26.1 — Milestone 3.26, a panel that cannot render nothing
 
 Reported: on a real source scan (M02, 534,732 vertices / 1,069,448 triangles,

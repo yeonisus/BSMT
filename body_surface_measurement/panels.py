@@ -2094,6 +2094,12 @@ class BSMT_PT_repair(bpy.types.Panel):
         row = box.row(align=True)
         row.operator("bsmt.show_non_manifold", text="Show Edges",
                      icon='HIDE_OFF')
+        # A defect one mesh edge long is a few millimetres on a body. The
+        # highlight is drawn at its true position and stays that size, so
+        # finding it is a separate, explicit press - the view is never moved
+        # as a side effect of asking to see something.
+        row.operator("bsmt.focus_non_manifold", text="Focus",
+                     icon='ZOOM_SELECTED')
         row.operator("bsmt.clear_repair_highlight", text="Clear Highlight",
                      icon='X')
         box.operator("bsmt.remove_duplicate_faces", icon='TRASH')
