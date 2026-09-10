@@ -3380,12 +3380,14 @@ class BSMT_OT_create_measurement_copy(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        props = state.get_props(context)
-        obj = context.active_object
-        if props is None or props.preprocess_running:
-            return False
-        return (obj is not None and obj.type == 'MESH'
-                and not visualization.is_helper(obj))
+        # One policy, in `scancopy.creation_block`, so the greyed button and
+        # the sentence the panel prints under it cannot disagree. The
+        # conditions and their order are unchanged; a measurement mesh is
+        # still refused by execute(), with an explanation, rather than by a
+        # silently unavailable button.
+        block = scancopy.creation_block(context.active_object,
+                                        state.get_props(context))
+        return block is None or not block["blocks_poll"]
 
     def execute(self, context):
         import datetime
@@ -3601,6 +3603,25 @@ class BSMT_OT_create_measurement_copy(bpy.types.Operator):
                         "BSMT: the source scan changed during preprocessing. "
                         "This is a bug; do not trust the copy.")
             return {'CANCELLED'}
+
+        # The generated mesh becomes the active object. Every stage after
+        # this one - repair, alignment, landmarks, measurement - acts on the
+        # ACTIVE object, and leaving the source active after preprocessing
+        # left the researcher looking at a Mesh Repair panel correctly saying
+        # the selected mesh is not a measurement mesh, with nothing on screen
+        # naming the object to select instead. Selection state only: neither
+        # object's geometry, visibility or provenance is touched, and the
+        # source is one click (or the Source button above) away.
+        try:
+            for selected in list(context.selected_objects):
+                selected.select_set(False)
+            copy.select_set(True)
+            context.view_layer.objects.active = copy
+        except (AttributeError, RuntimeError):
+            # Selection is a convenience. A scene that will not take it -
+            # a hidden object, a context without a view layer - must not
+            # turn a completed preprocessing run into a failure.
+            pass
 
         self.report(
             {'WARNING'} if gate["refusals"] else {'INFO'},

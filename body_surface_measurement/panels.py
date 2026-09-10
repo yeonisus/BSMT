@@ -19,6 +19,7 @@ where the code around it is written in British English.
 """
 
 import math
+import traceback
 
 import bpy
 
@@ -421,6 +422,64 @@ def _draw_measurement_target(context, layout, props):
         line = column.row()
         line.alert = verdict["state"] == preprocess.MEASUREMENT_NOT_READY
         line.label(text="   %s" % reason)
+
+
+#: Draw failures already written to the system console, keyed by panel and
+#: exception text. A panel redraws many times a second, so a failure that
+#: printed on every redraw would bury the traceback that explains it.
+_REPORTED_DRAW_FAILURES = set()
+
+
+def _safe_text(value):
+    """A string Blender can definitely draw.
+
+    Scan data carries text that is not valid UTF-8. An OBJ whose .mtl names
+    its texture in a legacy Korean codepage arrives in Python as a string
+    holding unpaired surrogates - measured on the M02 scan, whose image
+    path reaches Blender carrying U+DCB1 - and handing one of those to
+    ``layout.label()`` raises inside draw(), which is precisely the failure
+    the panel guard below exists to make survivable. Replacing the
+    undecodable bytes shows a slightly wrong filename; raising shows nothing
+    at all.
+    """
+    text = str(value)
+    return text.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
+def _draw_failure(layout, panel_label, exc, forward=None):
+    """Say, in the panel, that the panel's own draw failed.
+
+    An expanded panel that renders NOTHING is the worst outcome a sidebar has
+    available: the researcher cannot tell a refusal from a crash from a wrong
+    selection, and there is nothing on screen to report. It is also easy to
+    reach - Blender renders whatever a draw() emitted BEFORE it raised, so an
+    exception in the few lines that read the scene, ahead of the first
+    widget, renders as a blank body under an open disclosure arrow.
+
+    This is the floor. If the body cannot be built, the panel says so, names
+    the failure, points at the console for the traceback, and keeps the one
+    action that still moves the workflow forward.
+    """
+    detail = "%s: %s" % (type(exc).__name__, exc)
+    signature = (panel_label, detail)
+    if signature not in _REPORTED_DRAW_FAILURES:
+        _REPORTED_DRAW_FAILURES.add(signature)
+        print("BSMT: %s could not draw its contents" % panel_label)
+        traceback.print_exc()
+
+    box = layout.box()
+    box.alert = True
+    box.label(text="%s could not be drawn" % panel_label, icon='ERROR')
+    column = box.column(align=True)
+    column.scale_y = 0.7
+    for line in _wrap(_safe_text(detail), 44):
+        column.label(text=line)
+    for line in _wrap("This is a fault in BSMT, not in the scan. The full"
+                      " traceback is in the system console"
+                      " (Window > Toggle System Console).", 44):
+        column.label(text=line)
+    if forward:
+        layout.operator(forward, icon='MOD_DECIM')
 
 
 def _wrap(text, width):
@@ -1638,22 +1697,58 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
     bl_order = STAGE_ORDER[readiness.STAGE_PREPROCESS]
 
     def draw(self, context):
+        """The panel's contents, and the guarantee that there ARE contents.
+
+        Everything this panel shows is derived from the live scene, and all
+        of that reading happens before the first widget is emitted. Blender
+        renders what a draw() emitted before it raised, so any failure in
+        that phase used to render as an expanded panel with a completely
+        blank body - no controls, no message, and nothing on screen saying
+        which of the three possible causes it was. The body is now built
+        inside a guard, and a failure becomes a stated reason.
+        """
         layout = self.layout
         props = state.get_props(context)
         if props is None:
             layout.label(text="BSMT is not registered", icon='ERROR')
             return
+        try:
+            self._draw_body(context, layout, props)
+        except Exception as exc:            # noqa: BLE001 - see _draw_failure
+            # The class, not `self`: an exception handler must not depend
+            # on the attributes of the object that was being drawn.
+            _draw_failure(layout, BSMT_PT_preprocessing.bl_label, exc,
+                          forward="bsmt.create_measurement_copy")
+
+    @staticmethod
+    def _draw_body(context, layout, props):
+        obj = context.active_object
+        # THE reason creation is or is not available, from the same function
+        # the operator's poll() asks. A source scan that is NOT READY for
+        # exact measurement is not on that list and never has been: this
+        # stage is what produces the mesh that can become ready.
+        block = scancopy.creation_block(obj, props)
 
         _draw_hint(context, layout, readiness.STAGE_PREPROCESS, props)
 
-        obj = context.active_object
         info = scancopy.describe(obj) if obj is not None else None
 
         box = layout.box()
         if info is None:
-            box.label(text="Select a mesh scan to preprocess", icon='INFO')
+            # Say WHICH selection problem it is. "Select a mesh scan" is the
+            # same sentence whether nothing is selected, a camera is, or a
+            # BSMT helper is, and only one of those is what happened.
+            box.label(text=_safe_text(block["reason"] if block is not None
+                                      else "Select a mesh scan to preprocess"),
+                      icon='INFO')
+            if block is not None:
+                remedy = box.column(align=True)
+                remedy.scale_y = 0.7
+                remedy.enabled = False
+                for line in _wrap(_safe_text(block["remedy"]), 44):
+                    remedy.label(text=line)
         else:
-            self._draw_scan_facts(box, props, obj, info)
+            BSMT_PT_preprocessing._draw_scan_facts(box, props, obj, info)
 
         layout.prop(props, "preprocess_preset", text="Preset")
         layout.prop(props, "preprocess_target_triangles", text="Target")
@@ -1670,6 +1765,15 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
                 pass
 
         layout.operator("bsmt.create_measurement_copy", icon='MOD_DECIM')
+        # A greyed button that does not say why is a dead end. This is the
+        # operator's own answer, not a second opinion about it.
+        if info is not None and block is not None:
+            note = layout.column(align=True)
+            note.scale_y = 0.7
+            note.alert = block["blocks_poll"]
+            for line in _wrap(_safe_text("%s %s" % (block["reason"],
+                                                    block["remedy"])), 44):
+                note.label(text=line)
 
         # sect. 8: comparing the source with its copy is how a researcher
         # checks silhouette, landmark regions and texture registration. Three
@@ -1753,8 +1857,8 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
         """
         column = box.column(align=True)
         column.scale_y = 0.75
-        column.label(text="Selected: %s" % info["name"])
-        column.label(text="Mesh:      %s" % info["mesh_name"])
+        column.label(text=_safe_text("Selected: %s" % info["name"]))
+        column.label(text=_safe_text("Mesh:      %s" % info["mesh_name"]))
         column.label(text="Vertices:  {:,}".format(info["vertex_count"]))
         column.label(text="Triangles: {:,}".format(info["triangle_count"]))
 
@@ -1785,23 +1889,26 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
         appearance = box.column(align=True)
         appearance.scale_y = 0.75
         appearance.label(
-            text="UV map: %s" % (", ".join(info["uv_layers"])
-                                 if info["has_uv"] else "NONE"),
+            text=_safe_text("UV map: %s" % (", ".join(info["uv_layers"])
+                                            if info["has_uv"] else "NONE")),
             icon='CHECKMARK' if info["has_uv"] else 'DOT',
         )
         appearance.label(
-            text="Color attr: %s" % (", ".join(info["color_attribute_names"])
-                                     if info["has_color"] else "NONE"),
+            text=_safe_text("Color attr: %s"
+                            % (", ".join(info["color_attribute_names"])
+                               if info["has_color"] else "NONE")),
             icon='CHECKMARK' if info["has_color"] else 'DOT',
         )
         appearance.label(
-            text="Materials: %s" % (", ".join(info["material_slots"])
-                                    if info["has_material"] else "NONE"),
+            text=_safe_text("Materials: %s"
+                            % (", ".join(info["material_slots"])
+                               if info["has_material"] else "NONE")),
             icon='CHECKMARK' if info["has_material"] else 'DOT',
         )
         appearance.label(
-            text="Image texture: %s" % (", ".join(info["images"])
-                                        if info["has_image"] else "NONE"),
+            text=_safe_text("Image texture: %s"
+                            % (", ".join(info["images"])
+                               if info["has_image"] else "NONE")),
             icon='CHECKMARK' if info["has_image"] else 'DOT',
         )
         if not (info["has_uv"] or info["has_color"] or info["has_image"]):
@@ -1818,7 +1925,8 @@ class BSMT_PT_preprocessing(bpy.types.Panel):
             made = box.column(align=True)
             made.scale_y = 0.75
             made.label(text="This is a measurement mesh", icon='DUPLICATE')
-            made.label(text="Source Mesh: %s" % provenance.source_name)
+            made.label(text=_safe_text("Source Mesh: %s"
+                                       % provenance.source_name))
             made.label(text=provenance.representation
                             or preprocess.REPRESENTATION)
 

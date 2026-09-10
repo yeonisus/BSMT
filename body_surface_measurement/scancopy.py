@@ -12,6 +12,7 @@ the facts those decisions need.
 import time
 
 import bpy
+import numpy as np
 
 from . import preprocess
 
@@ -60,6 +61,16 @@ def used_material_names(obj):
     even when every face that used it has been collapsed away. Slot presence
     is therefore a weaker check than it looks, and this is what distinguishes
     "the material is still there" from "the material is still used".
+
+    The per-face indices are read from the mesh's own ``material_index``
+    attribute rather than through ``polygons.foreach_get``. This function
+    runs on every Scan Preprocessing redraw, and measured on the reported
+    1,069,448-face scan the polygon path costs **88 ms** against **0.1 ms**
+    for the attribute - the difference between a sidebar that responds and
+    one that stutters whenever the pointer crosses it. The answer is
+    identical: same attribute, same values, read a faster way, with the
+    polygon path kept as the fallback for a mesh that does not carry the
+    attribute at all.
     """
     mesh = obj.data
     slots = [slot.material.name if slot.material else "" for slot in obj.material_slots]
@@ -67,10 +78,19 @@ def used_material_names(obj):
         return []
     if not mesh.polygons:
         return []
+
+    indices = np.empty(len(mesh.polygons), dtype=np.int32)
+    attributes = getattr(mesh, "attributes", None)
+    attribute = attributes.get("material_index") if attributes is not None else None
+    if attribute is not None and str(getattr(attribute, "domain", "")) == 'FACE':
+        attribute.data.foreach_get("value", indices)
+    else:
+        # A mesh that does not expose the attribute - an older Blender, or a
+        # datablock in an unusual state. Slow, but always correct.
+        mesh.polygons.foreach_get("material_index", indices)
+
     used = set()
-    indices = [0] * len(mesh.polygons)
-    mesh.polygons.foreach_get("material_index", indices)
-    for index in set(indices):
+    for index in np.unique(indices).tolist():
         if 0 <= index < len(slots) and slots[index]:
             used.add(slots[index])
     return [name for name in slots if name in used]
@@ -103,6 +123,97 @@ def audit_object(obj):
         active_color=active_color_name(mesh),
         used_materials=used_material_names(obj),
     )
+
+
+# ---------------------------------------------------------------------------
+# Whether a measurement mesh may be created at all (Milestone 3.26)
+# ---------------------------------------------------------------------------
+#
+# ONE place decides this, and it decides it for the operator's poll() AND for
+# the panel that has to explain a greyed button. A panel that re-derives the
+# rule eventually disagrees with the operator, and the researcher is left
+# reading a button whose state nothing on screen accounts for.
+#
+# What is NOT on this list matters as much as what is. Preprocessing is the
+# step that PRODUCES a measurement mesh, so a source scan's own defects -
+# non-manifold edges, boundary edges, several components, degenerate
+# triangles, coincident vertices, sheer density - never block it and never
+# remove its controls. They are diagnosed on the mesh that comes out, and it
+# is `preprocess.preflight` that refuses to MEASURE on a mesh still carrying
+# them. Neither of those gates is touched here, and nothing here repairs
+# anything.
+
+BLOCK_NOT_REGISTERED = 'NOT_REGISTERED'
+BLOCK_RUNNING = 'RUNNING'
+BLOCK_NO_OBJECT = 'NO_OBJECT'
+BLOCK_NOT_MESH = 'NOT_MESH'
+BLOCK_HELPER = 'HELPER'
+BLOCK_IS_COPY = 'IS_COPY'
+BLOCK_NO_GEOMETRY = 'NO_GEOMETRY'
+
+#: The codes that make the operator UNAVAILABLE. The rest are refusals the
+#: operator makes, with an explanation, when it is actually pressed - which
+#: is deliberate: "this is already a measurement mesh, select the original"
+#: is worth reading, and a silently greyed button never says it.
+POLL_BLOCKS = (BLOCK_NOT_REGISTERED, BLOCK_RUNNING, BLOCK_NO_OBJECT,
+               BLOCK_NOT_MESH, BLOCK_HELPER)
+
+
+def _block(code, reason, remedy):
+    return {"code": code, "reason": reason, "remedy": remedy,
+            "blocks_poll": code in POLL_BLOCKS}
+
+
+def creation_block(obj, props=None):
+    """Why Create Measurement Mesh cannot run on `obj` right now, or None.
+
+    Returns a dict with `code`, `reason`, `remedy` and `blocks_poll`. Cheap
+    enough for a panel draw: it reads object type, the helper flag, the
+    provenance group and one polygon count, and touches no geometry.
+
+    The poll-blocking codes are exactly the conditions
+    `BSMT_OT_create_measurement_copy.poll` used to test inline, in the same
+    order, so making the operator ask this question changed nothing about
+    when the button is available.
+    """
+    # Imported here rather than at module scope for the same reason
+    # `diagnostics` imports geodesic locally: this module is imported early,
+    # and a UI helper must not decide the package's import order.
+    from . import visualization
+
+    if props is None:
+        return _block(BLOCK_NOT_REGISTERED,
+                      "BSMT is not registered in this scene.",
+                      "Re-enable the add-on.")
+    if getattr(props, "preprocess_running", False):
+        return _block(BLOCK_RUNNING,
+                      "Preprocessing is already running.",
+                      "Wait for it to finish.")
+    if obj is None:
+        return _block(BLOCK_NO_OBJECT,
+                      "No active object.",
+                      "Select the source scan in the viewport or the"
+                      " Outliner.")
+    if obj.type != 'MESH':
+        return _block(BLOCK_NOT_MESH,
+                      "'%s' is a %s, not a mesh." % (obj.name,
+                                                     str(obj.type).lower()),
+                      "Select the source scan.")
+    if visualization.is_helper(obj):
+        return _block(BLOCK_HELPER,
+                      "'%s' is a BSMT helper object, not a scan." % obj.name,
+                      "Select the source scan.")
+
+    provenance = getattr(obj, "bsmt_scan", None)
+    if provenance is not None and provenance.is_measurement_copy:
+        return _block(BLOCK_IS_COPY,
+                      "'%s' is already a measurement mesh." % obj.name,
+                      "Select the original scan to make another.")
+    if not len(obj.data.polygons):
+        return _block(BLOCK_NO_GEOMETRY,
+                      "'%s' has no faces." % obj.name,
+                      "Select a scan that carries geometry.")
+    return None
 
 
 def diagnostics(obj):

@@ -5,11 +5,11 @@ executed, what exists but has not been run, what has not been written, and
 what cannot be settled by code at all. Nothing here is a claim about human
 body measurement accuracy.
 
-- **Software version under test:** BSMT 0.26.0 (`body_surface_measurement.VERSION`)
+- **Software version under test:** BSMT 0.26.1 (`body_surface_measurement.VERSION`)
 - **Host:** macOS (darwin 25.5.0), Apple Silicon / ARM64
 - **Blender:** 4.5.13 LTS (hash `daeeeca98fb0`, built 2026-08-25)
 - **Geodesic backend:** pygeodesic (MMP), bundled
-- **Runs recorded here:** 2026-09-07, from the working tree (see
+- **Runs recorded here:** 2026-09-07 and 2026-09-10, from the working tree (see
   [Development note](#development-note--repository-and-release-state))
 
 ---
@@ -72,12 +72,12 @@ means the closed-form value on the ideal surface the mesh was sampled from.
 |---|---|---|---|---|
 | A | Analytic geometry | Numerical validation | **EXECUTED** — 50/50 pass | 2026-09-07 |
 | B | Rigid-transform invariance | Software verification | **EXECUTED** — 63/63 pass | 2026-09-07 |
-| C | Decimation sensitivity | Numerical characterisation | **EXECUTED** — 28/28 pass | 2026-09-07 |
+| C | Decimation sensitivity | Numerical characterisation | **EXECUTED** — 28/28 pass | 2026-09-10 (re-run) |
 | D | Repair invariance / locality | Software verification | **EXECUTED** — 40/40 pass (new suite) + 2 supporting suites | 2026-09-07 |
 | E | CSV export | Software verification | **EXECUTED** — 312/312 pass at source; package-level validated in §H | 2026-09-07 |
 | F | Protocol round-trip | Software verification | **EXECUTED** — 53/53 pass | 2026-09-07 |
 | G | Failure / stale-state | Software verification | **EXECUTED** — 68/68 pass (new suite) + 6 supporting suites | 2026-09-07 |
-| H | Clean packaged install | Software verification | **EXECUTED** — 79/79 pass from a clean 0.26.0 extraction | 2026-09-07 |
+| H | Clean packaged install | Software verification | **EXECUTED** — 79/79 pass from a clean 0.26.1 extraction | 2026-09-10 |
 | I | Researcher-run validation | Empirical | **REQUIRES HUMAN DATA** — none performed | — |
 
 ### 0.5 Reproducing these runs
@@ -970,12 +970,12 @@ installs. This section extracts the released ZIP into a temporary directory
 
 ### H.1 Artefacts under test
 
-Built by `python3 tools/build_release.py` from `VERSION = (0, 26, 0)`:
+Built by `python3 tools/build_release.py` from `VERSION = (0, 26, 1)`:
 
 | Package | Bytes | SHA256 |
 |---|---|---|
-| `dist/bsmt-0.26.0.zip` (Blender extension) | 1,886,006 | `43d3ee7d1038cd735f1a96b90faddd38e18d8aca33651f98726f7179570de4bb` |
-| `dist/body_surface_measurement-0.26.0.zip` (legacy add-on) | 281,909 | `68feb85a1d3ffd694705c96d517682bb7f9ecc52ba4521cbed371b6a738d0274` |
+| `dist/bsmt-0.26.1.zip` (Blender extension) | 1,892,180 | `5ea642a6df9ff81d1d731eede9c0a94080ac9cd7ca9ce9d9cf562d018167db7c` |
+| `dist/body_surface_measurement-0.26.1.zip` (legacy add-on) | 285,971 | `a65ec395a4dc1c402dc25459e96fa86eca613a6fb794d48a872b9ad913e3f24e` |
 
 ### H.2 Import isolation — asserted, not assumed
 
@@ -996,9 +996,9 @@ isolation is verified four ways:
 
 | Check | Result |
 |---|---|
-| `VERSION == (0, 26, 0)` | **PASS** |
+| `VERSION == (0, 26, 1)` | **PASS** |
 | `export.SCHEMA_VERSION == 2` | **PASS** |
-| Extension manifest declares `version = "0.26.0"` | **PASS** |
+| Extension manifest declares `version = "0.26.1"` | **PASS** |
 | Manifest declares `platforms = ["macos-arm64", "windows-x64"]` | **PASS** |
 
 ### H.4 Registration and clean unregistration
@@ -1132,30 +1132,33 @@ given anatomical measurement is outside what has been validated.
 
 ## Development note — release and provenance
 
-- **Release under test: 0.26.0**, built 2026-09-07 by
-  `python3 tools/build_release.py` from `VERSION = (0, 26, 0)`, which is the
+- **Release under test: 0.26.1**, built 2026-09-10 by
+  `python3 tools/build_release.py` from `VERSION = (0, 26, 1)`, which is the
   single source of truth the build reads to stamp the extension manifest.
   SHA256 digests are recorded in §H.1.
 - **Release metadata is reconciled.** `VERSION`, the generated
-  `blender_manifest.toml`, `CHANGELOG.md` (0.26.0), `PROJECT_SPEC.md`
-  (§11ac, Milestone 3.25), `INSTALL.md`, `docs/LICENSING.md` and
-  `docs/windows_acceptance.md` all name 0.26.0. `export.SCHEMA_VERSION`
+  `blender_manifest.toml`, `CHANGELOG.md` (0.26.1), `PROJECT_SPEC.md`
+  (§11ad, Milestone 3.26), `INSTALL.md`, `docs/LICENSING.md` and
+  `docs/windows_acceptance.md` all name 0.26.1. `export.SCHEMA_VERSION`
   remains **2**, as designed — it versions the CSV layout, not the release.
-- **Sections A, B, D, E, F and G were executed from the working tree** at the
-  commit this release was prepared from; **Section H was executed from the
-  built ZIP**.
-- **The decimation suite (§C) was not re-run for this release.** It takes
-  ~698 s, and every module it exercises — `preprocess.py`, `geodesic/solve.py`,
-  `geodesic/spaces.py`, `geodesic/meshcache.py`, `geodesic/extract.py`,
-  `geodesic/topology.py`, `measurement.py` — is **unchanged** since its
-  successful execution on 2026-09-07. The only production changes since were
-  to `export.py` (row construction), `state.py` (export records) and
-  `__init__.py` (version constant and description text), none of which can
-  affect a decimation measurement. The previously executed evidence in §C
-  therefore stands as recorded, and its provenance is this same working tree.
+- **What 0.26.1 changed, and why none of the evidence below moves.** It is a
+  sidebar release: a guard that stops the Scan Preprocessing panel rendering
+  an unexplained blank body, one shared answer to "may a measurement mesh be
+  created" (`scancopy.creation_block`, which the operator's `poll()` now
+  asks), the generated mesh becoming the active object, and a per-face
+  material read taken off the slow RNA path. No solver, no preflight, no
+  readiness policy, no topology analysis and no decimation code was touched;
+  `preprocess.preflight` still refuses a non-manifold mesh, which §B of
+  `tests/test_preprocess_panel_blender.py` now asserts directly.
+- **Every suite in this document was re-executed on 2026-09-10**, including
+  the decimation suite (§C, ~700 s) and the packaged-install suite (§H)
+  against the 0.26.1 ZIP. Sections A, B, C, D, E, F and G were executed from
+  the working tree at the commit this release was prepared from; **Section H
+  was executed from the built ZIP**. Full regression across all thirty
+  suites: **3,855 checks, 0 failures** — 2,753 offline and 1,102 in Blender.
 - **The manifest licence is provisional** (`SPDX:GPL-3.0-or-later`). The build
   prints a warning on every run. It is a placeholder pending the project
   owner's decision — see `docs/LICENSING.md`.
 
 Anyone citing a number from this document should cite it together with the
-release it was produced from: **BSMT 0.26.0**.
+release it was produced from: **BSMT 0.26.1**.

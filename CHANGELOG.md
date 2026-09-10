@@ -4,6 +4,109 @@ Version numbers are `major.minor.patch`. Every entry lists what changed and,
 where a defect was fixed, what it actually was. The full design record is in
 `PROJECT_SPEC.md`.
 
+## 0.26.1 — Milestone 3.26, a panel that cannot render nothing
+
+Reported: on a real source scan (M02, 534,732 vertices / 1,069,448 triangles,
+3 components, 7 boundary edges, 3 non-manifold edges, verdict **NOT READY**),
+the Scan Preprocessing panel was expanded and its body was completely empty —
+no controls, and no sentence saying why. Scan Setup and Mesh Repair were
+drawing normally, so the workflow had no route from a source scan to a
+measurement mesh.
+
+### What was measured before anything was changed
+
+The reported scan was imported and analysed. BSMT reproduces the report's
+numbers exactly — 534,732 / 1,069,448, 3 components, 7 boundary edges, 3
+non-manifold edges, 0 degenerate triangles, 0 coincident vertices, `NOT
+READY` — and in that state, on Blender 4.5.13, **the panel drew its full
+body**: scan facts, topology, Analyze Scan, appearance, the density warning,
+the preset, the target, Create Measurement Mesh, the compare row and the
+Solver Safety Gate. The same was true of the installed extension, of the
+source tree, in and out of Edit Mode, with the object hidden, with a modifier
+on it, with a shared mesh, and against every stored preprocessing state. The
+exact blank body could not be produced from the reported inputs.
+
+What the audit did establish is how it is reachable, and that it was reachable
+by construction rather than by any one input:
+
+- **Everything the panel shows is read from the scene before its first widget
+  is emitted.** `describe()`, the stage hint and the creation policy all run
+  ahead of the first `label()`.
+- **Blender renders what a draw() emitted before it raised** — measured with a
+  panel made to fail on purpose: three widgets drawn, then an exception, and
+  the three widgets are on screen. So a fault in that leading read phase
+  renders as *precisely* the reported symptom: an open disclosure arrow above
+  nothing.
+- **The panel had no failure path at all.** Any exception in that phase — a
+  Blender API change, an unusual datablock, undrawable text — produced a blank
+  body and nothing else. The reported scan is a live example of the last of
+  those: its `.mtl` names the texture in a legacy Korean codepage, and the
+  image path reaches Python holding an unpaired surrogate, which
+  `layout.label()` cannot encode.
+
+### The fix
+
+- **An expanded Scan Preprocessing panel can no longer render an unexplained
+  blank body.** The body is built inside a guard; if it fails, the panel says
+  which panel failed, names the exception, points at the system console for
+  the traceback (printed once per distinct failure, not once per redraw), and
+  keeps Create Measurement Mesh so a diagnostic fault cannot block the
+  workflow.
+- **Text that Blender cannot draw is replaced rather than raised.** Object,
+  mesh, UV, colour, material and image names now pass through `_safe_text`,
+  which is what stops a scan-derived name from being able to blank a panel.
+- **`scancopy.creation_block` is now the one place that decides whether a
+  measurement mesh may be created**, and the operator's `poll()` asks it. The
+  conditions and their order are unchanged. What is *not* on that list is the
+  point: non-manifold edges, boundary edges, several components, degenerate
+  triangles, coincident vertices and density never block preprocessing and
+  never remove its controls — this stage is what produces the mesh that can
+  become ready.
+- **The panel prints the reason.** Where creation is unavailable it says which
+  object and why ("'Camera' is a camera, not a mesh", "'M02_BSMT' is already a
+  measurement mesh"), with the remedy, instead of a greyed button.
+- **The panel stopped costing 94 ms a redraw.** Auditing the draw path
+  measured it: `scancopy.used_material_names` read one Python integer per
+  face through `polygons.foreach_get`, which on the reported 1,069,448-face
+  scan cost **88 ms every time the panel redrew** — enough to make the whole
+  sidebar stutter while the pointer is over it. The same values read from the
+  mesh's own `material_index` attribute cost **0.1 ms**, and the panel's
+  fact-gathering as a whole went from 94 ms to 6.5 ms. Identical answer; the
+  polygon path is kept as the fallback.
+- **The generated measurement mesh becomes the active object.** Repair,
+  alignment, landmarks and measurement all act on the active object, and
+  leaving the source active left the researcher in front of a Mesh Repair
+  panel correctly saying the selected mesh is not a measurement mesh, with
+  nothing naming the object to select instead. Selection state only.
+
+### What did not change
+
+No solver preflight, no readiness policy, no repair, no decimation, no
+topology analysis. Preprocessing still repairs nothing, and
+`preprocess.preflight` still refuses exact measurement on a non-manifold mesh
+— verified on the reported scan after preprocessing: the 350,000-triangle
+measurement mesh keeps all 3 non-manifold edges, and the gate keeps refusing
+it.
+
+### Verified
+
+`tests/test_preprocess_panel_blender.py` (new): 71 checks in Blender. A READY
+source shows the controls; a NOT READY source with non-manifold edges,
+boundary edges and three components shows the *same* controls and polls True,
+while the solver gate still refuses that mesh; an empty scene and a camera
+each get a named explanation; an existing measurement mesh shows its own
+state and why another copy would be refused; and, in the check that would
+have caught the report, the panel's fact-gathering is made to raise and the
+body must still name the failure and keep the forward action. The material
+audit keeps its exact answer on a three-slot mesh with an unused slot, a
+single-slot mesh with no explicit indices, and a mesh with no material.
+
+Real-scan acceptance on M02: source → Standard 350k → 350,000-triangle
+measurement mesh with its UV map, material and image texture preserved,
+source geometry byte-for-byte unchanged, generated mesh active and selected,
+topology analysed, still NOT READY for the 3 non-manifold edges, Mesh Repair
+now accepting it.
+
 ## 0.26.0 — Milestone 3.25, the tool states what it has actually been tested for
 
 Two things arrive together, because neither is worth much alone: an export

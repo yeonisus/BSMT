@@ -49,7 +49,7 @@ except ImportError:                                   # pragma: no cover
 FAILURES = []
 CHECKS = [0]
 
-EXPECTED_VERSION = (0, 26, 0)
+EXPECTED_VERSION = (0, 26, 1)
 EXPECTED_SCHEMA = 2
 EXPECTED_STAGES = (
     "Scan Setup",

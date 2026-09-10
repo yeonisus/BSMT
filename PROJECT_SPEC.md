@@ -4814,6 +4814,159 @@ geodesic on the mesh it is given, invariantly under rigid motion, refuses the
 cases it cannot compute safely, and exports the result without corrupting it.*
 
 
+## 11ad. Milestone 3.26 — A panel that cannot render nothing (v0.26.1, 2026-09-10)
+
+A defect report where the reported symptom could not be produced from the reported inputs, and
+where finding out *how it is reachable at all* was the whole of the work.
+
+### 11ad.1 The report
+
+On a real source scan, the expanded Scan Preprocessing panel had a completely empty body: no
+controls, no message, an open disclosure arrow above nothing. Scan Setup and Mesh Repair were
+drawing normally, and Mesh Repair was correctly saying the selected mesh is not a measurement
+mesh — so the workflow had no route from the source scan to a measurement mesh at all.
+
+    object: M02   mesh, mm
+    vertices 534,732   triangles 1,069,448
+    components 3   boundary edges 7   non-manifold edges 3
+    degenerate 0   coincident 0        verdict NOT READY
+
+### 11ad.2 What was measured, before anything was changed
+
+The scan itself was imported and analysed. BSMT reproduces every number in the report exactly,
+including the verdict and its single blocking reason. In that state, drawn by a **real Blender
+region** rather than by a test stand-in, the panel drew its full body — 31 widgets: scan facts,
+topology, Analyze Scan, appearance, the density warning, preset, target, decimation plan, Create
+Measurement Mesh, the three compare buttons and the Solver Safety Gate.
+
+| Reproduction attempt | Result |
+|---|---|
+| Real M02, source tree, real region draw, panel expanded | **full body** |
+| Real M02, the *installed* extension, the user's own preferences | **full body** |
+| Synthetic fixture with the identical defect profile | **full body** |
+| Object mode / Edit mode / Sculpt mode | **full body** |
+| Object hidden, with a modifier, mesh shared by two objects | **full body** |
+| Active-but-unselected, non-mesh active, empty scene | body, with a message |
+| Every stored preprocessing state, including a garbage verdict | **full body** |
+
+So the blank body is not what this state produces on Blender 4.5.13, and the report's own
+diagnosis — that a `NOT READY` verdict suppresses the preprocessing UI — is not what the code
+does: nothing in the draw path or in the operator's `poll()` reads the readiness verdict.
+
+### 11ad.3 What IS true: the panel had no floor
+
+Three facts, each measured:
+
+1. **Everything the panel shows is read from the scene before its first widget is emitted.**
+   `scancopy.describe()`, the stage hint and the creation policy all run ahead of the first
+   `label()`.
+2. **Blender renders whatever a `draw()` emitted before it raised.** Measured directly: a panel
+   made to emit three widgets and then raise renders those three widgets. Therefore a fault in
+   the leading read phase renders as *exactly* the reported symptom, and a fault anywhere later
+   renders as a partial panel.
+3. **There was no failure path.** Any exception in that phase — a Blender API change, an unusual
+   datablock, text that cannot be encoded — produced a blank body and nothing else. The console
+   traceback is the only trace, and a researcher has no reason to be looking at it.
+
+The reported scan is itself a live example of the third case: its `.mtl` names the texture in a
+legacy Korean codepage, so the image path arrives in Python holding an unpaired surrogate
+(`U+DCB1`), which `layout.label()` cannot encode. Nothing in the panel draws that path
+today, which is luck rather than design.
+
+The root cause is therefore structural, and is stated as such: **a panel whose entire body is
+derived from live scene state, with no failure path, can render as an unexplained blank.** That is
+the defect that was fixed; the specific trigger in that session was not reproducible here and is
+not claimed to be known.
+
+### 11ad.4 The invariant
+
+> An expanded BSMT panel with a selected object never renders an unexplained blank body. If it
+> cannot build its contents, it says so, names the failure, and keeps whatever action still moves
+> the workflow forward.
+
+Implemented for Scan Preprocessing as a guard around the body (`_draw_failure`), and as
+`_safe_text` on every label that echoes a scan-derived name — object, mesh, UV, colour attribute,
+material, image, source. The console traceback is printed once per distinct failure rather than
+once per redraw, because a panel redraws many times a second and the flood would bury it.
+
+### 11ad.5 One policy for "may a measurement mesh be created"
+
+`scancopy.creation_block(obj, props)` is now the single answer, and
+`BSMT_OT_create_measurement_copy.poll()` asks it. The conditions and their order are unchanged, so
+nothing about when the button is available changed.
+
+What is **not** on that list is the point of the milestone:
+
+    non-manifold edges      boundary edges        several components
+    degenerate triangles    coincident vertices   sheer density
+
+None of those block preprocessing, because preprocessing is the step that *produces* the mesh they
+would block. They are diagnosed on the mesh that comes out, and `preprocess.preflight` is what
+refuses to MEASURE on a mesh still carrying them. Neither gate is touched, nothing is repaired
+silently, and the measurement mesh generated from the reported scan still reports its 3
+non-manifold edges and is still refused by the solver.
+
+Where creation genuinely cannot run, the panel now prints the operator's own reason and a remedy —
+*"'Camera' is a camera, not a mesh"*, *"'M02_BSMT' is already a measurement mesh. Select the
+original scan to make another."* — rather than showing a greyed button with nothing to read.
+
+### 11ad.6 A second defect, found by auditing the same draw path
+
+The panel's fact-gathering was measured, not assumed, and it cost **94 ms per redraw** on the
+reported scan. Nearly all of it was one line: `used_material_names` read the per-face material
+index through `polygons.foreach_get`, which walks RNA one element at a time — 88 ms for 1,069,448
+faces. The same values read from the mesh's own `material_index` attribute take **0.1 ms**, and
+the whole of `describe()` drops to 6.5 ms.
+
+| Read | 1,069,448 faces |
+|---|---|
+| `mesh.polygons.foreach_get("material_index", …)` | 87.8 ms |
+| `mesh.attributes["material_index"].data.foreach_get("value", …)` | 0.1 ms |
+
+This is a sidebar that stutters whenever the pointer crosses it, on exactly the class of scan BSMT
+exists for, and it was invisible to every test because no test measures a redraw on a
+million-triangle mesh. The answer returned is identical — same attribute, same values — and the
+polygon path remains as the fallback for a mesh that does not carry the attribute.
+
+### 11ad.7 The generated mesh becomes the active object
+
+Every stage after preprocessing acts on the active object. Leaving the source active after
+creating the measurement mesh left the researcher in front of a Mesh Repair panel correctly saying
+the selected mesh is not a measurement mesh, with nothing on screen naming the object to select
+instead — the same dead end the report describes, reached a different way. The generated mesh is
+now selected and made active. Selection state only; both objects, their geometry, visibility and
+provenance are untouched, and the Source / Measurement / Both buttons still switch between them.
+
+### 11ad.8 What is verified
+
+`tests/test_preprocess_panel_blender.py` — 71 checks in Blender:
+
+- **A** a READY source shows preset, target and Create Measurement Mesh;
+- **B** a NOT READY source carrying non-manifold edges, boundary edges and three components shows
+  the *same* controls, polls True, and reports its defects — while `preprocess.preflight` still
+  refuses that mesh, for the non-manifold edges;
+- **C** an empty scene and a camera each get a named explanation, never an empty body;
+- **D** an existing measurement mesh shows its own state, its source and why another copy would be
+  refused;
+- **E** the invariant: the panel's fact-gathering is made to raise, and the body must still name
+  the failure, point at the console and keep Create Measurement Mesh — this is the check that
+  would have caught the reported symptom;
+- **F** the panel's stated reason and the operator's `poll()` agree for every case, including a
+  BSMT helper object;
+- **G** an unpaired surrogate is made drawable rather than raised;
+- **H** `used_material_names` still reports exactly the slots the faces reference — checked on a
+  three-slot mesh with one unused slot, on a single-slot mesh with no explicit indices, and on a
+  mesh with no material at all.
+
+Real-scan acceptance on M02: source → Standard 350k → a 350,000-triangle measurement mesh with UV
+map, material and image texture preserved, source vertex and triangle counts unchanged, generated
+mesh active and selected, topology analysed, still `NOT READY` for its 3 non-manifold edges, and
+Mesh Repair now accepting it.
+
+Existing suites unchanged in behaviour: the draw-path change is a guard, and the poll change is a
+delegation of the same conditions in the same order.
+
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~
