@@ -1149,7 +1149,8 @@ other.
 "The ZIP holds the current tree" is verified rather than inferred from a
 timestamp: every packaged `.py` was byte-compared to its working-tree
 original — **38 modules, 38 identical**, none missing from the ZIP and none
-left out of it — and the packaged `README.md` and `CHANGELOG.md` match too.
+left out of it — and the packaged `CHANGELOG.md` matches too. The packaged
+`README.md` is one revision behind the source tree; see **H.1b**.
 The model actually inside the archive was checked both ways: the landmark
 model is present (`BSMT_RegionLandmark`, `segment_pairs`, `MIN_LANDMARKS = 3`,
 `definition_key`, `bsmt.compute_region_boundary`, the region-owned
@@ -1182,6 +1183,44 @@ with the packaged solver instrumented and counted.
 **41 checks, 0 failures.** Every non-compute section ran inside a `NoSolver`
 block, so "only Compute Boundary solves" is measured in the packaged build and
 not merely inherited from the source suites.
+
+### H.1b README-only divergence between the ZIP and the source tree
+
+Since commit `2138085` the packaged `README.md` is **one revision behind** the
+committed source tree. The difference is **exactly two sentences of wording**,
+both of them documentation corrections:
+
+| Where | The packaged README says | The tree says |
+|---|---|---|
+| feature table, Surface Interior row | "It does **not** calculate an area — that is a later milestone" | "It does **not** itself report an area — *Compute Area* is a separate explicit press that measures this classification" |
+| Limitations, "A Surface Region is a boundary, not an area" | "BSMT does not calculate surface area in this version" | "The area it encloses is not part of the definition: it comes from two separate explicit presses, *Compute Interior* then *Compute Area*" |
+
+Both statements denied Surface Area, which **§L** records as EXECUTED at this
+same version. They were wrong in the package and they are corrected in the
+tree; the correction removed an inaccuracy rather than adding a claim.
+
+**What is unaffected**, and how that was established rather than assumed:
+
+* **All 42 packaged Python modules are byte-identical** to the committed source
+  tree — re-compared after the correction, 42 identical, none missing in either
+  direction.
+* **The packaged `CHANGELOG.md` is byte-identical** to the committed tree.
+* **No executable code differs.** `README.md` is not imported, parsed or
+  executed by anything in the package.
+* **No numerical result, tolerance, fixture or measured value differs**, and no
+  claim in this document rests on README text.
+* **§H's 80/80 and the §K.9 packaged tiling checks remain valid**: both were
+  executed against `bf491e61…`, whose code is the code in the tree.
+
+**The recorded artefact provenance is therefore unchanged and still valid.**
+`dist/bsmt-0.29.0.zip` = `bf491e610a044a9cded3d69907fefbed57da1a88f7665470e1083c2fac9457fe`
+is the artefact every §H and §K.9 result was produced from, and it still is.
+
+**A rebuild is not required for code correctness.** It is required only if
+exact documentation byte-equality between the ZIP and the tree is wanted. A
+rebuild would change the artefact hash, which is cited in §H.1, §K.9 and the
+Development note, so it is a release-record decision and not a free one — and
+it is deliberately not taken here.
 
 ### H.2 Import isolation — asserted, not assumed
 
@@ -2128,9 +2167,13 @@ given anatomical measurement is outside what has been validated.
   were measured from its immediate predecessor, whose `interior.py` differs
   only by the projected-endpoint fix and is unchanged in cost. All 42 packaged Python modules were
   byte-compared to their working-tree originals — 42 identical, none missing
-  in either direction — and the packaged `README.md` and `CHANGELOG.md` match
-  too. No section of this document rests on a stale artefact. Every other
-  section above was executed from the current working tree.
+  in either direction — and the packaged `CHANGELOG.md` matches too. The
+  packaged `README.md` is one revision behind the committed tree by exactly
+  two corrected sentences of wording (§H.1b); no executable code, numerical
+  result or package-validation claim is affected, and the artefact hash and
+  its provenance stand. No section of this document rests on a stale
+  artefact. Every other section above was executed from the current working
+  tree.
 - **One harness defect was found and fixed during this release build.**
   `tests/test_packaged_extension.py` asserted a hardcoded count of *eight*
   top-level workflow panels beside an `EXPECTED_STAGES` tuple that had grown
