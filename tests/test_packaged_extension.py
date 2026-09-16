@@ -49,7 +49,7 @@ except ImportError:                                   # pragma: no cover
 FAILURES = []
 CHECKS = [0]
 
-EXPECTED_VERSION = (0, 29, 0)
+EXPECTED_VERSION = (0, 29, 1)
 EXPECTED_SCHEMA = 2
 #: The workflow stages THE PACKAGED RELEASE ships, which is not necessarily
 #: what the working tree has. This list moves at RELEASE time, together with

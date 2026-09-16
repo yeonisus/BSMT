@@ -5,13 +5,13 @@ executed, what exists but has not been run, what has not been written, and
 what cannot be settled by code at all. Nothing here is a claim about human
 body measurement accuracy.
 
-- **Software version under test:** BSMT 0.29.0 (`body_surface_measurement.VERSION`)
+- **Software version under test:** BSMT 0.29.1 (`body_surface_measurement.VERSION`)
 - **Host:** macOS (darwin 25.5.0), Apple Silicon / ARM64
 - **Blender:** 4.5.13 LTS (hash `daeeeca98fb0`, built 2026-08-25)
 - **Geodesic backend:** pygeodesic (MMP), bundled
-- **Runs recorded here:** 2026-09-07, 2026-09-10, 2026-09-11, 2026-09-14 and
-  2026-09-15 (0.26.1, then 0.26.2, then 0.27.0, then 0.28.0 as an internal
-  build, then 0.29.0), from the working tree (see
+- **Runs recorded here:** 2026-09-07, 2026-09-10, 2026-09-11, 2026-09-14,
+  2026-09-15 and 2026-09-16 (0.26.1, then 0.26.2, then 0.27.0, then 0.28.0 as
+  an internal build, then 0.29.0, then 0.29.1), from the working tree (see
   [Development note](#development-note--repository-and-release-state))
 
 ---
@@ -83,6 +83,7 @@ means the closed-form value on the ideal surface the mesh was sampled from.
 | J | Surface Region definition | Software verification | **EXECUTED** — 102/102 offline + 103/103 + 33/33 (draw purity) in Blender | 2026-09-15 |
 | K | Surface Interior, Fill and Thickness Preview | Software verification | **EXECUTED** — 109/109 offline + 62/62 + 69/69 in Blender; performance §K.8, real-scan fix §K.9 | 2026-09-15 |
 | L | Surface Area | Software verification | **EXECUTED** — 45/45 offline + 55/55 in Blender | 2026-09-15 |
+| M | Repair-backup lifecycle | Software verification | **EXECUTED** — 68/68 pass; real-file result in §M.7 | 2026-09-16 |
 | I | Researcher-run validation | Empirical | **REQUIRES HUMAN DATA** — none performed | — |
 
 ### 0.5 Reproducing these runs
@@ -140,6 +141,10 @@ python3 tests/test_surfacearea.py
 /Applications/Blender.app/Contents/MacOS/Blender -b --factory-startup \
   --python tests/test_surface_area_blender.py
 
+# M — repair-backup lifecycle                 (~10 s)
+/Applications/Blender.app/Contents/MacOS/Blender -b --factory-startup \
+  --python tests/test_repair_backup_lifecycle_blender.py
+
 # K — Surface Interior and Thickness Preview   (~30 s)
 python3 tests/test_interior.py
 /Applications/Blender.app/Contents/MacOS/Blender -b --factory-startup \
@@ -154,7 +159,8 @@ Each Blender suite prints a machine-readable final line
 `BSMT_REPAIR_LOCALITY_RESULT=`, `BSMT_ARTIFACT_DELETION_RESULT=`,
 `BSMT_PACKAGED_RESULT=`, `BSMT_SURFACE_REGION_RESULT=`,
 `BSMT_REGION_DRAW_RESULT=`, `BSMT_SURFACE_INTERIOR_RESULT=`,
-`BSMT_THICKNESS_PREVIEW_RESULT=`, `BSMT_SURFACE_AREA_RESULT=`)
+`BSMT_THICKNESS_PREVIEW_RESULT=`, `BSMT_SURFACE_AREA_RESULT=`,
+`BSMT_BACKUP_LIFECYCLE_RESULT=`)
 carrying the exit code, so a harness need not parse the log.
 
 ---
@@ -1105,15 +1111,33 @@ installs. This section extracts the released ZIP into a temporary directory
 
 ### H.1 Artefacts under test
 
-Built by `python3 tools/build_release.py` from `VERSION = (0, 29, 0)`:
+Built by `python3 tools/build_release.py` from `VERSION = (0, 29, 1)`:
 
 | Package | Bytes | SHA256 |
 |---|---|---|
-| `dist/bsmt-0.29.0.zip` (Blender extension) | 2,026,408 | `bf491e610a044a9cded3d69907fefbed57da1a88f7665470e1083c2fac9457fe` |
-| `dist/body_surface_measurement-0.29.0.zip` (legacy add-on) | 394,978 | `be94955d1742dbb181aee0dcb061be25545c12020b66376073004df264ddb0ba` |
+| `dist/bsmt-0.29.1.zip` (Blender extension) | 2,031,836 | `7af9aa3a46601aa0b50d3da3653b840259f37efac14aae952d2370eb8b3b120a` |
+| `dist/body_surface_measurement-0.29.1.zip` (legacy add-on) | 397,977 | `501a3faa8271892e52ac981d26274b39edcb87a767f4cc5caa9ad2d02e32b730` |
 
-Rebuilt 2026-09-15 after Milestone 3.36 (§K.10). It supersedes one earlier
-0.29.0 build, which must not be distributed:
+Built 2026-09-16 after Milestone 3.37 (§M). **§H below was executed against
+these artefacts and no other.**
+
+**0.29.0 is superseded for behaviour, not for evidence.** Its measurement
+results all stand and are reproduced unchanged in §§A-L; what it carries is
+the repair-backup accumulation of §M.3, which leaves a full mesh copy in the
+file per repair. It should not be distributed once 0.29.1 exists:
+
+| Build | Why it is superseded |
+|---|---|
+| `bf491e61…` (0.29.0) | accumulates one full-mesh repair backup per repair (§M.3); measurement behaviour is identical to 0.29.1 |
+
+The 0.29.0 artefacts remain in `dist/` for the record:
+
+| Package | Bytes | SHA256 |
+|---|---|---|
+| `dist/bsmt-0.29.0.zip` | 2,026,408 | `bf491e610a044a9cded3d69907fefbed57da1a88f7665470e1083c2fac9457fe` |
+| `dist/body_surface_measurement-0.29.0.zip` | 394,978 | `be94955d1742dbb181aee0dcb061be25545c12020b66376073004df264ddb0ba` |
+
+It in turn superseded one earlier 0.29.0 build, which must not be distributed:
 
 | Build | Why it is superseded |
 |---|---|
@@ -1149,8 +1173,8 @@ other.
 "The ZIP holds the current tree" is verified rather than inferred from a
 timestamp: every packaged `.py` was byte-compared to its working-tree
 original — **38 modules, 38 identical**, none missing from the ZIP and none
-left out of it — and the packaged `CHANGELOG.md` matches too. The packaged
-`README.md` is one revision behind the source tree; see **H.1b**.
+left out of it — and the packaged `README.md` and `CHANGELOG.md` match too.
+The README divergence recorded here at 0.29.0 is **resolved**: see §H.1b.
 The model actually inside the archive was checked both ways: the landmark
 model is present (`BSMT_RegionLandmark`, `segment_pairs`, `MIN_LANDMARKS = 3`,
 `definition_key`, `bsmt.compute_region_boundary`, the region-owned
@@ -1184,43 +1208,24 @@ with the packaged solver instrumented and counted.
 block, so "only Compute Boundary solves" is measured in the packaged build and
 not merely inherited from the source suites.
 
-### H.1b README-only divergence between the ZIP and the source tree
+### H.1b The 0.29.0 README divergence, and how it was closed
 
-Since commit `2138085` the packaged `README.md` is **one revision behind** the
-committed source tree. The difference is **exactly two sentences of wording**,
-both of them documentation corrections:
+Between commit `2138085` and the 0.29.1 build, the packaged `README.md` was
+one revision behind the source tree by exactly two sentences. Both denied
+Surface Area, which §L records as EXECUTED at that same version:
 
-| Where | The packaged README says | The tree says |
+| Where | 0.29.0 package said | tree, and 0.29.1 package, says |
 |---|---|---|
 | feature table, Surface Interior row | "It does **not** calculate an area — that is a later milestone" | "It does **not** itself report an area — *Compute Area* is a separate explicit press that measures this classification" |
 | Limitations, "A Surface Region is a boundary, not an area" | "BSMT does not calculate surface area in this version" | "The area it encloses is not part of the definition: it comes from two separate explicit presses, *Compute Interior* then *Compute Area*" |
 
-Both statements denied Surface Area, which **§L** records as EXECUTED at this
-same version. They were wrong in the package and they are corrected in the
-tree; the correction removed an inaccuracy rather than adding a claim.
+No executable code, numerical result or package-validation claim was ever
+affected: `README.md` is not imported, parsed or executed by anything in the
+package, and every 0.29.0 result stands.
 
-**What is unaffected**, and how that was established rather than assumed:
-
-* **All 42 packaged Python modules are byte-identical** to the committed source
-  tree — re-compared after the correction, 42 identical, none missing in either
-  direction.
-* **The packaged `CHANGELOG.md` is byte-identical** to the committed tree.
-* **No executable code differs.** `README.md` is not imported, parsed or
-  executed by anything in the package.
-* **No numerical result, tolerance, fixture or measured value differs**, and no
-  claim in this document rests on README text.
-* **§H's 80/80 and the §K.9 packaged tiling checks remain valid**: both were
-  executed against `bf491e61…`, whose code is the code in the tree.
-
-**The recorded artefact provenance is therefore unchanged and still valid.**
-`dist/bsmt-0.29.0.zip` = `bf491e610a044a9cded3d69907fefbed57da1a88f7665470e1083c2fac9457fe`
-is the artefact every §H and §K.9 result was produced from, and it still is.
-
-**A rebuild is not required for code correctness.** It is required only if
-exact documentation byte-equality between the ZIP and the tree is wanted. A
-rebuild would change the artefact hash, which is cited in §H.1, §K.9 and the
-Development note, so it is a release-record decision and not a free one — and
-it is deliberately not taken here.
+**The 0.29.1 build closes it.** The packaged `README.md` and `CHANGELOG.md`
+are byte-identical to the working tree, re-verified after the build, so the
+divergence is a historical note rather than an open item.
 
 ### H.2 Import isolation — asserted, not assumed
 
@@ -2032,6 +2037,216 @@ performed, and none is implied by any number this milestone produces:
 
 ---
 
+## M. Repair-backup lifecycle
+
+> **Status: EXECUTED** — `tests/test_repair_backup_lifecycle_blender.py`
+> **68 checks, 0 failures**, 2026-09-16, BSMT 0.29.1, Blender 4.5.13 LTS,
+> macOS ARM64. Kind: **software verification**. This section makes no
+> numerical or anatomical claim, because the milestone it records makes none.
+
+### M.1 What this section is, and is not
+
+This is **storage management**, not measurement. Milestone 3.37 changed how
+many copies of a mesh BSMT leaves in a `.blend` file and nothing else. No
+scientific computation, repair algorithm, topology analysis, measurement
+result or geodesic behaviour changed, and no number recorded in sections
+**A** through **L** of this document is affected by it.
+
+Sections A–L were executed at 0.29.0. They are **not restated at 0.29.1**,
+because the modules they exercise are byte-identical between the two: only
+`meshrepair.py`, `operators.py` (one new operator) and `panels.py` (one new
+button) differ. The full regression was nevertheless re-run in full at
+0.29.1 and is reported in §M.9.
+
+### M.2 The defect, and how it was found
+
+A saved scan had become extremely slow to open. The load path was profiled
+**before anything was changed**, and it is not the cause:
+
+    wm.open_mainfile TOTAL   :   1.6778 s
+      BSMT load_post TOTAL   :   0.0001 s  (0.007%)
+      Blender deserialise    :   1.6777 s  (99.993%)
+
+Across eight real working files, BSMT's `load_post` is **0.0002%** of total
+open time. Nothing in it scales with vertices, triangles, regions or boundary
+points. **The load path was therefore not modified.**
+
+A second hypothesis — that `interiorcache` accumulated orphans, having no
+load-time sweep where `pathcache` has one — was tested directly and **did not
+reproduce**. Region deletion drops the interior cache at the deletion site,
+which cannot leave an orphan between save and reopen, and all eight real files
+carried zero interior caches. It is recorded here as disproved so that it is
+not re-investigated.
+
+What the files actually held was repair backups: **444.5 MB of a 554.5 MB
+file, 80.2%, in eighteen datablocks.** Across eight files, 1,309 MB of
+2,048 MB.
+
+### M.3 Root cause
+
+    previous = bpy.data.meshes.get(obj.data.name + BACKUP_SUFFIX)
+    if previous is not None and previous.users == 0:      # unreachable
+        bpy.data.meshes.remove(previous)
+    backup = obj.data.copy()
+    backup.name = obj.data.name + BACKUP_SUFFIX
+    backup.use_fake_user = True                           # users >= 1, always
+
+A fake user is a user, so `previous.users` was never 0. The previous backup
+was never removed, the canonical name stayed taken, Blender suffixed each new
+copy `.001`, `.002`, and the fake user kept every one of them alive. Only the
+most recent is named by `props.repair_backup_mesh`, so the rest were
+unreachable by any code path.
+
+Verified directly rather than argued: five successive `make_backup` calls
+produce five datablocks, all carrying `use_fake_user`, the first reporting
+`users == 1`.
+
+### M.4 Ownership model
+
+A datablock is deleted only when BSMT can **prove** it is its own backup.
+Every backup created from 0.29.1 carries:
+
+| key | meaning |
+|---|---|
+| `bsmt_repair_backup` | `True` — this datablock is a BSMT repair backup |
+| `bsmt_repair_backup_owner` | the object the backup belongs to |
+| `bsmt_repair_backup_mesh` | the live mesh datablock it was copied from |
+
+Matching is on the recorded owner **or** the source mesh, so renaming the
+object between two repairs does not orphan the earlier backup. A backup
+written before 0.29.1 carries no keys and is matched only by the exact name
+the old code produced for *that* object's mesh, anchored at the end of the
+name — never as a substring.
+
+`_release` clears the fake user deliberately, which is the fix; but if the
+datablock still has a **real** user it restores the fake user and leaves the
+mesh untouched. Every live measurement mesh, every source scan and every
+`obj.data` has a real user, which is what puts them structurally out of reach
+of this code rather than merely out of its intended scope.
+
+### M.5 The retention invariant
+
+For each repair target: **zero** backups before the first repair, **exactly
+one** after every successful repair, and that one is the mesh as it stood
+immediately before the most recent repair.
+
+| repairs | backups before | backups after |
+|---|---|---|
+| 1 | 1 | 1 |
+| 2 | 2 | 1 |
+| 5 | 5 | 1 |
+| 18 | 18 | **1** |
+
+The new backup is created, tagged and given its fake user **before** any older
+one is released, so no failure can leave a target with nothing to restore
+from.
+
+### M.6 Undo Repair, and save/reload persistence
+
+**Undo Repair semantics are unchanged.** One slot, one step: the state
+immediately before the most recent successful repair. The backup is not
+consumed by a restore, so pressing it twice restores the same state twice.
+This is not multi-level undo.
+
+Equivalence is asserted field by field after a repair that both moves vertices
+and deletes a face: vertex coordinates, polygon connectivity, the edge set,
+the loop array, UV layers, colour attributes, materials and the live datablock
+name all restore exactly.
+
+**`use_fake_user` is retained and is still the persistence mechanism.** After
+save → reload the backup datablock survives, is still recognised as a BSMT
+backup, `props.repair_backup_mesh` still names it, Undo Repair still works,
+and restoring yields the original mesh.
+
+One further check exists because its absence would be silent and severe: the
+**restored live mesh must not itself be marked as a backup**. `backup.copy()`
+carries custom properties across, so without stripping them the mesh now in
+use would advertise itself as deletable.
+
+### M.7 Legacy cleanup, and the real-file result
+
+`bsmt.clean_repair_backups` ("Clean Stale Repair Backups") is **explicit**.
+Automatic migration on load was considered and rejected: ownership of a
+pre-0.29.1 backup can only be inferred from its name, and an inference is not
+a licence to delete a researcher's geometry unasked.
+
+It keeps the backup `props.repair_backup_mesh` names, removes only
+identifiable BSMT repair backups, never touches a mesh anything still uses,
+lists every datablock and its size before removing anything, and reports what
+it reclaimed.
+
+Executed on a copy of a real 350,000-triangle scan file — the researcher's
+original was never written to:
+
+| | before | after |
+|---|---|---|
+| `_M13.blend` | 554.5 MB | **151.5 MB** (−402.9 MB, −72.7%) |
+| backup datablocks | 18 | 1 |
+| mesh datablocks | 21 | 4 |
+| cold open, fresh process | 1.827 s | **0.384 s** |
+| warm open | 0.107 s | 0.032 s |
+| peak resident memory | 1.31 GB | **506 MB** (−61%) |
+| live measurement mesh | intact | intact, 174,870 verts |
+| Undo Repair | works | works |
+
+Scan-density fixture, 358,800 triangles, old behaviour against new:
+
+| repairs | old backups | old size | new backups | new size |
+|---|---|---|---|---|
+| 1 | 1 | 35.0 MB | 1 | 35.0 MB |
+| 5 | 5 | 104.2 MB | 1 | **35.0 MB** |
+| 18 | 18 | 329.2 MB | 1 | **35.0 MB** |
+
+At 18 repairs the fixture opens in 0.096 s rather than 0.928 s, with peak RSS
+272 MB rather than 864 MB.
+
+**The memory figure is the operative one.** Sequential opens of these files on
+a 16 GB machine under memory pressure were measured at 70–112 s, against
+sub-second opens of the same files in a fresh process. The wait was swap, and
+halving the resident footprint is what removes it — not any change to how the
+file is read.
+
+### M.8 Test coverage
+
+`tests/test_repair_backup_lifecycle_blender.py`, 68 checks:
+
+| group | what it establishes |
+|---|---|
+| **A** | one backup after 1, 2, 5 and 18 repairs; it is the newest; still fake-user |
+| **B** | Undo Repair restores coordinates, connectivity, edges, loops, UVs, colours and the name exactly; the restored mesh is not itself a backup; idempotent on a second press |
+| **C** | the current backup survives save → reload and is still restorable |
+| **D** | pruning never touches `obj.data`, the source scan, another target's backup, a similar substring, or a suffixed mesh an object still uses; object rename does not orphan |
+| **E** | reverted and failed paths still restore; `discard_backup` works despite the fake user; a missing backup fails without raising |
+| **F** | 18 repairs leave one datablock — asserted structurally first, with a generous size band only as corroboration, so the suite does not rest on a byte threshold |
+| **G** | legacy untagged backups are identified and purged, the referenced one kept, the live mesh intact, Undo Repair still working |
+| **H** | the guard rails: `make_backup(obj)` is still the call, the fake user is still set, and the dead `users == 0` test is gone from the code while still explained in a comment |
+
+### M.9 Regression at 0.29.1
+
+Every suite was re-executed at 0.29.1 on 2026-09-16.
+
+**0 failures.** All nine repair suites are unchanged and green:
+`test_repair.py` 238, `test_localrepair.py` 136, `test_artifact.py` 88,
+`test_mesh_repair_blender.py` 76, `test_artifact_deletion_blender.py` 149,
+`test_local_face_repair_blender.py` 117, `test_repair_locality_blender.py` 40,
+`test_repair_highlight_blender.py` 38, `test_degenerate_policy.py` 35.
+
+The UI suites were re-run because `panels.py` gained one button:
+`test_workflow_ui.py` 128, `test_panel_order.py` 50,
+`test_region_panel_draw_blender.py` 33, `test_preprocess_panel_blender.py` 71
+— all green.
+
+### M.10 What this section does not establish
+
+That any measurement is more or less accurate than before — it is neither,
+and no number moved. That opening a `.blend` is fast in general: what was
+measured is that a file carrying N repair backups now carries one, and what
+that is worth in bytes, seconds and resident memory on the hardware named at
+the top of this document. And nothing whatsoever about human scans, which
+remains §I.
+
+---
+
 ## I. Researcher-run validation still required
 
 > **Kind:** empirical
@@ -2061,18 +2276,24 @@ given anatomical measurement is outside what has been validated.
 
 ## Development note — release and provenance
 
-- **Release under test: 0.29.0**, built 2026-09-15 by
-  `python3 tools/build_release.py` from `VERSION = (0, 29, 0)`, which is the
+- **Release under test: 0.29.1**, built 2026-09-16 by
+  `python3 tools/build_release.py` from `VERSION = (0, 29, 1)`, which is the
   single source of truth the build reads to stamp the extension manifest.
   SHA256 digests are recorded in §H.1. Previous release ZIPs in `dist/` are
   left in place; the build writes only the two ZIPs of the version it is
-  building, so this build ADDED the 0.29.0 pair and touched none of the 34
-  older ones - including the superseded 0.28.0 pair, which is kept for the
-  record and must not be distributed. **36 ZIPs** are now in `dist/`.
+  building, so this build ADDED the 0.29.1 pair and touched none of the 36
+  older ones - including the 0.29.0 pair, which is kept for the record and is
+  superseded for behaviour by §M. **38 ZIPs** are now in `dist/`.
 - **Release metadata is reconciled.** `VERSION`, the generated
-  `blender_manifest.toml`, `CHANGELOG.md` (0.29.0), `PROJECT_SPEC.md`
-  (§11ag Milestone 3.29 and §11ah Milestone 3.30), `INSTALL.md`,
-  `docs/LICENSING.md` and `docs/windows_acceptance.md` all name 0.29.0.
+  `blender_manifest.toml`, `CHANGELOG.md` (0.29.1), `PROJECT_SPEC.md`
+  (§11ao Milestone 3.37), `INSTALL.md`, `docs/LICENSING.md`,
+  `docs/windows_acceptance.md` and this document all name 0.29.1.
+  0.29.1 changes no installation step, no licensing question and no Windows
+  assumption; `tests/test_portability.py` was re-executed at 0.29.1 (**87/87**)
+  and the only new import is `re`, from the standard library, so the Windows
+  audit those documents record still holds and the checklist now names the
+  ZIPs a Windows tester should actually install. Nothing on that checklist has
+  been run on Windows - that status is unchanged.
   `export.SCHEMA_VERSION` remains **2**, as designed — it versions the CSV
   layout, not the release, and neither milestone changed an exported column.
 - **What 0.26.1 changed, and why none of the evidence below moves.** It is a
@@ -2167,13 +2388,10 @@ given anatomical measurement is outside what has been validated.
   were measured from its immediate predecessor, whose `interior.py` differs
   only by the projected-endpoint fix and is unchanged in cost. All 42 packaged Python modules were
   byte-compared to their working-tree originals — 42 identical, none missing
-  in either direction — and the packaged `CHANGELOG.md` matches too. The
-  packaged `README.md` is one revision behind the committed tree by exactly
-  two corrected sentences of wording (§H.1b); no executable code, numerical
-  result or package-validation claim is affected, and the artefact hash and
-  its provenance stand. No section of this document rests on a stale
-  artefact. Every other section above was executed from the current working
-  tree.
+  in either direction — and the packaged `README.md` and `CHANGELOG.md` match
+  too. The README divergence that 0.29.0 carried is closed by this build
+  (§H.1b). No section of this document rests on a stale artefact. Every other
+  section above was executed from the current working tree.
 - **One harness defect was found and fixed during this release build.**
   `tests/test_packaged_extension.py` asserted a hardcoded count of *eight*
   top-level workflow panels beside an `EXPECTED_STAGES` tuple that had grown

@@ -2591,6 +2591,8 @@ class BSMT_PT_repair(bpy.types.Panel):
         row.operator("bsmt.restore_repair_backup", text="Undo Repair",
                      icon='LOOP_BACK')
         row.operator("bsmt.clear_repair_report", text="Clear Log", icon='X')
+        layout.operator("bsmt.clean_repair_backups",
+                        text="Clean Stale Repair Backups", icon='TRASH')
 
         if props.repair_log:
             layout.separator()

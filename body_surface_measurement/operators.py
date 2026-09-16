@@ -6312,6 +6312,52 @@ class BSMT_OT_restore_repair_backup(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class BSMT_OT_clean_repair_backups(bpy.types.Operator):
+    """Remove repair backups that Undo Repair can no longer reach"""
+
+    bl_idname = "bsmt.clean_repair_backups"
+    bl_label = "Clean Stale Repair Backups"
+    bl_description = ("Remove repair backup meshes left by earlier repairs."
+                      " The backup Undo Repair uses is kept, and no scan,"
+                      " measurement mesh or mesh in use is touched")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = state.get_props(context)
+        keep = props.repair_backup_mesh if props is not None else ""
+        stale = [mesh for mesh in bpy.data.meshes
+                 if meshrepair.is_backup(mesh) and mesh.name != keep]
+        if not stale:
+            self.report({'INFO'},
+                        "BSMT: no stale repair backups - nothing to clean")
+            return {'CANCELLED'}
+
+        # Named before anything is removed, so the log says what went even if
+        # a datablock turns out to be in use and is therefore kept.
+        print("[BSMT] cleaning stale repair backups (keeping %r)"
+              % (keep or "<none>"))
+        for mesh in stale:
+            print("[BSMT]   %-44s %8.2f MB"
+                  % (mesh.name, meshrepair.approximate_bytes(mesh) / 1048576.0))
+
+        removed, freed = meshrepair.purge_stale_backups(keep_name=keep)
+        kept = len(stale) - removed
+        message = ("removed %d stale repair backup(s), about %.1f MB"
+                   % (removed, freed / 1048576.0))
+        if kept:
+            message += ("; %d left in place because something still uses "
+                        "them" % kept)
+        if keep:
+            message += "; the Undo Repair backup was kept"
+        print("[BSMT] " + message)
+        print("[BSMT] save the file to reclaim the space on disk")
+        if props is not None:
+            props.repair_log = ((props.repair_log + "\n"
+                                 if props.repair_log else "") + message)
+        self.report({'INFO'}, "BSMT: " + message)
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_repair_report(bpy.types.Operator):
     """Clear the repair analysis and log. No mesh is touched"""
 
@@ -8607,6 +8653,7 @@ classes = (
     BSMT_OT_auto_repair_local,
     BSMT_OT_auto_repair_boundaries,
     BSMT_OT_restore_repair_backup,
+    BSMT_OT_clean_repair_backups,
     BSMT_OT_clear_repair_report,
 )
 

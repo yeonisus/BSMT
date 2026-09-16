@@ -6869,3 +6869,173 @@ own area to 2.8e-13.
 `TILING_TOLERANCE`; Surface Area semantics; Smaller/Complement semantics; the geodesic solver; the
 region definition; the source or measurement mesh geometry; and Panel Preview geometry logic, which
 consumes the corrected Interior result and is otherwise untouched.
+
+
+## 11ao. Milestone 3.37 — one repair backup, not N (shipped in v0.29.1, 2026-09-16)
+
+### 11ao.1 What kind of change this is
+
+**Storage and datablock lifecycle management. Nothing else.**
+
+No scientific computation changed. No mesh repair algorithm changed. No measurement result
+changed. No number this tool has ever produced moves by this milestone, and no claim recorded in
+`docs/VALIDATION.md` §A-§L is affected by it. The milestone is about how many copies of a mesh
+BSMT leaves in a `.blend`, and about nothing else.
+
+Untouched, and verified untouched by direct diff: `interior.py`, `surfacearea.py`, `regions.py`,
+`interiorcache.py`, `pathcache.py`, `state.py`, `readiness.py`, `preprocess.py`, `repair.py`,
+`scancopy.py`, every module under `geodesic/`, and the `load_post` handler in `__init__.py`.
+
+### 11ao.2 The reported symptom, and what it was not
+
+Opening a saved scan had become extremely slow, and the obvious suspect was BSMT's own load-time
+work. It was profiled before anything was changed, and the load path is innocent:
+
+    wm.open_mainfile TOTAL   :   1.6778 s
+      BSMT load_post TOTAL   :   0.0001 s  (0.007%)
+      Blender deserialise    :   1.6777 s  (99.993%)
+
+Across eight real working files, `load_post` accounts for 0.0002% of total open time. Nothing in
+it is O(vertices), O(triangles), O(regions) or O(boundary points). **The load path was therefore
+not changed**, and a second hypothesis - that `interiorcache` accumulated orphans because it has
+no load-time sweep, unlike `pathcache` - was tested directly and did not reproduce: region
+deletion drops the interior cache at the deletion site (`state.py`), which is stronger than a
+sweep, and every real file carried zero interior caches.
+
+What the files actually contained was repair backups: **444.5 MB of a 554.5 MB scan file, 80.2%,
+in eighteen datablocks**. Across eight files, 1,309 MB of 2,048 MB.
+
+### 11ao.3 The cause
+
+A repair brackets its edit with a copy of the mesh datablock, kept as a real datablock so a
+restore is one assignment and cannot half-succeed (§11w). The copy is marked `use_fake_user` so it
+survives a save and reload. Beside it stood a cleanup that could never run:
+
+    previous = bpy.data.meshes.get(obj.data.name + BACKUP_SUFFIX)
+    if previous is not None and previous.users == 0:      # unreachable
+        bpy.data.meshes.remove(previous)
+    backup = obj.data.copy()
+    backup.name = obj.data.name + BACKUP_SUFFIX
+    backup.use_fake_user = True                           # users >= 1, always
+
+A fake user *is* a user. `previous.users` was never 0, the canonical name stayed taken, Blender
+suffixed each new copy `.001`, `.002`, and every copy remained in the file with a fake user
+keeping it alive. Only the most recent is named by `props.repair_backup_mesh`, so the remainder
+were unreachable by any code path - not stale data a researcher might still want, but data nothing
+could read.
+
+Two call sites fed it. `_RepairBase._guarded` keeps its backup on the success path deliberately,
+because that is what *Undo Repair* restores from. `_try_region` takes one **per region attempt,
+inside a loop**, so a single press of boundary auto-repair could add several.
+
+### 11ao.4 The ownership model
+
+Deleting a datablock because its *name* looks right is not acceptable for a tool that holds a
+researcher's only copy of a scan. Every backup BSMT creates now carries explicit ownership:
+
+| key | meaning |
+|---|---|
+| `bsmt_repair_backup` | `True` - this datablock is a BSMT repair backup |
+| `bsmt_repair_backup_owner` | the object the backup belongs to |
+| `bsmt_repair_backup_mesh` | the live mesh datablock it was copied from |
+
+`meshrepair.backups_for(obj)` matches a tagged backup on its recorded owner **or** on the live
+mesh it came from, so renaming the object between two repairs does not orphan the earlier backup.
+A backup written before this milestone carries no keys and is matched only by the exact name the
+old code would have produced for *this* object's mesh, anchored at the end of the name
+(`_BSMT_backup` or `_BSMT_backup.NNN`) - never as a substring, so `Body_BSMT_backup_of_mine` is
+not a backup.
+
+`meshrepair._release` is the only thing that deletes one. It clears the fake user **deliberately**
+- the point of the fix - but if the datablock still has a real user it puts the fake user back and
+leaves the mesh exactly as it was. That is the one case where "stale" cannot be proved, and it is
+also what makes every live measurement mesh, every source scan and every `obj.data` unreachable by
+this code: they all have real users.
+
+### 11ao.5 The retention invariant
+
+For each repair-capable target:
+
+* **zero** backups before the first repair;
+* **exactly one** after every successful repair;
+* that one is the mesh as it stood **immediately before the most recent repair**.
+
+### 11ao.6 Order of operations, and why it is safe
+
+    live = obj.data
+    backup = live.copy()              # 1. the pre-repair state, captured
+    backup.name = live.name + BACKUP_SUFFIX
+    backup[KEY_BACKUP] = True         # 2. tagged with ownership
+    backup[KEY_OWNER] = obj.name
+    backup[KEY_MESH] = live.name
+    backup.use_fake_user = True       # 3. survives save/reload, as before
+    for stale in backups_for(obj):    # 4. only now release the older ones
+        if stale is not backup:
+            _release(stale)
+    canonical = live.name + BACKUP_SUFFIX   # 5. reclaim the clean name
+    if backup.name != canonical and bpy.data.meshes.get(canonical) is None:
+        backup.name = canonical
+
+The new backup exists, is tagged and is fake-user **before** anything is released, so at no point
+does the target have nothing to restore from. Step 5 keeps the name from drifting to `.001`,
+`.002` across repeated repairs.
+
+`operators.py` call sites are unchanged: `meshrepair.make_backup(obj)` is still the literal call,
+and every failure path in `_guarded`, `_try_region` and the degenerate-repair operator still
+restores from a backup guaranteed to exist.
+
+### 11ao.7 Undo Repair - unchanged, and pinned
+
+One slot, one step. The backup is **not** consumed by a restore, so pressing *Undo Repair* twice
+restores the same pre-repair state twice, exactly as before this milestone. BSMT does not have a
+repair history and this did not give it one. `tests/test_repair_backup_lifecycle_blender.py` B12
+and B13 assert the idempotence so it cannot drift.
+
+### 11ao.8 Legacy files: an explicit operator, not a migration
+
+The fix is preventive and does not shrink a file that is already bloated. `bsmt.clean_repair_backups`
+("Clean Stale Repair Backups", in Mesh Repair beside *Undo Repair*) does that: it keeps the backup
+`props.repair_backup_mesh` names, removes only identifiable BSMT repair backups, never touches a
+mesh anything still uses, prints every datablock and its size **before** removing anything, and
+reports the count and approximate megabytes reclaimed.
+
+Automatic migration on load was **considered and rejected.** Ownership of a pre-0.29.1 backup can
+only be inferred from its name, and an inference is not a licence to delete a researcher's
+geometry without being asked. The operator is explicit, and it says what it did.
+
+### 11ao.9 A second defect, found by the new suite
+
+`restore_backup` assigned the live name while the old datablock still held it:
+
+    obj.data = backup.copy()
+    obj.data.name = current.name      # the name is still taken -> ".001"
+
+so the live mesh **drifted to a new name on every undo**. The name is now freed before it is
+claimed; if something else still holds the old mesh the suffix remains, which is then correct.
+This was pre-existing 0.29.0 behaviour, not introduced here.
+
+### 11ao.10 Measured result
+
+| | before | after |
+|---|---|---|
+| `_M13.blend` | 554.5 MB | **151.5 MB** (−402.9 MB, −72.7%) |
+| backup datablocks | 18 | 1 |
+| mesh datablocks | 21 | 4 |
+| cold open, fresh process | 1.827 s | **0.384 s** |
+| peak resident memory | 1.31 GB | **506 MB** (−61%) |
+| live measurement mesh | intact | intact (174,870 verts) |
+| Undo Repair | works | works |
+
+Scan-density fixture (358,800 triangles): at 5 repairs 104.2 MB → 35.0 MB; at 18 repairs
+329.2 MB → **35.0 MB**, open 0.928 s → 0.096 s, peak RSS 864 MB → 272 MB.
+
+The memory figure is the operative one. These files pushed a 16 GB machine into swap - sequential
+opens under memory pressure were measured at 70-112 s against sub-second opens in a fresh process
+- and halving the resident footprint is what removes that, not any change to how the file is read.
+
+### 11ao.11 What this does not change
+
+The repair algorithm; topology analysis; artifact classification; local face repair logic;
+measurement mesh content; the source mesh; landmark invalidation semantics; Surface Region;
+Surface Interior; Surface Area; pygeodesic; the `load_post` handler; and the use of `fake_user` to
+carry the current backup across a save and reload, which is still required and still tested.

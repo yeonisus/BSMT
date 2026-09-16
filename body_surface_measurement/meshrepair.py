@@ -13,6 +13,8 @@ Each edit is bracketed by a mesh-datablock backup, so a repair can be undone
 even if Blender's undo stack has been disturbed by a script.
 """
 
+import re
+
 import bmesh
 import bpy
 import numpy as np
@@ -21,6 +23,19 @@ from . import preprocess, scancopy
 
 BACKUP_SUFFIX = "_BSMT_backup"
 
+#: Ownership, written onto every backup this module creates. A backup is
+#: identified by these, never by its name alone: a researcher's own mesh that
+#: happens to read like a backup must never be deletable by BSMT.
+KEY_BACKUP = "bsmt_repair_backup"        # True on a backup datablock
+KEY_OWNER = "bsmt_repair_backup_owner"   # the OBJECT the backup belongs to
+KEY_MESH = "bsmt_repair_backup_mesh"     # the live mesh it was copied from
+
+#: Backups written before ownership metadata existed carry no keys at all, so
+#: they are recognised by the naming convention Blender itself produced:
+#: `<mesh>_BSMT_backup`, then `.001`, `.002`, ... The match is anchored at the
+#: END of the name, so `Body_BSMT_backup_of_mine` is NOT a BSMT backup.
+_LEGACY_NAME = re.compile(re.escape(BACKUP_SUFFIX) + r"(\.\d+)?$")
+
 
 class RepairAborted(Exception):
     """A repair could not be completed. The mesh is left as it was."""
@@ -28,33 +43,165 @@ class RepairAborted(Exception):
 
 # ---------------------------------------------------------------------------
 # backup / restore
+#
+# ONE restorable backup per repair target, and exactly one.
+#
+# Until 0.29.0 the stale-backup cleanup here read
+#
+#     if previous is not None and previous.users == 0:
+#
+# which could never be true: the very next lines set `use_fake_user`, so a
+# backup always has at least one user. Blender therefore name-suffixed each
+# new copy and kept every one of them. A real 350,000-triangle scan file
+# reached eighteen backups - 444.5 MB of 554.5 MB, 80.2% of the file - of
+# which seventeen were unreachable by any code path, because only the most
+# recent is named by `props.repair_backup_mesh`.
+#
+# So a fake user is no longer treated as evidence that a datablock is wanted.
+# For a datablock BSMT can PROVE is its own stale backup, the fake user is
+# cleared deliberately; for anything else, including a backup something still
+# references, nothing is touched.
 # ---------------------------------------------------------------------------
+
+def is_backup(mesh):
+    """True if this datablock is a BSMT repair backup.
+
+    Ownership metadata first; the legacy naming convention only as a fallback,
+    so files written by an earlier BSMT can still be cleaned up.
+    """
+    if mesh is None:
+        return False
+    try:
+        if bool(mesh.get(KEY_BACKUP, False)):
+            return True
+        return bool(_LEGACY_NAME.search(mesh.name))
+    except Exception:                                 # pragma: no cover
+        return False
+
+
+def approximate_bytes(mesh):
+    """Roughly what one backup costs in the .blend, for reporting only."""
+    try:
+        return (len(mesh.vertices) * 12 + len(mesh.polygons) * 8
+                + len(mesh.loops) * 8 + len(mesh.edges) * 8)
+    except Exception:                                 # pragma: no cover
+        return 0
+
+
+def backups_for(obj):
+    """Every repair backup belonging to this target object.
+
+    A tagged backup is matched on its recorded owner, or on the live mesh it
+    was copied from - so renaming the OBJECT between two repairs does not
+    orphan the backup the first one took. An untagged backup - from a file
+    written before 0.29.1 - is matched only on the exact name the old code
+    would have produced for THIS object's mesh, never on a substring.
+
+    Anything this cannot attribute is left alone and is reachable only
+    through the explicit "Clean Stale Repair Backups" operator.
+    """
+    if obj is None or obj.data is None:
+        return []
+    live = obj.data
+    prefix = live.name + BACKUP_SUFFIX
+    found = []
+    for mesh in bpy.data.meshes:
+        if mesh is live or not is_backup(mesh):
+            continue
+        owner = str(mesh.get(KEY_OWNER, "") or "")
+        source = str(mesh.get(KEY_MESH, "") or "")
+        if owner or source:
+            if owner == obj.name or (source and source == live.name):
+                found.append(mesh)
+        elif mesh.name == prefix or mesh.name.startswith(prefix + "."):
+            found.append(mesh)
+    return found
+
+
+def _release(mesh):
+    """Delete one backup BSMT owns, fake user and all. True if it went.
+
+    A backup something else still references is left exactly as it was: that
+    is the one case where "stale" cannot be proved, and an ambiguous mesh is
+    never deleted silently.
+    """
+    was_fake = mesh.use_fake_user
+    mesh.use_fake_user = False
+    if mesh.users:
+        mesh.use_fake_user = was_fake
+        return False
+    bpy.data.meshes.remove(mesh)
+    return True
+
+
+def _clear_backup_marks(mesh):
+    """A restored mesh is live geometry, not a backup. Strip the ownership.
+
+    `backup.copy()` carries the custom properties across, so without this the
+    mesh now IN USE would advertise itself as a deletable backup.
+    """
+    for key in (KEY_BACKUP, KEY_OWNER, KEY_MESH):
+        try:
+            if key in mesh.keys():
+                del mesh[key]
+        except Exception:                             # pragma: no cover
+            pass
+
 
 def make_backup(obj):
     """Copy the current mesh datablock and return its name.
 
     Kept as a real datablock rather than a serialised blob so restoring is a
     single assignment and cannot half-succeed.
+
+    Order matters, and is chosen so no failure can leave the target with
+    nothing to restore from: the new backup is created and tagged FIRST, and
+    only then are this target's older backups released. At no point does the
+    only usable backup not exist.
     """
-    previous = bpy.data.meshes.get(obj.data.name + BACKUP_SUFFIX)
-    if previous is not None and previous.users == 0:
-        bpy.data.meshes.remove(previous)
-    backup = obj.data.copy()
-    backup.name = obj.data.name + BACKUP_SUFFIX
+    live = obj.data
+    backup = live.copy()
+    backup.name = live.name + BACKUP_SUFFIX
+    backup[KEY_BACKUP] = True
+    backup[KEY_OWNER] = obj.name
+    backup[KEY_MESH] = live.name
     backup.use_fake_user = True          # survive a file save/reload
+
+    # The new backup now exists, so releasing the old ones cannot strand the
+    # target. Only this object's backups are considered.
+    for stale in backups_for(obj):
+        if stale is not backup:
+            _release(stale)
+
+    # With the old ones gone the canonical name is usually free again, so the
+    # backup does not drift to .001, .002, ... across repeated repairs.
+    canonical = live.name + BACKUP_SUFFIX
+    if backup.name != canonical and bpy.data.meshes.get(canonical) is None:
+        backup.name = canonical
     return backup.name
 
 
 def restore_backup(obj, backup_name):
-    """Put a backed-up mesh back on the object. Returns True on success."""
+    """Put a backed-up mesh back on the object. Returns True on success.
+
+    The backup datablock is left in place and stays restorable: BSMT has one
+    repair-backup slot, and pressing Undo Repair twice restores the same
+    pre-repair state twice rather than walking back a history.
+    """
     backup = bpy.data.meshes.get(backup_name)
     if backup is None:
         return False
     current = obj.data
+    live_name = current.name
     obj.data = backup.copy()
-    obj.data.name = current.name
+    _clear_backup_marks(obj.data)
+    # Free the name BEFORE claiming it: renaming while the old datablock
+    # still holds it makes Blender hand back `<name>.001`, so a mesh drifted
+    # to a new name on every undo. If something else still uses the old mesh
+    # the name stays taken, and the suffix is then the correct answer.
     if current.users == 0:
         bpy.data.meshes.remove(current)
+    obj.data.name = live_name
     return True
 
 
@@ -62,10 +209,34 @@ def discard_backup(backup_name):
     backup = bpy.data.meshes.get(backup_name)
     if backup is None:
         return False
-    backup.use_fake_user = False
-    if backup.users == 0:
-        bpy.data.meshes.remove(backup)
-    return True
+    return _release(backup)
+
+
+def purge_stale_backups(keep_name=None, obj=None):
+    """Delete repair backups nothing can restore from.
+
+    `keep_name` is the backup Undo Repair currently points at and is always
+    kept. With `obj`, only that target's backups are considered; without it,
+    every BSMT repair backup in the file is - which is what an existing
+    bloated file needs, including backups whose object is long gone.
+
+    Returns (datablocks removed, approximate bytes freed).
+    """
+    keep = {str(keep_name)} if keep_name else set()
+    if obj is not None:
+        candidates = backups_for(obj)
+    else:
+        candidates = [mesh for mesh in bpy.data.meshes if is_backup(mesh)]
+    removed = 0
+    freed = 0
+    for mesh in list(candidates):
+        if mesh.name in keep:
+            continue
+        size = approximate_bytes(mesh)
+        if _release(mesh):
+            removed += 1
+            freed += size
+    return removed, freed
 
 
 # ---------------------------------------------------------------------------
