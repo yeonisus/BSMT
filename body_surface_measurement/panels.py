@@ -23,9 +23,10 @@ import traceback
 
 import bpy
 
-from . import (alignment, attach, export, geodesic, landmarks, measurement,
-               measurements, overlay, preprocess, readiness, repair, scancopy,
-               state, timing, visualization, viz)
+from . import (alignment, attach, export, geodesic, interior, landmarks,
+               localrepair, measurement, measurements, overlay, preprocess,
+               readiness, regions, repair, scancopy, state, surfacearea,
+               timing, visualization, viz)
 
 
 #: Panel order, one number per workflow stage. Explicit `bl_order` rather
@@ -44,7 +45,8 @@ STAGE_ORDER = {
     readiness.STAGE_LANDMARKS: 50,
     readiness.STAGE_MEASUREMENTS: 60,
     readiness.STAGE_VISUALIZATION: 70,
-    readiness.STAGE_EXPORT: 80,
+    readiness.STAGE_REGIONS: 80,
+    readiness.STAGE_EXPORT: 90,
 }
 
 
@@ -1679,6 +1681,534 @@ class BSMT_PT_measurement_visualization(bpy.types.Panel):
         box.operator("bsmt.path_timing_report", icon='CONSOLE')
 
 
+class BSMT_UL_regions(bpy.types.UIList):
+    """Region rows: id, name, segment count and status."""
+
+    bl_idname = "BSMT_UL_regions"
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_property, index=0, flt_flag=0):
+        if self.layout_type not in {'DEFAULT', 'COMPACT'}:
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon=regions.STATUS_ICONS.get(item.status,
+                                                                'BLANK1'))
+            return
+        row = layout.row(align=True)
+        identifier = row.row()
+        identifier.scale_x = 0.35
+        identifier.enabled = False
+        identifier.label(text=item.protocol_id or "-")
+        row.label(text=item.name or "(unnamed region)")
+        count = row.row()
+        count.alignment = 'RIGHT'
+        count.scale_x = 0.5
+        count.enabled = False
+        count.label(text="%d landmark%s" % (len(item.landmarks),
+                                            "" if len(item.landmarks) == 1
+                                            else "s"))
+        mark = row.row()
+        mark.alignment = 'RIGHT'
+        mark.scale_x = 0.2
+        if item.status == regions.STATUS_INVALID:
+            mark.alert = True
+        mark.label(text="", icon=regions.STATUS_ICONS.get(item.status,
+                                                          'BLANK1'))
+
+
+class BSMT_UL_region_landmarks(bpy.types.UIList):
+    """One boundary landmark of a region, in the order it runs round."""
+
+    bl_idname = "BSMT_UL_region_landmarks"
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_property, index=0, flt_flag=0):
+        if self.layout_type not in {'DEFAULT', 'COMPACT'}:
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='LAYER_ACTIVE')
+            return
+        row = layout.row(align=True)
+        position = row.row()
+        position.scale_x = 0.25
+        position.enabled = False
+        position.label(text="%d" % (index + 1))
+        identifier = row.row()
+        identifier.scale_x = 0.4
+        identifier.enabled = False
+        identifier.label(text=item.landmark_protocol_id or "--")
+        row.label(text=item.landmark_name
+                  or "landmark %d" % item.landmark_stable_id)
+
+
+class BSMT_PT_surface_regions(bpy.types.Panel):
+    """Closed boundaries defined by ordered landmarks (Milestone 3.31).
+
+    A Surface Region is a researcher-defined CLOSED BOUNDARY on the
+    measurement mesh, specified by an ordered set of anatomical landmarks.
+    Consecutive landmarks - including the final-to-first pair - are joined by
+    cached surface geodesic paths.
+
+    It is not an area: this milestone establishes the boundary and stops
+    there, because an area computed from a boundary nobody proved closed is a
+    plausible wrong number.
+
+    Measurement Manager is NOT part of this workflow. Exactly one button here
+    reaches the solver, and it says so.
+    """
+
+    bl_label = "Surface Regions"
+    bl_idname = "BSMT_PT_surface_regions"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "BSMT"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = STAGE_ORDER[readiness.STAGE_REGIONS]
+
+    def draw(self, context):
+        layout = self.layout
+        props = state.get_props(context)
+        collection = state.get_regions(context)
+        if props is None or collection is None:
+            layout.label(text="BSMT is not registered", icon='ERROR')
+            return
+
+        _draw_hint(context, layout, readiness.STAGE_REGIONS, props)
+
+        row = layout.row()
+        row.template_list("BSMT_UL_regions", "", context.scene, "bsmt_regions",
+                          props, "region_index",
+                          rows=3 if len(collection) > 1 else 2)
+        side = row.column(align=True)
+        side.operator("bsmt.add_region", text="", icon='ADD')
+        side.operator("bsmt.remove_region", text="", icon='REMOVE')
+
+        item = state.active_region(context, props)
+        if item is None:
+            note = layout.column(align=True)
+            note.scale_y = 0.75
+            for line in _wrap("A Surface Region is a closed boundary you "
+                              "define by listing landmarks in order. It does "
+                              "not calculate an area.", 44):
+                note.label(text=line)
+            return
+
+        # DERIVED, NOT STORED. `validate_region` is pure - it returns the
+        # verdict and writes nothing. The mutating sibling
+        # `refresh_region_status` must never be called from here: Blender
+        # forbids writing to ID-backed data while the UI draws, and assigning
+        # `item.status` from a draw raises
+        #     Writing to ID classes in this context is not allowed
+        # which loses the whole panel. Storing is an operator's job.
+        try:
+            result, _facts = state.validate_region(context, item)
+        except Exception as exc:                      # noqa: BLE001
+            _draw_failure(layout, BSMT_PT_surface_regions.bl_label, exc,
+                          "the region could not be checked")
+            return
+
+        box = layout.box()
+        box.prop(item, "name", text="Name")
+        self._draw_status(box, item, result)
+        self._draw_landmarks(layout, props, item, result)
+        self._draw_compute(layout, props, item, result)
+        self._draw_display(layout, props, item, result)
+        self._draw_interior(layout, props, item, result)
+        self._draw_area(layout, props, item)
+        self._draw_panel_preview(layout, props, item)
+
+        if item.report:
+            layout.separator()
+            report = layout.box().column(align=True)
+            report.scale_y = 0.7
+            for line in item.report.split("\n"):
+                if line.strip():
+                    report.label(text=line)
+
+        note = layout.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("A region is a boundary, not an area. Only Compute "
+                          "Boundary runs the geodesic solver; everything "
+                          "else here reuses what it cached.", 44):
+            note.label(text=line)
+
+    @staticmethod
+    def _draw_status(box, item, result):
+        # Every value here comes from `result`, the verdict this draw just
+        # derived - not from item.status, which is the last verdict an
+        # OPERATOR stored. They agree in normal use; when they do not, the
+        # live one is the true one and the divergence is said out loud below
+        # rather than resolved by writing (which a draw may not do).
+        status = result["status"]
+        row = box.row(align=True)
+        row.alert = status == regions.STATUS_INVALID
+        row.label(text=regions.STATUS_SHORT.get(status, status),
+                  icon=regions.STATUS_ICONS.get(status, 'BLANK1'))
+        detail = box.column(align=True)
+        detail.scale_y = 0.7
+        detail.enabled = status != regions.STATUS_INVALID
+        for line in _wrap(result["detail"], 44):
+            detail.label(text=line)
+        if item.status != status:
+            drift = box.column(align=True)
+            drift.scale_y = 0.7
+            drift.alert = True
+            for line in _wrap("Stored status is %s; this is what the "
+                              "landmarks say now. Press Validate Region or "
+                              "Refresh to record it."
+                              % regions.STATUS_SHORT.get(item.status,
+                                                         item.status), 44):
+                drift.label(text=line)
+        if result["closed"]:
+            facts = box.column(align=True)
+            facts.scale_y = 0.7
+            facts.enabled = False
+            facts.label(text="Boundary: %.1f mm around, %s point(s)"
+                             % (result["length_mm"],
+                                "{:,}".format(result["point_count"])))
+            scope = box.column(align=True)
+            scope.scale_y = 0.7
+            if item.validated:
+                scope.enabled = False
+                for line in _wrap("Validated. Self-intersection checking is "
+                                  "sound but INCOMPLETE - the report below "
+                                  "says what it does and does not cover.",
+                                  44):
+                    scope.label(text=line)
+            else:
+                scope.label(text="Not checked for self-intersection.",
+                            icon='INFO')
+                for line in _wrap("This verdict comes from a redraw, which "
+                                  "does not run that test. Press Validate "
+                                  "Region.", 44):
+                    scope.label(text=line)
+
+    @staticmethod
+    def _draw_landmarks(layout, props, item, result):
+        box = layout.box()
+        box.label(text="Boundary Landmarks (%d)" % len(item.landmarks),
+                  icon='LAYER_ACTIVE')
+        if len(item.landmarks):
+            row = box.row()
+            row.template_list("BSMT_UL_region_landmarks", "", item,
+                              "landmarks", item, "landmark_index",
+                              rows=4 if len(item.landmarks) > 2 else 2)
+            side = row.column(align=True)
+            side.operator("bsmt.move_region_landmark", text="",
+                          icon='TRIA_UP').direction = 'UP'
+            side.operator("bsmt.move_region_landmark", text="",
+                          icon='TRIA_DOWN').direction = 'DOWN'
+            side.separator()
+            side.operator("bsmt.remove_region_landmark", text="", icon='X')
+        else:
+            empty = box.row()
+            empty.enabled = False
+            empty.label(text="no boundary landmarks yet")
+
+        add = box.row(align=True)
+        add.prop(item, "landmark_picker", text="", icon='ADD')
+        add.operator("bsmt.add_region_landmark", text="Add Selected",
+                     icon='PLUS')
+        if len(item.landmarks):
+            add.operator("bsmt.clear_region_landmarks", text="", icon='TRASH')
+
+        # THE BOUNDARY, spelled out the way the researcher reads it. The
+        # closing landmark is repeated at the end on purpose: the final-to-
+        # first segment is implicit in the definition, and a list that did
+        # not show it would look like an open chain.
+        if result["definition"]:
+            shown = box.column(align=True)
+            shown.scale_y = 0.7
+            shown.enabled = False
+            shown.label(text="Boundary definition:")
+            for line in _wrap(result["definition"], 40):
+                shown.label(text="   " + line)
+
+        hint = box.column(align=True)
+        hint.scale_y = 0.7
+        hint.enabled = False
+        for line in _wrap("The order is the boundary, and it closes back to "
+                          "the first landmark automatically. Editing this "
+                          "list computes nothing.", 44):
+            hint.label(text=line)
+
+        problems = result.get("problems") or []
+        if problems:
+            warn = box.column(align=True)
+            warn.alert = True
+            warn.scale_y = 0.7
+            for problem in problems[:6]:
+                for line in _wrap("%d. %s" % (problem["position"],
+                                              problem["detail"]), 44):
+                    warn.label(text=line)
+
+    @staticmethod
+    def _draw_compute(layout, props, item, result):
+        box = layout.box()
+        compute = box.row()
+        compute.scale_y = 1.3
+        compute.enabled = len(item.landmarks) >= regions.MIN_LANDMARKS
+        compute.operator("bsmt.compute_region_boundary",
+                         text="Compute Boundary", icon='PLAY')
+        cost = box.column(align=True)
+        cost.scale_y = 0.7
+        cost.enabled = False
+        segments = len(item.landmarks)
+        if segments >= regions.MIN_LANDMARKS:
+            for line in _wrap("Solves %d surface segments. On a dense scan "
+                              "this takes minutes and Blender will not "
+                              "redraw until it finishes." % segments, 44):
+                cost.label(text=line)
+        else:
+            for line in _wrap("Add at least %d landmarks to define a closed "
+                              "boundary." % regions.MIN_LANDMARKS, 44):
+                cost.label(text=line)
+        if item.computed_elapsed_s > 0.0 and result["computed"]:
+            cost.label(text="Last computed in %.1f s"
+                            % item.computed_elapsed_s)
+        if result["segment_labels"]:
+            listing = box.column(align=True)
+            listing.scale_y = 0.7
+            listing.enabled = False
+            for line in result["segment_labels"][:8]:
+                listing.label(text=line)
+            if len(result["segment_labels"]) > 8:
+                listing.label(text="   ...")
+
+    @staticmethod
+    def _draw_display(layout, props, item, result):
+        box = layout.box()
+        box.operator("bsmt.validate_region", icon='CHECKMARK')
+        row = box.row(align=True)
+        row.operator("bsmt.show_region_boundary", text="Show Boundary",
+                     icon='HIDE_OFF')
+        row.operator("bsmt.hide_region_boundary", text="Hide",
+                     icon='HIDE_ON')
+        row = box.row(align=True)
+        row.operator("bsmt.refresh_regions", text="Refresh",
+                     icon='FILE_REFRESH')
+        row.operator("bsmt.clear_region_boundaries", text="Clear All",
+                     icon='X')
+        style = box.row(align=True)
+        style.prop(item, "color", text="")
+        style.prop(props, "region_boundary_thickness_mm", text="Thickness")
+        if result["status"] not in regions.TRUSTED and item.show_boundary:
+            warn = box.column(align=True)
+            warn.alert = True
+            warn.scale_y = 0.75
+            for line in _wrap("This boundary is drawn in the warning colour "
+                              "because it no longer matches the landmarks. "
+                              "Press Compute Boundary.", 44):
+                warn.label(text=line)
+
+
+    @staticmethod
+    def _draw_interior(layout, props, item, result):
+        box = layout.box()
+        box.label(text="Surface Interior", icon='MOD_MASK')
+
+        # Read, never derived here: the interior's status is stored by an
+        # operator, and a draw may not write. The one thing derived live is
+        # whether the BOUNDARY is currently trustworthy, because an interior
+        # of an untrustworthy boundary is not worth offering.
+        boundary_ok = result["status"] in regions.TRUSTED
+        status = item.interior_status
+        row = box.row(align=True)
+        row.alert = status == interior.STATUS_INVALID
+        row.label(text=interior.STATUS_SHORT.get(status, status),
+                  icon=interior.STATUS_ICONS.get(status, 'BLANK1'))
+        if item.interior_detail:
+            detail = box.column(align=True)
+            detail.scale_y = 0.7
+            detail.enabled = status != interior.STATUS_INVALID
+            for line in _wrap(item.interior_detail, 44):
+                detail.label(text=line)
+
+        side = box.row()
+        side.prop(item, "interior_side", text="")
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("Which side of the boundary is the region. The "
+                          "smaller side is a default, not a claim that it is "
+                          "anatomically inside.", 44):
+            note.label(text=line)
+
+        compute = box.row()
+        compute.scale_y = 1.2
+        compute.enabled = boundary_ok
+        compute.operator("bsmt.compute_region_interior",
+                         text="Compute Interior", icon='PLAY')
+        if not boundary_ok:
+            hint = box.column(align=True)
+            hint.scale_y = 0.7
+            hint.enabled = False
+            for line in _wrap("Compute the boundary first - an interior of a "
+                              "boundary BSMT cannot vouch for would be a "
+                              "precise answer to the wrong question.", 44):
+                hint.label(text=line)
+
+        if item.interior_definition:
+            facts = box.column(align=True)
+            facts.scale_y = 0.7
+            facts.enabled = False
+            facts.label(text="%s whole triangles, %s cut by the boundary"
+                             % ("{:,}".format(item.interior_full_count),
+                                "{:,}".format(item.interior_partial_count)))
+            if item.interior_component_id:
+                facts.label(text="Surface component %d"
+                                 % item.interior_component_id)
+            if item.interior_elapsed_s > 0.0:
+                facts.label(text="Analyzed in %.2f s (no solver)"
+                                 % item.interior_elapsed_s)
+
+            row = box.row(align=True)
+            row.operator("bsmt.show_region_fill", text="Show Fill",
+                         icon='HIDE_OFF')
+            row.operator("bsmt.hide_region_fill", text="Hide", icon='HIDE_ON')
+            row.operator("bsmt.clear_region_fills", text="", icon='X')
+            style = box.row(align=True)
+            style.prop(item, "fill_color", text="")
+            style.prop(item, "fill_opacity", text="Opacity")
+            if status not in interior.TRUSTED and item.show_fill:
+                warn = box.column(align=True)
+                warn.alert = True
+                warn.scale_y = 0.75
+                for line in _wrap("This fill is drawn in the warning colour "
+                                  "because it no longer matches the "
+                                  "boundary. Press Compute Interior.", 44):
+                    warn.label(text=line)
+
+        scope = box.column(align=True)
+        scope.scale_y = 0.7
+        scope.enabled = False
+        for line in _wrap("No area is calculated. The interior is the "
+                          "classified surface a later milestone will "
+                          "measure.", 44):
+            scope.label(text=line)
+
+    @staticmethod
+    def _draw_area(layout, props, item):
+        box = layout.box()
+        box.label(text="Surface Area", icon='SNAP_FACE')
+        ready = bool(item.interior_definition)
+
+        status = item.area_status
+        row = box.row(align=True)
+        row.alert = status == surfacearea.STATUS_INVALID
+        row.label(text=surfacearea.STATUS_SHORT.get(status, status),
+                  icon=surfacearea.STATUS_ICONS.get(status, 'BLANK1'))
+
+        compute = box.row()
+        compute.scale_y = 1.2
+        compute.enabled = ready
+        compute.operator("bsmt.compute_region_area", text="Compute Area",
+                         icon='PLAY')
+        if not ready:
+            hint = box.column(align=True)
+            hint.scale_y = 0.7
+            hint.enabled = False
+            for line in _wrap("Compute the interior first - an area needs to "
+                              "know which side of the boundary the region "
+                              "is.", 44):
+                hint.label(text=line)
+
+        # The NUMBER is shown only when it is currently the answer. A stale
+        # area is named as stale and the figure is withheld: a number on
+        # screen is read as a result whatever label sits above it.
+        if status in surfacearea.TRUSTED:
+            value = box.column(align=True)
+            big = value.row()
+            big.scale_y = 1.3
+            big.label(text=surfacearea.format_mm2(item.area_mm2))
+            value.label(text=surfacearea.format_cm2(item.area_mm2))
+
+            facts = box.column(align=True)
+            facts.scale_y = 0.7
+            facts.enabled = False
+            facts.label(text="Selected side: %s"
+                             % interior.SIDE_LABELS.get(item.area_side,
+                                                        item.area_side))
+            facts.label(text="%s from whole triangles, %s from clipped"
+                             % (surfacearea.format_mm2(item.area_full_mm2),
+                                surfacearea.format_mm2(item.area_partial_mm2)))
+            if item.area_component_mm2 > 0.0:
+                facts.label(text="%.2f%% of this surface component"
+                                 % (100.0 * item.area_mm2
+                                    / item.area_component_mm2))
+        elif item.area_interior_key or status == surfacearea.STATUS_INVALID:
+            # DELIBERATELY NOT `area_detail`. That field holds the last
+            # RESULT sentence, which contains the figure itself - echoing it
+            # here would put the number back on screen under a "stale" label,
+            # and a number on screen is read as a result whatever label sits
+            # above it. The reason code is what belongs here.
+            warn = box.column(align=True)
+            warn.alert = True
+            warn.scale_y = 0.75
+            reason = surfacearea.CODE_LABELS.get(item.area_code, "")
+            for line in _wrap("This area is no longer the answer%s. Press "
+                              "Compute Area." % (" - " + reason if reason
+                                                 else ""), 44):
+                warn.label(text=line)
+
+        method = box.column(align=True)
+        method.scale_y = 0.7
+        method.enabled = False
+        method.label(text="Method:")
+        for line in _wrap(surfacearea.METHOD_LABEL, 44):
+            method.label(text="   " + line)
+        for line in _wrap("This is the %s. It is NOT true anatomical surface "
+                          "area." % surfacearea.DEFINITION, 44):
+            method.label(text=line)
+
+    @staticmethod
+    def _draw_panel_preview(layout, props, item):
+        box = layout.box()
+        box.label(text="Thickness Preview", icon='MOD_SOLIDIFY')
+        ready = bool(item.interior_definition)
+
+        row = box.row(align=True)
+        row.enabled = ready
+        row.prop(item, "panel_thickness_mm", text="Thickness (mm)")
+
+        buttons = box.row(align=True)
+        buttons.enabled = ready
+        buttons.operator("bsmt.show_region_panel", text="Show Preview",
+                         icon='HIDE_OFF')
+        buttons.operator("bsmt.hide_region_panel", text="Hide",
+                         icon='HIDE_ON')
+        buttons.operator("bsmt.clear_region_panels", text="", icon='X')
+
+        style = box.row(align=True)
+        style.enabled = ready
+        style.prop(item, "panel_color", text="")
+        style.prop(item, "panel_opacity", text="Opacity")
+
+        if item.panel_detail:
+            detail = box.column(align=True)
+            detail.scale_y = 0.7
+            detail.enabled = False
+            for line in _wrap(item.panel_detail, 44):
+                detail.label(text=line)
+        if item.panel_folded_faces:
+            warn = box.column(align=True)
+            warn.alert = True
+            warn.scale_y = 0.75
+            for line in _wrap("%d face(s) of the offset surface fold through "
+                              "themselves - the thickness is more than the "
+                              "local curvature allows there."
+                              % item.panel_folded_faces, 44):
+                warn.label(text=line)
+
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("Outward only, along the body surface normals. A "
+                          "visualization - not a physical simulation and not "
+                          "a manufacturing model. A normal offset distorts "
+                          "on a curved body.", 44):
+            note.label(text=line)
+
+
 class BSMT_PT_preprocessing(bpy.types.Panel):
     """Turn a dense textured scan into a lighter TEXTURED measurement mesh.
 
@@ -2052,7 +2582,7 @@ class BSMT_PT_repair(bpy.types.Panel):
 
         self._draw_diagnostics(layout, props)
         self._draw_degenerate(context, layout, props)
-        self._draw_non_manifold(layout, props)
+        self._draw_non_manifold(layout, props, context)
         self._draw_boundaries(layout, props)
         self._draw_components(layout, props)
 
@@ -2088,7 +2618,7 @@ class BSMT_PT_repair(bpy.types.Panel):
                 column.label(text=line)
 
     @staticmethod
-    def _draw_non_manifold(layout, props):
+    def _draw_non_manifold(layout, props, context=None):
         box = layout.box()
         box.label(text="Non-Manifold Edges")
         row = box.row(align=True)
@@ -2102,6 +2632,7 @@ class BSMT_PT_repair(bpy.types.Panel):
                      icon='ZOOM_SELECTED')
         row.operator("bsmt.clear_repair_highlight", text="Clear Highlight",
                      icon='X')
+        BSMT_PT_repair._draw_focused_defect(box, props, context)
         box.operator("bsmt.remove_duplicate_faces", icon='TRASH')
         weld = box.column(align=True)
         weld.prop(props, "repair_weld_distance_mm")
@@ -2111,6 +2642,177 @@ class BSMT_PT_repair(bpy.types.Panel):
         note.enabled = False
         for line in _wrap("The weld touches only the non-manifold edges' own "
                           "vertices. It is never a global merge.", 44):
+            note.label(text=line)
+
+    @staticmethod
+    def _draw_focused_defect(box, props, context=None):
+        """The defect being inspected, and the component it sits in.
+
+        The whole artifact workflow is here, in the order it is meant to be
+        used: step to a defect, look at it, see the whole component it
+        belongs to, and only then delete it. Nothing on this path runs by
+        drawing the panel, and the destructive button is not drawn at all
+        when the component is the body (Milestone 3.28).
+        """
+        total = len(props.repair_nonmanifold_defects)
+        if not total:
+            return
+        index = min(props.repair_nonmanifold_index, total - 1)
+        entry = props.repair_nonmanifold_defects[index]
+
+        panel = box.box()
+        panel.label(text="Focused Defect", icon='VIEWZOOM')
+        step = panel.row(align=True)
+        step.operator("bsmt.step_nonmanifold_defect", text="",
+                      icon='TRIA_LEFT').direction = 'PREV'
+        label = step.row()
+        label.alignment = 'CENTER'
+        label.label(text="Defect %d / %d" % (index + 1, total))
+        step.operator("bsmt.step_nonmanifold_defect", text="",
+                      icon='TRIA_RIGHT').direction = 'NEXT'
+        step.operator("bsmt.focus_nonmanifold_defect", text="",
+                      icon='ZOOM_SELECTED')
+
+        detail = panel.column(align=True)
+        detail.scale_y = 0.7
+        detail.enabled = False
+        for line in _wrap(entry.label, 44):
+            detail.label(text=line)
+        if entry.component_index:
+            detail.label(text="Component %d: %s triangles (%.2f%%)%s"
+                              % (entry.component_index,
+                                 "{:,}".format(entry.component_triangle_count),
+                                 entry.component_percent,
+                                 "  [body]" if entry.component_is_largest
+                                 else ("  [small]" if entry.component_is_small
+                                       else "")))
+            detail.label(text="%s vertices, %.0f x %.0f x %.0f mm"
+                              % (("{:,}".format(entry.component_vertex_count),)
+                                 + tuple(entry.component_bbox)))
+
+        panel.operator("bsmt.preview_artifact_component",
+                       text="Preview Artifact", icon='HIDE_OFF')
+
+        if entry.deletion_block:
+            warn = panel.column(align=True)
+            warn.alert = True
+            warn.scale_y = 0.75
+            warn.label(text="Deletion blocked", icon='CANCEL')
+            for line in _wrap(entry.deletion_block, 44):
+                warn.label(text=line)
+        else:
+            panel.operator("bsmt.delete_defect_component",
+                           text="Delete Artifact", icon='TRASH')
+            # sect. 13: said BEFORE the action, not after it.
+            landmarks_here = 0
+            if context is not None:
+                landmarks_here = sum(
+                    1 for item in (state.get_landmarks(context) or ())
+                    if item.surface_point.valid
+                    and item.surface_point.source_object == props.repair_object
+                )
+            if landmarks_here:
+                warn = panel.column(align=True)
+                warn.alert = True
+                warn.scale_y = 0.75
+                for line in _wrap("Deleting geometry will invalidate existing "
+                                  "landmark positions. %d landmark(s) on this "
+                                  "mesh will need re-picking."
+                                  % landmarks_here, 44):
+                    warn.label(text=line)
+
+        if props.repair_artifact_preview:
+            preview = panel.column(align=True)
+            preview.scale_y = 0.7
+            for line in props.repair_artifact_preview.split("\n"):
+                if not line.strip():
+                    preview.separator()
+                elif line.startswith("DELETION BLOCKED") or \
+                        line.startswith("NOTE"):
+                    row = preview.row()
+                    row.alert = True
+                    row.label(text=line)
+                else:
+                    preview.label(text=line)
+
+        note = panel.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("Deletes the whole connected component holding this "
+                          "defect, from the measurement mesh only. BSMT does "
+                          "not decide whether geometry is anatomically "
+                          "relevant - you do.", 44):
+            note.label(text=line)
+
+        BSMT_PT_repair._draw_local_repair(panel, props)
+
+    @staticmethod
+    def _draw_local_repair(panel, props):
+        """The second repair strategy: a few faces, not a whole component.
+
+        Drawn for EVERY focused defect, not only the ones whose component
+        deletion is blocked - the two are different repairs for different
+        topology, and hiding one behind the other's refusal would make the
+        useful case look like a consolation prize. The destructive button
+        appears only after an inspection has produced an unambiguous
+        candidate; an ambiguous classification draws the refusal and nothing
+        else (Milestone 3.30).
+        """
+        box = panel.box()
+        box.label(text="Local Defect Repair", icon='MOD_MESHDEFORM')
+        box.operator("bsmt.inspect_local_defect",
+                     text="Inspect Local Topology", icon='VIEWZOOM')
+
+        if props.repair_local_report:
+            column = box.column(align=True)
+            column.scale_y = 0.7
+            for line in props.repair_local_report.split("\n"):
+                if not line.strip():
+                    column.separator()
+                elif line.startswith("Automatic local repair") or \
+                        line.startswith("Manual mesh inspection") or \
+                        line.startswith("NOTE"):
+                    row = column.row()
+                    row.alert = True
+                    row.label(text=line)
+                else:
+                    column.label(text=line)
+
+        if (props.repair_local_classification
+                == localrepair.LOCAL_DUPLICATE_FACE):
+            # sect. 12: do not grow a second duplicate-face implementation.
+            # The existing repair already removes exactly the repeated copy,
+            # so this classification points at it rather than competing.
+            hint = box.column(align=True)
+            hint.scale_y = 0.75
+            for line in _wrap("This defect is duplicated faces. Use Remove "
+                              "Duplicate Faces above - it already removes "
+                              "exactly the repeated copy.", 44):
+                hint.label(text=line)
+            return
+
+        if props.repair_local_removable:
+            row = box.row(align=True)
+            row.operator("bsmt.preview_local_candidate",
+                         text="Preview Candidate Faces", icon='HIDE_OFF')
+            row.operator("bsmt.clear_repair_highlight", text="",
+                         icon='X')
+            box.operator("bsmt.remove_local_faces",
+                         text="Remove Local Artifact Faces", icon='TRASH')
+        elif props.repair_local_classification:
+            warn = box.column(align=True)
+            warn.alert = True
+            warn.scale_y = 0.75
+            warn.label(text="No safe candidate", icon='CANCEL')
+
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.enabled = False
+        for line in _wrap("Removes only a small, unambiguously separable "
+                          "branch of faces at this defect - never the "
+                          "component, never anatomy BSMT cannot tell apart "
+                          "from a flap. Refused when the local topology is "
+                          "ambiguous.", 44):
             note.label(text=line)
 
     @staticmethod
@@ -2555,7 +3257,11 @@ classes = (
     BSMT_PT_measurements,
     # stage 7 - Measurement Visualization
     BSMT_PT_measurement_visualization,
-    # stage 8 - Results and Export
+    # stage 8 - Surface Regions
+    BSMT_UL_regions,
+    BSMT_UL_region_landmarks,
+    BSMT_PT_surface_regions,
+    # stage 9 - Results and Export
     BSMT_PT_session,
 )
 

@@ -127,10 +127,11 @@ def main():
         "Landmark Manager",
         "Measurement Manager",
         "Measurement Visualization",
+        "Surface Regions",
         "Results and Export",
     ]
     got = [cls.bl_label for cls in top_level]
-    check("seven top-level stages, in workflow order", got == expected, got)
+    check("nine top-level stages, in workflow order", got == expected, got)
     check("every top-level panel declares an explicit bl_order",
           all(getattr(cls, "bl_order", None) is not None for cls in top_level),
           [(c.bl_label, getattr(c, "bl_order", None)) for c in top_level])

@@ -49,8 +49,15 @@ except ImportError:                                   # pragma: no cover
 FAILURES = []
 CHECKS = [0]
 
-EXPECTED_VERSION = (0, 26, 2)
+EXPECTED_VERSION = (0, 29, 0)
 EXPECTED_SCHEMA = 2
+#: The workflow stages THE PACKAGED RELEASE ships, which is not necessarily
+#: what the working tree has. This list moves at RELEASE time, together with
+#: EXPECTED_VERSION above and a rebuilt ZIP - never before, or this suite
+#: would be asserting that a released artefact contains work it predates.
+#: "Surface Regions" was added for 0.29.0, which is the first RELEASED ZIP
+#: to carry
+#: Milestone 3.29.
 EXPECTED_STAGES = (
     "Scan Setup",
     "Scan Preprocessing",
@@ -59,6 +66,7 @@ EXPECTED_STAGES = (
     "Landmark Manager",
     "Measurement Manager",
     "Measurement Visualization",
+    "Surface Regions",
     "Results and Export",
 )
 
@@ -215,8 +223,12 @@ def run(workspace, addon_zip, extension_zip):
     top_level = [cls for cls in packaged_panels.workflow_panels()
                  if not getattr(cls, "bl_parent_id", "")]
     labels = tuple(cls.bl_label for cls in top_level)
-    check("there are exactly EIGHT top-level workflow panels",
-          len(labels) == 8, len(labels))
+    # Derived from EXPECTED_STAGES, never written as a literal: a hardcoded
+    # count does not move when the stage list does, and at 0.28.0 it did not -
+    # the list gained "Surface Regions" while the literal still said eight.
+    check("there are exactly %d top-level workflow panels"
+          % len(EXPECTED_STAGES),
+          len(labels) == len(EXPECTED_STAGES), len(labels))
     check("in the specified workflow order",
           labels == EXPECTED_STAGES, labels)
     for position, stage in enumerate(EXPECTED_STAGES, start=1):

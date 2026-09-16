@@ -65,6 +65,7 @@ STAGE_ALIGNMENT = 'ALIGNMENT'
 STAGE_LANDMARKS = 'LANDMARKS'
 STAGE_MEASUREMENTS = 'MEASUREMENTS'
 STAGE_VISUALIZATION = 'VISUALIZATION'
+STAGE_REGIONS = 'REGIONS'
 STAGE_EXPORT = 'EXPORT'
 
 def landmark_emphasis_visible(ui_stage):
@@ -93,6 +94,7 @@ STAGE_ORDER = (
     STAGE_LANDMARKS,
     STAGE_MEASUREMENTS,
     STAGE_VISUALIZATION,
+    STAGE_REGIONS,
     STAGE_EXPORT,
 )
 
@@ -104,6 +106,7 @@ STAGE_TITLES = {
     STAGE_LANDMARKS: "Landmark Manager",
     STAGE_MEASUREMENTS: "Measurement Manager",
     STAGE_VISUALIZATION: "Measurement Visualization",
+    STAGE_REGIONS: "Surface Regions",
     STAGE_EXPORT: "Results and Export",
 }
 
@@ -166,6 +169,15 @@ def stage_hint(stage, has_mesh=True, analysed=True, copy_status="",
     if stage == STAGE_VISUALIZATION:
         if measurements_defined <= 0:
             return "Define a measurement to visualize."
+        return ""
+
+    if stage == STAGE_REGIONS:
+        # A region is assembled from paths that already exist, so the only
+        # thing this stage can be short of is paths - and saying so is more
+        # useful than an empty panel. It never suggests computing one for
+        # you: that is a solve, and solves are the researcher's to ask for.
+        if measurements_defined <= 0:
+            return "Define and compute surface paths before building a region."
         return ""
 
     if stage == STAGE_EXPORT:

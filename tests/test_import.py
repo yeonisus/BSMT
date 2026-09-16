@@ -972,19 +972,29 @@ def test_landmark_modules_are_pure(bsmt):
           "informational" in ops_gate.lower())
     check("the solver target is logged",
           "def log_solver_target(" in ops_gate)
-    check("and logged at all three entry points",
-          ops_gate.count("log_solver_target(") == 4,
+    check("and logged at all four entry points",
+          ops_gate.count("log_solver_target(") == 5,
           str(ops_gate.count("log_solver_target(")))
-    check("the gate is applied at exactly three solver entry points",
-          len(finder.hits) == 3, str(finder.hits))
+    # FOUR since Milestone 3.31: Surface Regions compute their own boundary
+    # segments rather than borrowing a measurement's path, which is a new
+    # route to the native solver and therefore a new thing the preflight gate
+    # has to guard. The count is asserted, not just the membership, so a
+    # FIFTH route cannot be added without this test being updated
+    # deliberately.
+    check("the gate is applied at exactly four solver entry points",
+          len(finder.hits) == 4, str(finder.hits))
     for expected in ("BSMT_OT_calculate_surface_distance",
                      "_measure_one",
-                     "BSMT_OT_compute_surface_path"):
+                     "BSMT_OT_compute_surface_path",
+                     "BSMT_OT_compute_region_boundary"):
         check("the gate guards %s" % expected,
               any(expected in where for where in finder.hits),
               str(finder.hits))
-    check("only one place calls the path solve",
-          ops_text.count("solve.surface_path(") == 1,
+    # Two callers, and they are the two operators a researcher explicitly
+    # presses: one measurement path, and one region boundary. Neither is
+    # reachable from a panel draw, a list edit or a status refresh.
+    check("exactly two places call the path solve",
+          ops_text.count("solve.surface_path(") == 2,
           str(ops_text.count("solve.surface_path(")))
     for op_name in ("calculate_measurement", "calculate_all_measurements",
                     "add_measurement", "pick_landmark"):

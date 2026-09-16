@@ -22,11 +22,14 @@ LINE_NAME = "BSMT_Straight_Line"
 COMPONENT_PREFIX = "BSMT_Component_"
 LANDMARK_PREFIX = "BSMT_Landmark_"
 MEASUREMENT_PREFIX = "BSMT_Measurement_"
+REGION_PREFIX = "BSMT_Region_"
 REPAIR_PREFIX = "BSMT_Repair_"
 REPAIR_NON_MANIFOLD = REPAIR_PREFIX + "NonManifold"
 REPAIR_BOUNDARY = REPAIR_PREFIX + "Boundary"
 REPAIR_DEGENERATE = REPAIR_PREFIX + "Degenerate"
 REPAIR_DEGENERATE_ACTIVE = REPAIR_PREFIX + "DegenerateActive"
+REPAIR_COMPONENT = REPAIR_PREFIX + "Component"
+REPAIR_LOCAL_CANDIDATE = REPAIR_PREFIX + "LocalCandidate"
 ALIGN_PREFIX = "BSMT_Align_"
 ALIGN_AXES = ALIGN_PREFIX + "Axes"
 STRAIGHT_SUFFIX = "_Straight"
@@ -57,6 +60,15 @@ REPAIR_BOUNDARY_COLOR = (0.15, 0.6, 1.0, 1.0)        # blue
 # useful if you can tell which one you are on.
 REPAIR_DEGENERATE_COLOR = (1.0, 0.75, 0.0, 1.0)      # amber
 REPAIR_DEGENERATE_ACTIVE_COLOR = (1.0, 1.0, 1.0, 1.0)  # white
+# The whole connected component a deletion would remove, previewed before any
+# geometry is touched. Distinct from every defect colour on purpose: it marks
+# what would GO, not what is wrong.
+REPAIR_COMPONENT_COLOR = (1.0, 0.45, 0.0, 1.0)       # orange
+# The handful of faces a LOCAL repair would remove from inside a component
+# that may not be deleted (Milestone 3.30). Deliberately not the component
+# colour: confusing "these three triangles go" with "this whole fragment
+# goes" is the one misreading this preview exists to prevent.
+REPAIR_LOCAL_CANDIDATE_COLOR = (0.65, 0.15, 1.0, 1.0)  # violet
 
 # Marker spheres are built once at radius 1.0 and resized with object scale, so
 # changing "Marker Size" never rebuilds geometry.
@@ -309,6 +321,10 @@ def clear_all(context):
             continue
         if obj.name.startswith(REPAIR_PREFIX):
             # Repair highlights have their own Clear button too.
+            continue
+        if obj.name.startswith(REGION_PREFIX):
+            # A region boundary has its own Show/Hide, and `Clear Points` is
+            # about A/B - it must not take a researcher's boundary with it.
             continue
         if obj.name.startswith(ALIGN_PREFIX):
             # So does the alignment axis preview.
@@ -834,6 +850,405 @@ def show_repair_markers(context, name, points_local, size, matrix_world,
         obj.display_type = 'WIRE'
     obj.matrix_world = matrix_world
     return obj
+
+
+#: A component preview copies the component's own triangles. On a stray
+#: fragment that is a few hundred faces; this cap is what stops a mis-scoped
+#: preview from trying to duplicate a 350,000-triangle body into a helper.
+MAX_PREVIEW_TRIANGLES = 200000
+
+
+def show_repair_surface(context, name, points_local, faces, matrix_world,
+                        color):
+    """Draw a copy of a set of triangles over the scan. (object, reason).
+
+    Used to preview the WHOLE connected component an artifact deletion would
+    remove, so the researcher sees the actual extent of what goes rather than
+    a mark on one edge of it. Unlike the rod highlights nothing is
+    exaggerated - these are the component's own triangles, in its own place -
+    because the entire point is to show the true shape and size.
+
+    A helper like every other: BSMT_Helpers collection, helper flag, drawn in
+    front, not selectable, and therefore never reachable by a canonical mesh
+    build or by topology diagnostics (sect. 18).
+    """
+    existing = _existing_helper(name)
+    if existing is not None:
+        remove_object(existing)
+    faces = [tuple(int(index) for index in face) for face in faces]
+    if not faces or len(points_local) == 0:
+        return None, "there is nothing to preview"
+    if len(faces) > MAX_PREVIEW_TRIANGLES:
+        return None, ("%s triangles is too large to preview as a highlight"
+                      % "{:,}".format(len(faces)))
+    obj = _colored_helper(context, name, points_local, faces, color)
+    obj.matrix_world = matrix_world
+    return obj, ""
+
+
+# ---------------------------------------------------------------------------
+# Surface Region boundaries (Milestone 3.29)
+# ---------------------------------------------------------------------------
+#
+# A region boundary is ONE poly curve built by concatenating the region's
+# cached path polylines in loop order. Not one helper per segment: the point
+# of a region is that it is a single closed loop, and drawing it as four
+# separate curves would let three of them survive an edit that broke the
+# fourth - a boundary on screen that no longer exists.
+#
+# Nothing here reads geometry. The points handed in came out of `pathcache`,
+# which is where a solve is kept, so showing, hiding, restyling and moving a
+# boundary all cost exactly zero solver time (sect. 8 of the brief).
+
+#: A boundary BSMT cannot currently vouch for is drawn in this colour whatever
+#: the region's own colour says. A stale boundary that looks exactly like a
+#: trusted one is the failure this project keeps refusing to ship.
+REGION_UNTRUSTED_COLOR = (1.0, 0.45, 0.0, 1.0)        # orange
+
+
+def region_object_name(stable_id):
+    return "%s%06d_Boundary" % (REGION_PREFIX, int(stable_id))
+
+
+def region_helper_objects():
+    """Every region helper: boundaries, fills and panel previews alike."""
+    return [obj for obj in bpy.data.objects
+            if obj.name.startswith(REGION_PREFIX) and is_helper(obj)]
+
+
+def region_boundary_objects():
+    """Boundary curves only. Fills and previews have their own lifetimes.
+
+    Separate because a researcher clearing the drawn boundaries should not
+    lose the interior they waited for, and vice versa - the two are different
+    layers of the same analysis, not one drawing.
+    """
+    return [obj for obj in region_helper_objects()
+            if obj.name.endswith("_Boundary")]
+
+
+def region_fill_objects():
+    return [obj for obj in region_helper_objects()
+            if obj.name.endswith(FILL_SUFFIX)]
+
+
+def region_analysis_objects():
+    """Fills and previews: the layers built from an interior, not from it."""
+    return [obj for obj in region_helper_objects()
+            if obj.name.endswith(FILL_SUFFIX)
+            or obj.name.endswith(PANEL_SUFFIX)]
+
+
+def update_region_boundary(context, props, stable_id, points_local,
+                           matrix_world, color, thickness_mm, closed=True):
+    """Create or refresh one region's boundary curve. Returns the object.
+
+    The curve is CYCLIC when the loop closes, so the last point joins the
+    first without the caller having to repeat it - which would also have
+    doubled a point and confused any later length arithmetic.
+    """
+    name = region_object_name(stable_id)
+    obj = _existing_helper(name)
+    if len(points_local) < 2:
+        if obj is not None:
+            remove_object(obj)
+        return None
+    if obj is None or not isinstance(obj.data, bpy.types.Curve):
+        if obj is not None:
+            remove_object(obj)
+        curve = _poly_curve(name + "_Curve", len(points_local))
+        obj = new_helper_object(context, name, curve, color)
+        obj.data.materials.append(
+            get_material("BSMT_Material_Region_%06d" % int(stable_id), color)
+        )
+    spline = _set_curve_points(obj.data, points_local)
+    if spline is not None:
+        _set_flag(spline, "use_cyclic_u", bool(closed))
+    _set_float(obj.data, "bevel_depth", thickness_radius(props, thickness_mm))
+    _set_color(obj, "color", color)
+    if obj.data.materials and obj.data.materials[0] is not None:
+        _set_color(obj.data.materials[0], "diffuse_color", color)
+    _set_matrix(obj, matrix_world)
+    # The boundary lies ON the surface, so real occlusion is correct: the far
+    # side of a loop that wraps a limb should be hidden by the body.
+    _set_flag(obj, "show_in_front", False)
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# region FILL - the interior, drawn as the faces it actually is
+# ---------------------------------------------------------------------------
+#
+# The fill is NOT a decorative overlay and NOT a projected polygon. Its faces
+# ARE the interior representation: one face per full interior triangle, one
+# per exactly-clipped partial piece. Drawing the same thing a later Surface
+# Area milestone will sum is the point - a fill that looked right while the
+# analysis said something else would be the most convincing wrong answer this
+# tool could give.
+
+FILL_SUFFIX = "_Fill"
+
+#: Shown when the interior is not something BSMT can currently vouch for. A
+#: stale fill that looked exactly like a current one would be worse than no
+#: fill at all.
+REGION_FILL_UNTRUSTED_COLOR = (1.0, 0.45, 0.0, 1.0)      # orange
+
+
+def region_fill_object_name(stable_id):
+    return "%s%06d%s" % (REGION_PREFIX, int(stable_id), FILL_SUFFIX)
+
+
+def update_region_fill(context, props, stable_id, vertices_local, faces,
+                       matrix_world, color, opacity):
+    """Create or refresh one region's interior fill. Returns the object.
+
+    `vertices_local` and `faces` are the classified interior geometry in the
+    scan's LOCAL space - full triangles and clipped partial polygons, already
+    decided by `interior.compute`. Nothing is computed here and no source
+    geometry is read: this writes a helper mesh and stops.
+    """
+    name = region_fill_object_name(stable_id)
+    obj = _existing_helper(name)
+    if len(vertices_local) < 3 or not faces:
+        if obj is not None:
+            remove_object(obj)
+        return None
+
+    mesh = bpy.data.meshes.new(name + "_Mesh")
+    mesh[HELPER_FLAG] = True
+    mesh.from_pydata([tuple(float(value) for value in point)
+                      for point in vertices_local], [], list(faces))
+    mesh.update()
+
+    shade = (float(color[0]), float(color[1]), float(color[2]),
+             float(opacity))
+    if obj is None or not isinstance(obj.data, bpy.types.Mesh):
+        if obj is not None:
+            remove_object(obj)
+        obj = new_helper_object(context, name, mesh, shade)
+    else:
+        old = obj.data
+        obj.data = mesh
+        if old is not None and old.users == 0:
+            bpy.data.meshes.remove(old)
+    material = _fill_material(stable_id, shade)
+    obj.data.materials.clear()
+    obj.data.materials.append(material)
+    _set_color(obj, "color", shade)
+    _set_matrix(obj, matrix_world)
+    # The fill lies ON the surface, so it must be occluded by the body like
+    # the boundary is; and it must never be pickable, or a researcher could
+    # land a landmark on their own analysis layer.
+    _set_flag(obj, "show_in_front", False)
+    obj.hide_select = True
+    return obj
+
+
+def _fill_material(stable_id, shade):
+    """A blended material, so the scan stays visible through the fill."""
+    return _fill_material_named("BSMT_Material_RegionFill_%06d"
+                                % int(stable_id), shade)
+
+
+def _fill_material_named(name, shade):
+    """A blended material, so what is behind stays visible through it."""
+    material = bpy.data.materials.get(name)
+    if material is None:
+        material = bpy.data.materials.new(name)
+        material.use_nodes = False
+        material[HELPER_FLAG] = True
+    material.diffuse_color = shade
+    for attribute, value in (("blend_method", 'BLEND'),
+                             ("show_transparent_back", False)):
+        try:
+            setattr(material, attribute, value)
+        except (AttributeError, TypeError):           # pragma: no cover
+            pass
+    return material
+
+
+def region_fill(stable_id):
+    return _existing_helper(region_fill_object_name(stable_id))
+
+
+def region_fill_exists(stable_id):
+    return _existing_helper(region_fill_object_name(stable_id)) is not None
+
+
+def set_region_fill_visible(stable_id, visible):
+    obj = _existing_helper(region_fill_object_name(stable_id))
+    if obj is None:
+        return False
+    _set_flag(obj, "hide_viewport", not visible)
+    return True
+
+
+def sync_region_fill_transform(stable_id, matrix_world):
+    obj = _existing_helper(region_fill_object_name(stable_id))
+    return _set_matrix(obj, matrix_world) if obj is not None else False
+
+
+def remove_region_fill(stable_id):
+    obj = _existing_helper(region_fill_object_name(stable_id))
+    return remove_object(obj) if obj is not None else False
+
+
+# ---------------------------------------------------------------------------
+# region THICKNESS PREVIEW
+# ---------------------------------------------------------------------------
+
+PANEL_SUFFIX = "_Panel"
+
+
+def region_panel_object_name(stable_id):
+    return "%s%06d%s" % (REGION_PREFIX, int(stable_id), PANEL_SUFFIX)
+
+
+def update_region_panel(context, props, stable_id, vertices_local, faces,
+                        matrix_world, color, opacity):
+    """Create or refresh one region's thickness preview. Returns the object.
+
+    Helper geometry, like everything else here: the measurement mesh and the
+    source scan are never touched, and this object is excluded from every
+    diagnostic by the same helper flag the rest of BSMT uses.
+    """
+    name = region_panel_object_name(stable_id)
+    obj = _existing_helper(name)
+    if len(vertices_local) < 4 or not faces:
+        if obj is not None:
+            remove_object(obj)
+        return None
+
+    mesh = bpy.data.meshes.new(name + "_Mesh")
+    mesh[HELPER_FLAG] = True
+    mesh.from_pydata([tuple(float(value) for value in point)
+                      for point in vertices_local], [], list(faces))
+    mesh.update()
+
+    shade = (float(color[0]), float(color[1]), float(color[2]),
+             float(opacity))
+    if obj is None or not isinstance(obj.data, bpy.types.Mesh):
+        if obj is not None:
+            remove_object(obj)
+        obj = new_helper_object(context, name, mesh, shade)
+    else:
+        previous = obj.data
+        obj.data = mesh
+        if previous is not None and previous.users == 0:
+            bpy.data.meshes.remove(previous)
+    material = _fill_material_named(
+        "BSMT_Material_RegionPanel_%06d" % int(stable_id), shade)
+    obj.data.materials.clear()
+    obj.data.materials.append(material)
+    _set_color(obj, "color", shade)
+    _set_matrix(obj, matrix_world)
+    _set_flag(obj, "show_in_front", False)
+    obj.hide_select = True
+    return obj
+
+
+def region_panel(stable_id):
+    return _existing_helper(region_panel_object_name(stable_id))
+
+
+def region_panel_exists(stable_id):
+    return _existing_helper(region_panel_object_name(stable_id)) is not None
+
+
+def set_region_panel_visible(stable_id, visible):
+    obj = _existing_helper(region_panel_object_name(stable_id))
+    if obj is None:
+        return False
+    _set_flag(obj, "hide_viewport", not visible)
+    return True
+
+
+def sync_region_panel_transform(stable_id, matrix_world):
+    obj = _existing_helper(region_panel_object_name(stable_id))
+    return _set_matrix(obj, matrix_world) if obj is not None else False
+
+
+def remove_region_panel(stable_id):
+    obj = _existing_helper(region_panel_object_name(stable_id))
+    return remove_object(obj) if obj is not None else False
+
+
+def region_panel_objects():
+    return [obj for obj in region_helper_objects()
+            if obj.name.endswith(PANEL_SUFFIX)]
+
+
+def clear_region_panels():
+    """Remove every drawn thickness preview. Interiors are kept."""
+    removed = 0
+    for obj in region_panel_objects():
+        if remove_object(obj):
+            removed += 1
+    return removed
+
+
+def region_boundary(stable_id):
+    return _existing_helper(region_object_name(stable_id))
+
+
+def region_boundary_exists(stable_id):
+    return _existing_helper(region_object_name(stable_id)) is not None
+
+
+def set_region_boundary_visible(stable_id, visible):
+    """Show or hide a boundary WITHOUT destroying it. Rebuilding costs nothing
+    in solver time but does churn a curve with thousands of points."""
+    obj = _existing_helper(region_object_name(stable_id))
+    if obj is None:
+        return False
+    _set_flag(obj, "hide_viewport", not visible)
+    _set_flag(obj, "hide_render", not visible)
+    return True
+
+
+def sync_region_transform(stable_id, matrix_world):
+    """Point a boundary at the scan's current transform. One matrix copy."""
+    obj = _existing_helper(region_object_name(stable_id))
+    if obj is None:
+        return False
+    return _set_matrix(obj, matrix_world)
+
+
+def remove_region_boundary(stable_id):
+    obj = _existing_helper(region_object_name(stable_id))
+    return remove_object(obj) if obj is not None else False
+
+
+def clear_region_boundaries():
+    """Remove every drawn region BOUNDARY. Fills and definitions are kept."""
+    removed = 0
+    for obj in region_boundary_objects():
+        if remove_object(obj):
+            removed += 1
+    return removed
+
+
+def clear_region_fills():
+    """Remove every drawn region FILL. Boundaries and definitions are kept."""
+    removed = 0
+    for obj in region_fill_objects():
+        if remove_object(obj):
+            removed += 1
+    return removed
+
+
+def remove_orphan_region_boundaries(valid_stable_ids):
+    """Drop region helpers whose region is gone from this file."""
+    wanted = set()
+    for value in valid_stable_ids:
+        wanted.add(region_object_name(value))
+        wanted.add(region_fill_object_name(value))
+        wanted.add(region_panel_object_name(value))
+    removed = 0
+    for obj in region_helper_objects():
+        if obj.name not in wanted and remove_object(obj):
+            removed += 1
+    return removed
 
 
 def clear_repair_highlights():

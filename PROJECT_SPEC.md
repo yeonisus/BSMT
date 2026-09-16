@@ -5089,6 +5089,948 @@ the screen.
 No repair policy, readiness verdict, solver gate or topology analysis changed.
 
 
+## 11af. Milestone 3.28 — Delete the artifact you inspected (v0.27.0, 2026-09-11)
+
+### 11af.1 The gap
+
+Milestone 3.27 made a non-manifold defect findable: **Show Edges** draws it, **Focus** frames it.
+What a researcher could then do about it was a local weld, which on a detached fragment correctly
+attempts the repair and rolls it back at 1 → 1, and a Connected Components list that could delete a
+component — but nothing connected *the defect being looked at* to *the component it lives in*.
+
+On a real scan that gap is the common case. A typical measurement mesh:
+
+| | |
+|---|---|
+| Triangles | ~350,000 |
+| Connected components | 15 |
+| Boundary edges | 3 |
+| Non-manifold edges | 1 |
+| Degenerate triangles | 0 |
+
+Fourteen of those fifteen components are small fragments — floor shards, turntable scraps, slivers
+off a shoulder — and the one non-manifold edge is frequently on one of them. Deleting that fragment
+is the correct repair and the tool could not express it.
+
+### 11af.2 What is NOT decided here
+
+**BSMT does not determine anatomical relevance.** Nothing on this path infers that geometry is
+unwanted, and nothing about it is automatic. Being small is not evidence of being irrelevant: hair,
+a garment, a held object and a scanner artefact are indistinguishable to a triangle count, and a
+tool that deleted the small ones would eventually delete a plait.
+
+The decision is the researcher's, made by *looking at the thing*. That is why the workflow is
+
+> **Show Edges → Focus → Preview Artifact → Delete Artifact → confirm**
+
+and why every step is a press.
+
+### 11af.3 The focused defect
+
+Non-manifold edges are grouped into **defects**: two edges sharing a vertex are one defect. That was
+already `repair.non_manifold_regions`'s rule — the real Design X scan's seven non-manifold edges are
+one artefact around one vertex, not seven problems — and it now lives in one function,
+`repair.group_nonmanifold_edges`, called by both the full region description and by the cheap
+component lookup this milestone needs.
+
+Cheap matters. `non_manifold_regions` also resolves every *incident face* of every defect, which
+costs a python pass over the whole triangle array — about three seconds on a 350,000-triangle scan,
+and Analyze would pay it every time. `artifact.defect_regions` needs only the defect's own edges and
+the component labels the canonical mesh already carries, so it is O(number of non-manifold edges).
+Both number the defects identically, which is asserted rather than assumed.
+
+`Analyze Mesh` fills the focused-defect list in the same pass as every other repair list, so the
+panel can never show a defect from one analysis beside a component list from another. It records the
+**canonical geometry hash** alongside.
+
+### 11af.4 "Primary body component", defined once
+
+The component holding the **most triangles**, which is exactly how
+`geodesic.topology.component_labels` already ranks them (label 0) and how the Connected Components
+list already marks `is_largest`. Not a second definition, and deliberately **not object count**: one
+Blender mesh object routinely holds fifteen connected components, so "there is only one object" says
+nothing about whether the thing being deleted is the body.
+
+A **tie** is refused, not broken. If two components hold the same number of triangles, which one is
+the body is genuinely ambiguous and BSMT will not guess.
+
+### 11af.5 The hard rule
+
+`artifact.deletion_block` is the one place that decides, and it refuses in four shapes:
+
+| Situation | Code | What the researcher sees |
+|---|---|---|
+| Defect is on the largest component | `PRIMARY` | *The focused defect belongs to the primary body component. Automatic component deletion is not permitted. Use another repair method or inspect manually.* |
+| The mesh has one component | `ONLY_COMPONENT` | deleting it would leave nothing to measure, then the same message |
+| Component ties with the largest | `AMBIGUOUS_LARGEST` | which is the body is ambiguous; BSMT will not guess |
+| Component holds no triangles | `EMPTY` | re-analyze the mesh |
+
+When the focused defect is blocked, the destructive button **is not drawn**; the panel prints the
+reason. A scripted call is refused with the same text, so the rule is not a UI convention.
+
+Size is **not** a blocking rule. A large non-primary component may be deleted — it can legitimately
+be a garment or an accessory — but the confirmation says in as many words that it is not a small
+fragment and to check it is not anatomy first.
+
+### 11af.6 Preview
+
+**Preview Artifact** draws the whole candidate component as a solid coloured helper built from *its
+own triangles at its own position* — nothing is exaggerated, because the entire point is to show the
+true shape and extent. It is compacted to that component's vertices, so previewing a 400-triangle
+fragment does not build a helper holding 350,000 unused vertices, and it is capped at 200,000
+triangles so a mis-scoped preview cannot try to duplicate a body.
+
+It states, before anything is touched:
+
+- component number, vertex count, edge count, triangle count;
+- its share of the mesh, and whether that counts as small;
+- bounding box in millimetres;
+- whether it is the largest / main component;
+- whether it holds the highlighted non-manifold edge;
+- how many landmarks and measurements on this mesh will be restated.
+
+Read-only: the mesh's vertices and faces are asserted unchanged across a preview.
+
+### 11af.7 Transactional deletion
+
+The edit is `meshrepair.remove_component`, the existing component deletion, scoped to the vertex set
+the *fresh* canonical mesh gives for that component. Around it, the existing `_RepairBase._guarded`
+wrapper: back up the mesh datablock, edit, rebuild the canonical diagnostics, accept or restore.
+
+Acceptance is `repair.accept_repair` in strict mode — the existing authoritative rule, called, not
+restated — plus four additions specific to removing a whole component:
+
+| Added check | Why |
+|---|---|
+| No degenerate triangle introduced | a degenerate triangle is a hard blocker for exact measurement |
+| Exactly one component disappeared | more means the edit reached past its scope |
+| Triangles fell by exactly that component's count | the same, measured differently |
+| Primary component's triangle count unchanged | this is the check that says *the body is still the body* |
+
+A **partial improvement is a success.** Non-manifold 2 → 1 is kept. Requiring every defect to vanish
+in one press would make the operation impossible on exactly the scans that need it.
+
+Rollback is BSMT's own, through the mesh-datablock backup, and does not depend on Blender's undo
+stack having survived a script. The operator also declares `UNDO`, so an intentional deletion is
+undoable the ordinary way; the two mechanisms are independent on purpose.
+
+**One pre-existing gap was closed on this path.** `_guarded` re-analysed the edited mesh *outside*
+any guard: an exception there escaped the operator and left the edit in place with nothing having
+vouched for it. It now restores the mesh and reports it. That applies to every repair using the
+wrapper, and it is the path taken when a deletion would empty the mesh.
+
+### 11af.8 Index stability
+
+A geometry edit renumbers vertices, edges and triangles, so a stored region id or component number
+describes a mesh that no longer exists (sect. 7.7). Three things follow, and all three are enforced:
+
+1. The focused-defect entry stores **no authoritative index**. Its centre is kept in object-local
+   coordinates purely so the viewport can be framed without re-reading the mesh.
+2. Before any destructive action, the stored **geometry hash** must equal the live canonical mesh's.
+   If it does not, the operation is refused with *press Analyze Mesh again* — it is not applied to
+   whatever happens to be at those indices now.
+3. The vertex indices actually handed to bmesh are re-derived from the canonical mesh the wrapper
+   just rebuilt, and the defect found at the stored region id must still be at the position that
+   analysis recorded for it.
+
+After a successful deletion the highlights are cleared — they were built from indices of the old
+mesh — the diagnostics re-run, and the focused-defect list is rebuilt from scratch rather than
+patched.
+
+### 11af.9 Invalidation
+
+Geometry changed, so `state.invalidate_for_geometry_change` — the centralized policy, not a second
+implementation — restates every landmark on that mesh and invalidates every measurement result and
+cached path computed on it. **Nothing is re-projected**: a stored triangle index is meaningless once
+triangles have been renumbered, and silently re-attaching a researcher's landmark would move their
+data. The source scan is never touched, and the wrapper independently re-checks the source's
+triangle count after every edit.
+
+### 11af.10 What this is not
+
+No global merge-by-distance, no loose-geometry sweep, no remesh, no hole filling, no smoothing, no
+broad non-manifold cleanup. The operation is: *user-inspected + focused defect + component-scoped +
+explicit deletion*, and nothing else. Multiple connected components remain a **preference**, never a
+blocker; no rule requiring `connected_components == 1` was introduced.
+
+### 11af.11 What is verified
+
+`tests/test_artifact.py` — **88 checks**, offline, pure numpy. The component a defect sits in; the
+cheap lookup and the full region description numbering defects identically; the facts the
+confirmation states; the primary / only-component / tie refusals with their exact messages and
+codes; every rollback condition; and that `accept_deletion` never accepts a state
+`repair.accept_repair` refused.
+
+`tests/test_artifact_deletion_blender.py` — **149 checks**, in Blender, on a 1.7 m body-scale
+measurement mesh with a real source object, rotated and translated:
+
+- **A–C** analysis, preview and deletion: the fragment's three triangles and five vertices go, the
+  body's triangle count is unchanged to the triangle, non-manifold 1 → 0, components 2 → 1, the
+  verdict becomes READY, the source scan is byte-for-byte what it was, the highlights are cleared
+  and the panel's counts, hash and log are refreshed;
+- **D** a defect on the primary body component: blocked in the list, refused by the operator with
+  the exact message, mesh untouched — including the mixed case where one defect is on the body and
+  one is on a fragment, and focusing each gives the opposite answer;
+- **E** two fragments: 2 → 1 is **accepted**, the body untouched, then 1 → 0 on the second press;
+- **F–H** injected edits that over-reach into the body, that empty the mesh, and that manufacture a
+  degenerate triangle — each refused and restored vertex-for-vertex, with the reason in the log;
+- **I** highlight and helper geometry: flagged helpers, refused as repair targets, and the
+  diagnostics identical with them present;
+- **J** landmarks and measurements go stale, the stored number is dropped, and no landmark's
+  triangle, barycentrics or local position moved;
+- **K** an external edit behind BSMT's back: the stored analysis is refused, not reused, and
+  re-analyzing recovers;
+- **L** the undo contract. `bpy.ops.ed.undo` has no valid context in background Blender, so what is
+  asserted is that the operator declares `UNDO`, the read-only operators do not, BSMT's rollback
+  needs no undo stack, and restoring the pre-deletion mesh leaves BSMT refusing the stale analysis
+  rather than acting on it.
+
+
+## 11ag. Milestone 3.29 — Surface Region (developed at 0.28.0; shipped in v0.29.0, 2026-09-11)
+
+> **SUPERSEDED by §11ai (Milestone 3.31).** The data model described below —
+> a region as an ordered list of measurement path references with stored
+> orientations — was replaced by ordered landmark ids before it ever shipped.
+> The reasoning for the replacement is in §11ai.1, and the parts that
+> survived unchanged (the status vocabulary, the self-intersection policy of
+> §11ag.6, the verdict-scope rule of §11ag.6a and the draw-purity rule of
+> §11ag.6b) are still current. Read this section for why a region is built
+> from geodesic paths rather than chords; read §11ai for what a region IS.
+
+### 11ag.1 What a Surface Region is, and what it is not
+
+> A **Surface Region** is a researcher-defined **closed boundary** on the measurement mesh,
+> assembled from ordered, already-computed surface paths.
+
+    Landmark  →  Surface Path  →  Surface Region  →  Surface Area [a later milestone]
+
+This milestone implements the third arrow and **stops there**. There is no area anywhere in the
+code: no face-area summation, no interior flood fill, no triangle clipping, no projected area, no
+coverage percentage, no contact area, no mesh cutting and no remeshing. A region does not modify
+the source scan and does not modify the measurement mesh.
+
+That order is deliberate. An area computed from a boundary nobody proved closed is a plausible
+wrong number — the worst kind this project can produce — so the boundary, and the proof that it
+closes, comes first and gets its own milestone.
+
+### 11ag.2 Why the boundary is made of PATHS
+
+The shortcut would be to join the corner landmarks with straight 3D segments. That is wrong for the
+same reason a straight distance is not a surface distance: a chord between two landmarks cuts
+**through** the body, is systematically short, and encloses something that is not a patch of the
+subject's skin.
+
+BSMT already has the right primitive — the exact geodesic polyline in `pathcache` — so a region is
+built from those and from nothing else. Two consequences follow, and the rest of the design exists
+to enforce them: a region is only as trustworthy as the paths under it, and **a region never
+computes a path**.
+
+### 11ag.3 Data model
+
+Persistent on the Scene (`bpy.types.Scene.bsmt_regions`), so it saves in the .blend like every other
+BSMT definition. Additive: a file that predates this simply has an empty collection, which is
+exactly "no regions defined yet". No migration, because there is nothing to migrate.
+
+```
+BSMT_SurfaceRegion
+    stable_id            monotonic int, unique per scene, never reused
+    protocol_id          "R01" - template facing
+    name, notes          researcher's label; renaming changes nothing measured
+    segments             ordered BSMT_RegionSegment collection   AUTHORITATIVE
+    segment_index        UI selection only
+    status               DRAFT | NOT_READY | VALID | STALE | INVALID
+    status_code          the reason token
+    status_detail        the sentence to show
+    report               the last explicit Validate press, multi-line
+    validated            has an explicit Validate run against THIS definition
+    validated_fingerprint what that press was run against - see 11ag.6a
+    boundary_closed / boundary_length_mm / boundary_point_count
+    boundary_object / boundary_geometry_hash / boundary_component_id
+    show_boundary, color
+
+BSMT_RegionSegment
+    measurement_stable_id   -> BSMT_Measurement.stable_id   AUTHORITATIVE
+    forward                 orientation, STORED not inferred
+    measurement_protocol_id / measurement_name   cached, diagnostics only
+```
+
+**Stable ids throughout.** A boundary path is referenced by the *measurement's* stable id, because
+in BSMT a surface path belongs to a measurement — that is where the cached polyline is keyed and
+where its provenance lives. Nothing stores a polygon, edge, triangle or collection index, so a
+region survives the mesh being reindexed and the measurement list being reordered. The cached
+protocol id and name are for *naming a reference that has gone*, never for finding a substitute —
+the same rule `measurements.py` already states about landmark references.
+
+**Orientation is stored.** A geodesic traversed backwards is the same curve, so reusing a path in
+reverse costs no second solve and creates no duplicate path. But `(path_id, forward)` is written
+into the definition rather than re-guessed at read time: if direction were inferred on every read,
+the same saved region could validate differently on two different days.
+
+**The status fields are a record, not an authority.** `state.refresh_region_status` re-derives the
+verdict from the live paths whenever the panel draws or a dependency changes — the same reason the
+alignment panel re-measures every draw. A stored verdict about something the researcher can still
+change is exactly the thing that lied before.
+
+### 11ag.4 Status and reason codes
+
+Five statuses, in the project's existing vocabulary rather than a parallel system:
+
+| Status | Meaning |
+|---|---|
+| `DRAFT` | not enough segments yet to form a closed boundary |
+| `NOT_READY` | a boundary path has not been computed. BSMT never computes one to validate a region |
+| `VALID` | a closed loop, and every boundary path is current |
+| `STALE` | the loop still closes, but a path no longer matches its landmarks, geometry or metric |
+| `INVALID` | the ordered paths do not form one usable closed boundary |
+
+`regions.TRUSTED` is `(VALID,)` and nothing else. Reason codes: `EMPTY`, `TOO_FEW_SEGMENTS`,
+`MISSING_PATH`, `PATH_NOT_COMPUTED`, `PATH_STALE`, `OPEN_BOUNDARY`, `DISCONNECTED_PATHS`,
+`DUPLICATE_SEGMENT`, `ZERO_LENGTH_SEGMENT`, `CROSS_COMPONENT`, `GEOMETRY_MISMATCH`,
+`SELF_INTERSECTION`.
+
+### 11ag.5 Validation rules, in order
+
+`regions.validate()` is pure, deterministic and **ordered**, and the order is part of the design:
+**structure is judged before freshness**. A boundary that is both open and stale is told it is
+open — the problem the researcher can actually fix — rather than being sent to recompute a path
+that would still not close the loop.
+
+1. every referenced path exists → else `MISSING_PATH`, references **kept** so the panel can name
+   what went;
+2. no path used twice → else `DUPLICATE_SEGMENT` (checked before the count, because one path used
+   forwards then backwards is not two segments);
+3. at least `MIN_SEGMENTS` = **2** — two *different* paths between one pair of landmarks enclose a
+   real lune-shaped patch, so three is the wrong minimum;
+4. no zero-length segment → `ZERO_LENGTH_SEGMENT`. An *uncomputed* path's 0 mm is deliberately not
+   mistaken for this;
+5. consecutive endpoints meet, **by landmark stable id** → else `DISCONNECTED_PATHS`;
+6. the last path returns to the first one's start → else `OPEN_BOUNDARY`;
+7. no corner reached twice → else `SELF_INTERSECTION`;
+8. one mesh, one geometry hash, one connected component → else `GEOMETRY_MISMATCH` /
+   `CROSS_COMPONENT`;
+9. every path computed → else `NOT_READY` / `PATH_NOT_COMPUTED`;
+10. no non-adjacent paths sharing a point → else `SELF_INTERSECTION` (explicit Validate only);
+11. any path stale → `STALE`; otherwise `VALID`.
+
+Endpoints are joined **by landmark stable id**, which is what "B is the same B" means in BSMT.
+Comparing coordinates would make validity depend on float noise; comparing list positions would
+repoint a boundary whenever a landmark was deleted.
+
+### 11ag.6 Self-intersection — sound, incomplete, and said so
+
+The boundary lies on a triangulated surface, not in a plane. **No projected-polygon test is used**,
+because a boundary that wraps a limb self-intersects in every axis-aligned projection while being
+perfectly simple on the surface. Calling that "self-intersection detection" would be a heuristic
+dressed as a result.
+
+What is implemented is **sound** — everything it reports is a real place where the boundary meets
+itself: a path used twice; a corner the loop arrives at more than once; and two non-adjacent paths
+that **share a point**, found by a spatial grid and then confirmed by an actual distance, so the
+grid can only make the test miss, never invent.
+
+What is **not** detected: a transversal crossing strictly *between* two sampled points of a path.
+Catching that needs each polyline point's triangle index, which `pathcache` does not store;
+resolving them would cost one BVH query per point. `regions.SELF_INTERSECTION_LIMITS` states this,
+every validation result carries it, and the operator prints it. **It is deferred work, not solved
+work.**
+
+### 11ag.6a A verdict reports what it did NOT check
+
+A `VALID` from a panel redraw and a `VALID` from **Validate Region** are not the same claim. The
+redraw restates a region from its stored properties and its paths' cache state; only the explicit
+press loads every cached polyline and runs the shared-point test above. Printing one word for both
+would let the cheaper check be read as the stronger one — the same failure mode as a stale status
+line, one level up.
+
+So the scope of a verdict is part of the verdict:
+
+* every result carries `touch_checked`, true only when the shared-point test actually ran;
+* `regions.summary_lines` ends every report with a **scope** line — the limitation text when it ran,
+  and `regions.TOUCH_NOT_RUN` alongside the limitation text when it did not;
+* the panel says *"Not checked for self-intersection — this verdict comes from a redraw"* until an
+  explicit Validate has been run against **this** region as it now stands, and states the
+  incompleteness afterwards;
+* nothing anywhere reports a boundary as *simple* or *non-self-intersecting*. A closed boundary is
+  reported as **closed**, which is what was actually established.
+
+**`validated` is derived, not remembered.** A boolean set by a button and never cleared is precisely
+the stale authoritative-looking claim this milestone exists to refuse, so `refresh_region_status`
+recomputes `state.region_fingerprint` — the ordered path references with their orientation, plus the
+verdict, geometry hash and perimeter of the same pass — and any difference clears both the flag and
+the stored report. Reordering a boundary withdraws the claim at once rather than leaving a region
+that looks validated and no longer matches what was validated. There is no hook on each edit
+operator, because a flag maintained by remembering to clear it is a flag that will eventually not be
+cleared.
+
+### 11ag.6b The draw path is read-only
+
+Blender refuses writes to ID-backed data while the interface is drawing. The
+first version of this panel called the storing `state.refresh_region_status`
+from `draw()`, which raised `Writing to ID classes in this context is not
+allowed: ... error setting BSMT_SurfaceRegion.status` and replaced the panel
+with that message in the real UI. Headless Blender never enters a genuine draw
+callback, so the whole in-Blender suite had been calling `Panel.draw()`
+directly and passing.
+
+The derivation and the record are therefore separate functions:
+
+| | writes? | who calls it |
+|---|---|---|
+| `state.validate_region` | no | the panel, every draw |
+| `state.store_region_status` | yes | `refresh_region_status` only |
+| `state.refresh_region_status` | yes | operators and invalidation paths only |
+
+Validation semantics did not change — same rules, same order, same statuses
+and reason codes. What changed is who is allowed to write the answer down.
+
+A consequence worth stating: the panel now displays the **live** verdict while
+`item.status` holds the last one an operator stored. They agree in normal use,
+because every edit, every invalidation path and Validate all store. When they
+do not, the panel shows the live verdict and **says the stored one disagrees**
+rather than resolving it by writing, which is precisely what it may not do.
+
+This is the general rule for BSMT panels and not a Surface Region special
+case: `state.readiness_snapshot`, `state.workflow_facts` and the alignment
+panel's re-measure are all pure for the same reason. A sweep of every panel in
+`panels.py` found no other draw-time write.
+
+### 11ag.7 Protocol / export — assessed, and DEFERRED
+
+Region definitions **belong** in protocol export: they are definitions, they carry no scan-specific
+coordinates, and `apply_protocol` already restores stable ids from file, which is exactly what would
+make a region's path references survive the trip. The data model is built for it — `protocol_id`,
+stable-id references and stored orientation are all present.
+
+It is deferred for this milestone anyway, for reasons that are about the format rather than the
+effort:
+
+1. `protocol.loads_protocol` returns a 3-tuple `(name, landmarks, measurements)` consumed by the
+   load operator, `state.apply_protocol` and the 53-check round-trip suite. Widening it is a
+   breaking API change across a format with a strict portability assertion.
+2. The semantics are a real design question, not a mechanical one: a region loaded onto a new scan
+   references measurements that have not been computed there, so it must arrive `NOT_READY` — and
+   the Surface Area milestone will want to add method metadata to the same record. Settling the
+   schema once, with area in view, is better than settling it twice.
+
+**Nothing was half-implemented.** The protocol format and CSV **schema v2 are untouched**, so old
+protocol files load exactly as before and exported CSVs are byte-identical in shape. There are no
+numeric region results to export in this milestone, so there is nothing missing from the CSV.
+
+### 11ag.8 Invalidation
+
+Region status is **derived**, which is what makes propagation correct by construction rather than by
+remembering to add a hook. `state.refresh_region_status` is called by the panel on every draw, by
+`invalidate_for_geometry_change` (the centralized policy, which now returns `regions_restated`), by
+`invalidate_measurements_for_landmark`, by `remove_measurement`, by `clear_measurements`, and by
+every region edit.
+
+**Nothing is rebuilt or reprojected.** A region whose paths went stale is restated as stale and its
+segments are left exactly as defined — the same rule that stops BSMT reprojecting a landmark onto
+changed geometry.
+
+A **rigid transform does not reach staleness**, matching the existing geometry-hash and metric-tensor
+policy: translating or rotating the scan cannot change a local coordinate, so the boundary stays
+valid and the helper follows by matrix.
+
+### 11ag.9 Visualization
+
+One poly curve per region, `BSMT_Region_<id>_Boundary`, built by concatenating the cached path
+polylines in loop order, reversing where a segment is used backwards, dropping the duplicated point
+at each join, and set **cyclic** when the loop closes. Not one helper per segment: a region is a
+single closed loop, and four separate curves would let three survive an edit that broke the fourth —
+a boundary on screen that no longer exists.
+
+Built entirely from `pathcache`, so showing, hiding, restyling and moving a boundary cost **zero
+solver time**. Region-specific colour is supported. Transforms are synced in the one existing pass
+(`viz.sync_transforms`).
+
+**A region BSMT cannot vouch for is drawn in a warning colour** and the operator says so. It is
+still drawn, because seeing where a broken boundary runs is how a researcher works out what to fix —
+but it must never look identical to one that is trusted.
+
+### 11ag.10 The solver constraint, measured
+
+**No region operation runs the geodesic solver.** Not validating, showing, hiding, refreshing,
+reordering, reversing, renaming, adding, removing or deleting; not the panel draw; not any
+invalidation path.
+
+This is asserted by counting constructions of `PyGeodesicAlgorithmExact` — the only door to the
+native solver — rather than by reasoning about control flow, which is what drifts. Every region
+block in the suite completes with the counter unchanged, and the counter is separately asserted
+non-zero after the fixture's paths are computed, so a suite that stopped counting would fail rather
+than pass.
+
+### 11ag.11 What is verified
+
+`tests/test_regions.py` — **116 checks**, offline, pure. The happy path and the lune; every
+structural refusal with its code; uncomputed and stale paths; that structure is judged before
+freshness; that order is authoritative and validation deterministic; orientation; the
+self-intersection test's soundness (rings 1 mm apart are **not** flagged), its detection of a real
+shared point, and that its limits are documented and carried in every result; that a verdict which
+skipped the shared-point test says so and a verdict which ran it still states the limitation, with
+neither claiming a simple boundary; and that every result names each boundary path by its two
+landmarks, including a reversed one and a reference that has gone.
+
+`tests/test_surface_region_blender.py` — **113 checks**, in Blender, on a real scan with four
+genuinely solved geodesic paths: the whole build/validate/show workflow; hide keeps the helper;
+reorder and reverse change the verdict and change it back; a rigid transform does not; re-picking a
+landmark makes it STALE and the boundary turns the warning colour; deleting a landmark or a
+measurement restates it in the same pass with the reference kept and named; a geometry change goes
+through the centralized invalidation; **deleting a region keeps every landmark, measurement and
+cached path**; save/reload preserves ids, order and orientation; an empty file loads safely; the
+panel draws; the panel states which checks a verdict ran and withdraws "validated" the moment the
+boundary is reordered; a drawn boundary is a curve helper that `state.measurement_target` never
+returns, even when it is the active object; and thirteen `NoSolver` blocks prove the counter never
+moved.
+
+`tests/test_region_panel_draw_blender.py` — **33 checks**, in Blender, on a fixture with four
+DELIBERATELY UNCOMPUTED paths so it needs no solver and runs in about three seconds. It is the
+guard for §11ag.6b and does not rely on Blender raising, because headless Blender will not: a
+snapshot of every persisted region field across a draw, a wrong-but-legal sentinel verdict that a
+re-deriving draw would silently correct, and a tripwire that replaces all three status writers with
+functions that raise, plus a check that the tripwire is itself armed. It then proves the other half
+of the contract — that Validate, add, remove, reorder, reverse and invalidation propagation all
+still change stored state — and finally draws **every** BSMT panel, asserting none mutates region
+state or constructs the solver. Reintroducing the original one-line call makes five of its checks
+fail, which is how it was verified.
+
+
+## 11ah. Milestone 3.30 — Local Defect Repair (developed at 0.28.0; shipped in v0.29.0, 2026-09-14)
+
+### 11ah.1 The gap Milestone 3.28 correctly left open
+
+`artifact.deletion_block` refuses to delete the connected component holding an inspected defect when
+that component is the **primary body**. That refusal is right and is unchanged by this milestone.
+
+It is also, on the current real scan, a dead end. The measurement copy reports:
+
+| | |
+|---|---|
+| Connected components | 25 |
+| Non-manifold edges | 1 |
+| Degenerate triangles | 0 |
+| The focused defect | 1 non-manifold edge, 2 vertices, ~0.93 mm across |
+| Its component | Component 1, ~92% of the mesh |
+
+Component 1 is the body. Deleting it is not a repair, so **Delete Artifact** blocks — and the scan is
+then left with a blocking defect and no repair at all. The local weld does not fix it (the two
+vertices are not coincident), the degenerate repair does not apply (there are no degenerate
+triangles), and `Repair Local Defects` plans against `repair.classify_region`, which reports this
+shape as a fan or refuses it.
+
+This milestone adds the second strategy: remove a handful of **faces** from *inside* a component.
+
+### 11ah.2 Three repairs, three topologies
+
+The distinction is the whole design, and it is now documented in `localrepair.py`'s own module
+docstring, in `README.md` and here:
+
+| Repair | Acts on | Removes | Refused when |
+|---|---|---|---|
+| **Weld Non-Manifold Region** | coincident / near-coincident **vertices** at the non-manifold edges | nothing — it merges | it does not reduce the non-manifold count |
+| **Delete Artifact** | a whole detached **component** | everything in it | the component is the primary body, the only one, or ties for largest |
+| **Remove Local Artifact Faces** | a few **faces** inside a component, including the body | exactly the approved candidate | the local topology is ambiguous |
+
+None is a global cleanup. None runs without a press.
+
+### 11ah.3 What is NOT decided here
+
+**BSMT does not determine anatomical relevance.** That was true of component deletion (§11af.2) and
+it is true here. Nothing in `localrepair.py` infers that geometry is unwanted; what it answers is a
+purely topological question, and when the topology does not answer it, the module refuses.
+
+> **A false refusal is acceptable. A false-positive destructive repair is not.**
+
+The two failure modes are not symmetric: a refusal costs a researcher a manual edit in Blender's own
+mesh tools; a false positive silently deletes anatomy from a research measurement and produces a
+confidently wrong number downstream.
+
+### 11ah.4 The structural test: the defect as a wall
+
+Given the focused defect's own non-manifold edges:
+
+1. resolve the **incident faces** of each defect edge (numpy, by edge code — never
+   `repair.edge_incidence`, whose python dict costs ~3 s on a 350,000-triangle scan);
+2. walk the surface outward from those faces over face adjacency, with **the defect edges removed
+   from the adjacency graph**. Two faces that meet only across a defect edge are not neighbours;
+3. each connected group that comes back is a **local branch**.
+
+A branch is explored to at most `LOCAL_EXPLORE_FACES` faces. One that reaches the cap is marked
+**unbounded**: the walk stopped, the surface did not.
+
+A removal is offered when, and only when:
+
+- there is **exactly one** bounded candidate branch, and
+- it stands against a continuation — either an unbounded branch, or a bounded branch at least
+  `DOMINANCE_RATIO`× its size.
+
+### 11ah.5 Two continuations are one body — the bug that mattered
+
+The first working version required exactly two branches and refused when both were unbounded. On
+test fixtures that passed. On a body scan it refuses **everything**, and the reason is structural:
+the two faces on either side of a defect edge reconnect only by going right round the torso,
+thousands of faces away — far past any bounded walk. So a bounded walk seeded from both sides
+*necessarily* returns two unbounded branches for a perfectly ordinary flap.
+
+Caught by `tests/test_localrepair.py` on a 24×24 grid, where the same fixture classified as
+`SMALL_DANGLING_FLAP` at n=12 and n=40 but `AMBIGUOUS` at n=24 — the size at which the reconnection
+path is just longer than the cap.
+
+The fix is to pool every capped branch as one continuation: *the surface keeps going*, which is the
+only thing a bounded local inspection can honestly say about it. What remains a candidate is the
+branches that **closed**.
+
+### 11ah.6 The classifications
+
+| Code | Meaning | Removal |
+|---|---|---|
+| `SMALL_DANGLING_FLAP` | one small closed branch, and at least one of its vertices is used by nothing else — it genuinely hangs off | offered |
+| `SMALL_LOCAL_BRANCH` | one small closed branch sharing every vertex with the surviving surface — a redundant patch lying over it | offered |
+| `LOCAL_DUPLICATE_FACE` | the incident faces repeat a triangle | **delegated** to *Remove Duplicate Faces* |
+| `AMBIGUOUS` | anything else, with the reason stated | refused |
+| `UNSUPPORTED` | the defect has no non-manifold edges, or no face uses them any more | refused |
+
+Every refusal path is exercised by a fixture in `tests/test_localrepair.py`, and one test asserts
+over all of them at once that `removable` is never set.
+
+### 11ah.7 Refusal conditions, in the order they are asked
+
+1. **duplicated faces** among the incident faces → delegated (§11ah.8), never removed here;
+2. fewer than two branches → the defect is woven into the surface, not hanging off it;
+3. more than one candidate branch → *"the non-manifold edge(s) separate the local surface into N
+   branches, leaving K candidate branches …"*;
+4. every branch unbounded → nothing local to remove;
+5. the candidate is not dominated → *"two similarly sized local surface branches (X and Y faces); no
+   safe automatic deletion candidate could be identified"*;
+6. candidate above `MAX_CANDIDATE_FACES` → cap named as a **software safety cap**;
+7. candidate wider than `repair.region_diagonal_limit(mean_edge_mm)` → the same adaptive limit the
+   existing local repair already uses, reused rather than reinvented;
+8. **predicted** removal does not strictly reduce the non-manifold count;
+9. **predicted** removal introduces a non-manifold edge anywhere, or a degenerate triangle;
+10. predicted removal leaves no triangles.
+
+Steps 8–10 are predictions made on the canonical arrays before anything is edited, so the panel
+states the outcome it claims and a candidate that would not help is refused rather than attempted
+and rolled back.
+
+### 11ah.8 Duplicate faces are delegated, never reimplemented
+
+`repair.duplicate_faces` keys a face by its **sorted** vertex triple, so an exactly repeated face and
+a reversed-winding copy are the same case to it, and `BSMT_OT_remove_duplicate_faces` already removes
+exactly the repeated copy inside the same transaction. Growing a second implementation here would be
+two code paths that must agree about which copy to keep.
+
+So the inspection *classifies* the case and the panel points at the existing button. This is the
+architecture sect. 12 of the brief asked for: one implementation, one place it lives.
+
+### 11ah.9 The caps are software caps, and they are on screen
+
+| Constant | Value | What it is |
+|---|---|---|
+| `LOCAL_EXPLORE_FACES` | 512 | how far the walk runs before calling a branch a continuation |
+| `MAX_CANDIDATE_FACES` | 64 | backstop: a walk bug cannot become a large deletion |
+| `DOMINANCE_RATIO` | 8 | the body branch must be this many times the candidate |
+| `repair.region_diagonal_limit` | max(20 mm, 6 × mean edge) | existing adaptive local-artefact extent |
+
+**None of these is an anatomical criterion**, and none of them is the test. The structural branch
+separation decides; the caps bound the damage a defect in *this code* could do. They are printed in
+the inspection report and in the confirmation dialog, under the heading *"Safety caps (software, not
+anatomical)"*, and `DOMINANCE_RATIO`, `MAX_CANDIDATE_FACES` and `LOCAL_EXPLORE_FACES` are arguments
+to `classify_local_defect` so a later revision is a one-line change with a test that already varies
+them.
+
+### 11ah.10 Preview
+
+**Preview Candidate Faces** draws **only the candidate faces**, from their own vertices at their own
+positions, in `REPAIR_LOCAL_CANDIDATE_COLOR` — deliberately not the component colour, because
+confusing *"these three triangles go"* with *"this whole fragment goes"* is the one misreading the
+preview exists to prevent. It reuses `visualization.show_repair_surface`, so it is a BSMT helper:
+tagged, in `BSMT_Helpers`, not selectable, and therefore invisible to the canonical mesh build and
+to topology diagnostics (§18).
+
+The preview reads the current canonical mesh, edits nothing, runs no solver, is removed by *Clear
+Highlight*, and is refused outright when the geometry hash no longer matches the inspection.
+
+### 11ah.11 Transactional execution
+
+`BSMT_OT_remove_local_faces` subclasses the existing `_RepairBase` — no parallel rollback mechanism.
+Before the edit, inside the transaction, against the canonical mesh the wrapper has just rebuilt:
+
+- `_lists_match_mesh` — the analysis on screen is of *this* object and *this* geometry hash;
+- `_local_inspection_is_current` — the inspection is of this geometry hash **and** this defect id;
+- `_focused_defect_region` — the defect is still at the position that analysis recorded for it;
+- `classify_local_defect` is run **again**, and its answer, not the stored one, is what acts.
+
+Faces are then addressed by **vertex set** through `meshrepair.remove_faces_by_vertex_sets`, never by
+polygon index: a canonical triangle is a loop triangle, and on a mesh that still carries quads it is
+not polygon *i* (§7.7). A candidate face that is half a quad has no polygon with that vertex set, so
+the count check refuses instead of removing something else.
+
+### 11ah.12 Acceptance, and the locality proof
+
+`repair.accept_repair(..., require_nonmanifold_decrease=True)` is asked first and in full. The
+`verify` hook can only ever **add** reasons to revert:
+
+- `localrepair.extra_removal_reasons` — no new degenerate triangle; the non-manifold count did not
+  rise; exactly the approved faces went; exactly the vertices they stranded went;
+- `localrepair.locality_reasons` — §11ah.13;
+- `localrepair.defect_resolved_reasons` — the focused defect's own edges are gone, by **midpoint
+  position**;
+- `localrepair.introduced_reasons` — no non-manifold edge exists anywhere that was not there before.
+
+Deliberately **not** required: `connected_components == 1`, and a cap on new boundary edges.
+Removing a flap exposes the boundary the flap was covering; a boundary edge is warning-only under the
+current policy, so the increase is *reported* in the report and the dialog rather than refused.
+
+### 11ah.13 Geometry-locality verification
+
+The locality claim is measured, not asserted. `localrepair.face_position_signature` keys every
+triangle by the **quantised positions of its three corners**, corners sorted (so a reversed winding
+is the same surface) and rows sorted (so face order is not part of the identity). The check is then
+one array comparison:
+
+> the surface after the edit == the surface before it, minus the approved candidate, exactly.
+
+Index-free on purpose. Deleting faces renumbers every vertex and polygon in the mesh, so an
+index-based before/after comparison reports the whole mesh as changed and proves nothing. This
+follows the philosophy of `tests/test_repair_locality_blender.py`, which separates *invalidation
+policy* (global, conservative) from *geometric locality* (the surface itself changed only where it
+was supposed to).
+
+Positions come from `vertices_local`, not `vertices_solver`: solver space is centred on the mesh's
+own bounding box, so deleting a flap sitting at an extreme of that box would shift every coordinate
+in the array and make an unchanged mesh look entirely changed. For the same reason the non-manifold
+midpoint signatures are taken on `vertices_solver + center_mm`.
+
+`tests/test_localrepair.py` asserts the proof can **fail**: a moved vertex outside the candidate, one
+face too many deleted, and one approved face left behind are each caught.
+
+### 11ah.14 Invalidation and index stability
+
+On success, in order: the highlights are cleared **first** (they were built from indices of a mesh
+that no longer exists), then `state.invalidate_for_geometry_change` — the same central path
+component deletion uses — restates landmarks, invalidates measurements and cached paths, clears the
+A/B result and restates Surface Regions. Nothing is re-projected and nothing is silently kept VALID.
+
+The stored inspection is a **display cache with no authority**. It is cleared by
+`state.clear_local_repair` on a successful repair, on `Analyze Mesh`, and on stepping to another
+defect — which also removes the candidate highlight, because a violet patch drawn where deleted faces
+used to be is a dangling reference a researcher can see.
+
+### 11ah.15 No solver
+
+Nothing on this path calls pygeodesic. `localrepair.py` imports `numpy` and `repair` and nothing
+else; the scope test tokenises the module and asserts it against the **executable** source, so the
+module is free to document what it does not do without failing its own test.
+
+### 11ah.16 Tests
+
+`tests/test_localrepair.py` — **136 checks**, pure numpy:
+
+- the supported cases: a one-face flap, a four-face flap taken as one branch, a patch that strands
+  no vertex classified as a branch rather than a flap;
+- every refusal: two comparable branches, three branches, the dominance ratio (asserted both ways —
+  the same fixture is accepted at a lower ratio, proving the refusal came from *that* rule), the
+  face cap, the millimetre cap, and a defect with no edges;
+- duplicates, exact and reversed, and that `repair.duplicate_faces` finds the same face;
+- the branch walk: the defect is a wall, the walk is bounded, the incidence is right;
+- the prediction, including that a no-op removal would be refused;
+- the locality proof, in both directions;
+- acceptance, including that it is only ever **stricter** than `repair.accept_repair`;
+- the report and dialog text;
+- scope: no bpy, no bmesh, no solver, no weld, no remesh.
+
+`tests/test_local_face_repair_blender.py` — **117 checks**, in Blender, on a 1.7 m body-scale
+rotated, translated, triangulated measurement copy whose defect is a flap on the body itself:
+
+- the real case end to end, including that Delete Artifact still blocks beside it;
+- the preview holds exactly the candidate faces, edits nothing, moves nothing, and is invisible to
+  the diagnostics;
+- the removal takes one triangle and one vertex, non-manifold 1 → 0, and every surviving triangle is
+  bit-identical — with the removed face derived from the two *surfaces*, not from the operator's own
+  account of itself;
+- the source scan is untouched;
+- a multi-face flap goes as one branch;
+- ambiguous topology draws no button and refuses a scripted call;
+- duplicates are delegated and the existing repair still fixes them;
+- a stale candidate is refused, and stepping or re-analysing drops the inspection;
+- four injected failures roll back: an over-reaching deletion, an emptied mesh, moved unrelated
+  geometry, and a manufactured degenerate triangle;
+- invalidation restates a landmark through the central path;
+- and Weld Non-Manifold Region, Delete Artifact and Remove Duplicate Faces all still behave exactly
+  as before.
+
+### 11ah.17 Limitations
+
+- **Only one candidate branch.** A defect separating two removable flaps is refused, even when both
+  are obviously artefacts. Deliberate: "two candidates" is where guessing starts.
+- **Edge-type defects only.** A bow-tie *vertex* with no non-manifold edge does not appear in the
+  defect list at all, here or anywhere else in BSMT.
+- **One defect per press.** There is no batch mode, by design.
+- **A quad mesh limits the candidate.** A candidate triangle that is half a quad has no polygon to
+  address, and the operation refuses with a message naming triangulation as the fix.
+- **The caps are unvalidated against a corpus.** They are conservative software bounds chosen to be
+  safe, reported in the UI, and easy to revise; they are not derived from a study of scan defects.
+
+
+## 11ai. Milestone 3.31 — Surface Region, defined by landmarks (shipped in v0.29.0, 2026-09-15)
+
+### 11ai.1 Why 11ag was replaced rather than extended
+
+Milestone 3.29 (§11ag) modelled a Surface Region as an ordered list of **measurement path references**,
+each carrying a stored orientation. Every rule in it was correct. The workflow it forced was not:
+
+    Landmark → Measurement definition → compute measurement surface path
+             → Surface Region → add measurement path → reorder → reverse → validate
+
+Defining a five-sided region meant five measurements, five solves, five path references added in the
+right order, and five orientations set by hand. The failure is not a missing feature; it is that the
+wrong object was made authoritative.
+
+A measurement and a region answer different questions. A measurement asks *how far is it from A to B*.
+A region asks *what closed boundary do these landmarks describe*. They may share a solver; making one
+the data model of the other coupled two things that have different lifetimes, different dependencies
+and different owners.
+
+### 11ai.2 The model
+
+**The authoritative definition is the ordered landmark ids.** Everything else a region holds is
+derived from them and can be discarded and recomputed.
+
+```
+BSMT_SurfaceRegion
+    stable_id, protocol_id, name, notes
+    landmarks[]          BSMT_RegionLandmark   AUTHORITATIVE, ordered
+    landmark_index       UI selection only
+    landmark_picker      write-only enum, never read back
+    segments[]           BSMT_RegionSegment    CACHED RESULT
+    cached_definition    the definition key `segments` were computed for
+    status / status_code / status_detail / report
+    validated / validated_fingerprint
+    boundary_* (display) , show_boundary, color
+
+BSMT_RegionLandmark                 BSMT_RegionSegment
+    landmark_stable_id  AUTHORITATIVE   from_landmark / to_landmark
+    landmark_protocol_id / _name        computed, point_count, length_mm,
+      cached, diagnostics only            distance_mm, mode, elapsed_s
+                                        object_name, geometry_hash,
+                                          metric_tensor, metric_key, unit
+                                        from_triangle / from_bary
+                                        to_triangle / to_bary, component_id
+```
+
+Stable ids throughout. No list index, no dynamic enum value and no triangle index is authoritative
+anywhere — the enum-remap hazard recorded in `measurements.py` applies identically here, so
+`landmark_picker` is write-only and its update callback is the only place it is consumed.
+
+**`segment_pairs` is the whole rule**: n landmarks imply n segments, and the last closes Ln back to
+L1. The closing pair is implicit and mandatory, which means there is no way to express an open
+boundary and nothing to validate about one. Orientation is not stored because it is not a degree of
+freedom: the order the researcher typed IS the orientation.
+
+### 11ai.3 Definition vs. cache
+
+`cached_definition` is `regions.definition_key(landmark_ids)` recorded at compute time. Validation
+compares it to the live definition with one string compare, and that single field is what makes
+every edit produce STALE rather than a boundary quietly belonging to a different loop. A rotated or
+reversed definition gives a different key on purpose: the same loop walked the other way is the same
+curve, but the segments cached for it are not the same segments.
+
+The order of the rules is deliberate — **the definition is judged before the cache**. A degenerate
+landmark list is told it is degenerate, not told its boundary is stale, because recomputing would
+produce the same degenerate loop.
+
+The key is compared **before** completeness, too. Adding a landmark leaves n+1 pairs against n cached
+segments; reporting that as "not computed" would hide a perfectly good boundary for the previous
+definition and tell the researcher they had never computed anything.
+
+### 11ai.4 Compute Boundary, and the solver
+
+One operator reaches the solver: `bsmt.compute_region_boundary`. It is the fourth entry point past
+the preflight gate, and `tests/test_import.py` asserts the count rather than mere membership, so a
+fifth cannot appear without that test being updated deliberately.
+
+**Transactional at the region level.** Every segment is solved into memory first; nothing is written
+until all have succeeded. The policy on failure is stated once, in `_failed`: nothing is written, the
+previous cache is left exactly as it was, and the failing segment is named. A region cannot emerge
+from a failed compute VALID, and can never hold a boundary that is part fresh and part stale — a
+drawing that looks authoritative while describing two different definitions.
+
+Refused **before** the solver is constructed: fewer than three landmarks, a repeat, a landmark that
+has gone or was never picked, two on different components, a legacy definition, a blocked preflight,
+landmarks spread across two meshes. A geometry hash change detected after the loop also refuses.
+
+Boundary polylines live in `pathcache` under `BSMT_RegionPath_<region>_<position>` — the same storage
+mechanics as a measurement path, a deliberately separate name space and lifetime. `keep_only_regions`
+drops orphans when a definition shrinks, so a six-landmark boundary's segments 5 and 6 cannot be
+picked up by a later six-landmark definition.
+
+### 11ai.5 The dependency graph, and the decoupling
+
+```
+geometry → landmarks → region boundary cache → [future] interior → area
+```
+
+Measurements are **not** in it. `remove_measurement` and `clear_measurements` no longer restate
+regions — under the old model those calls existed because a region referenced measurement paths;
+they would now be coupling with nothing behind it. `invalidate_regions_for_landmark` restates
+regions on the landmark event directly, rather than only when some measurement happened to share it.
+
+§G of `tests/test_surface_region_blender.py` is the proof, and it is deliberately blunt: a computed
+VALID region, then a measurement edited, then deleted, then every measurement cleared — the region's
+status, definition, perimeter and cache unchanged throughout.
+
+### 11ai.6 Migration: refused by name
+
+0.28.0 was never released, so no supported file carries the old model. A dev file that does leaves a
+detectable signature: segments present, landmarks empty, because Blender drops the removed
+properties on load. That is reported `INVALID / LEGACY_DEFINITION` with an instruction to define the
+boundary again.
+
+**It is not migrated.** Turning ordered measurement references into ordered landmark ids requires
+guessing which end of each path was meant to come first, and a guess there silently produces a
+different boundary than the one the researcher defined. Refusing by name is the only answer that
+cannot be wrong.
+
+### 11ai.7 Minimum three landmarks — and the expressiveness this costs
+
+Two landmarks give A→B and B→A: the same geodesic walked both ways, enclosing nothing. So the minimum
+is three.
+
+The old model allowed two, because two *different* paths between one pair — round the front of an arm
+and round the back — do bound a lune. A landmark pair cannot express that. **This is the one place
+the new model is less expressive than the one it replaces**, and it is recorded here rather than
+glossed over. Expressing a lune again would need a per-segment route hint, which is a real design
+question and not one this milestone answers.
+
+### 11ai.8 A bug the decoupling exposed
+
+`viz.sync_transforms` returned early when a file held no measurements. Under the old model that was
+unreachable — a region was built from measurements, so there were always some. With regions
+decoupled it would have stranded every boundary helper at the scan's old transform in a
+measurement-free file. Fixed by making the measurement loop optional and the region sync
+unconditional.
+
+### 11ai.9 What is verified
+
+`tests/test_regions.py` — **102 checks**, offline, pure. The order-defines-the-segments rule including
+the implicit closing pair; the definition key telling reordered and rotated loops apart; every
+definition refusal with its code; that the definition is judged before the cache; every way a cache
+stops matching; the legacy refusal; the self-intersection test's soundness and its documented limits.
+
+`tests/test_surface_region_blender.py` — **103 checks**, in Blender on a real sphere with real solves:
+the whole define/compute/show workflow with **no measurements in the file at all**; that Compute
+Boundary is the only thing that solves and that it produces exactly n segments with the last closing
+Ln→L1; that no measurement or measurement path cache is created behind the scenes; rigid-transform
+invariance; every definition edit producing STALE with the cache kept; **§G, the measurement
+decoupling**; landmark re-pick and deletion; centralized geometry invalidation; deletion keeping
+landmarks and scan; save/reload including the cached polylines; an empty file; the legacy refusal;
+and eleven `NoSolver` blocks.
+
+`tests/test_region_panel_draw_blender.py` — **33 checks**. Unchanged in purpose from §J.4b: the panel
+draw writes nothing, now snapshotting the ordered landmark definition entry by entry as well.
+
+
 ## 12. Open items requiring decisions
 
 1. ~~**Degenerate triangles block the readiness verdict but only warn the solver gate.**~~
@@ -5207,3 +6149,723 @@ been performed is wrong and must be rejected.
 A useful consequence: alignment can be applied, changed or reset at any point
 in the workflow, before or after landmark picking, without invalidating
 anything already measured.
+
+
+## 11aj. Milestone 3.32 — Surface Interior, Fill and Thickness Preview (shipped in v0.29.0, 2026-09-15)
+
+### 11aj.1 What this milestone answers, and what it does not
+
+§11ai established a **closed boundary**. A boundary raises exactly one question — *which side of it is
+the region* — and that question has to be answered before any area can mean anything.
+
+    ordered landmarks → cached closed boundary → SURFACE INTERIOR
+                      → region fill → THICKNESS PREVIEW → Surface Area [later]
+
+**Surface Interior**: the selected mesh-surface side bounded by a computed Surface Region boundary.
+**Thickness Preview**: a visualization generated by offsetting the selected surface-region
+representation along mesh-surface normals; intended for geometric visualization, and not a physical
+simulation or manufacturing model.
+
+**No area is calculated.** No face-area summation is presented as a result, no coverage percentage,
+no centroid, no mesh cutting, no remeshing. The `area_total` the analysis carries internally is named
+a TRIANGLE-AREA TOTAL in the code and is documented there as not being the region's surface area; no
+panel displays it.
+
+### 11aj.2 The property the whole approach rests on
+
+An exact geodesic on a polyhedral surface is piecewise straight, and its breakpoints lie **on
+triangle edges**. This was not assumed — it was measured on a real computed BSMT boundary before a
+line of the algorithm was written:
+
+| | |
+|---|---|
+| interior boundary points tested | 20 |
+| points found on a mesh edge | 20 |
+| worst distance to the nearest edge | 3.9e-06 (bbox diagonal 346) |
+| relative | ~1e-8 |
+
+So a cached boundary is an exact sequence of **edge crossings**, and between two consecutive
+crossings it is a straight chord across exactly one triangle. That turns "which side is the region"
+into a graph problem with an exact barrier, and it is what makes exact clipping possible rather than
+approximate.
+
+**No per-point triangle identity had to be added to the cache.** Locating each point against the mesh
+at Compute Interior time is enough, costs one pass, and avoids changing the solver or the cache
+format. A boundary point that cannot be placed on the mesh is a refusal (`BOUNDARY_OFF_SURFACE`),
+not something to work around.
+
+### 11aj.3 Representation
+
+Per crossed triangle, the boundary contributes one or more **traversals** — a polyline entering on one
+edge and leaving on another, with interior bends where a boundary corner (a landmark, which sits
+inside a triangle) falls in it. Each traversal cuts the triangle; several cuts are applied in turn,
+each to whichever piece contains it.
+
+| Classification | Representation |
+|---|---|
+| wholly inside | the triangle index |
+| wholly outside | the triangle index |
+| **cut** | the clipped polygon, in mesh coordinates **and** in barycentric coordinates, plus its area |
+
+Adjacency is decided by **edge-interval overlap**, not combinatorially: an edge crossed twice has
+three portions, and any rule of the form "which piece holds vertex u" mis-links the middle one.
+
+**The pieces must tile the triangle**, and that is asserted per triangle inside `compute` rather than
+left to a test — every downstream number inherits it and nothing else re-checks it. Worst measured
+error **3.6e-07** of a triangle's own area, which is the float32 precision the cached boundary is
+stored at (`TILING_TOLERANCE`, documented in the source as a precision bound and not a slack
+allowance).
+
+### 11aj.4 Two sides, and the refusal to name one "inside"
+
+Both sides are computed from one analysis, seeded from the two pieces of one cut triangle. `SMALLER`
+and `COMPLEMENT`, by triangle-area total. The smaller is the DEFAULT because it is usually the patch
+someone outlining a region meant; the enum description says in so many words that this is not a claim
+that it is anatomically inside.
+
+Because one analysis yields both, switching sides is a re-run of pure topology — no boundary
+recomputation and no solver — which is what makes offering the choice affordable.
+
+### 11aj.5 Open surfaces, and what is refused
+
+BSMT tolerates boundary edges and multiple components as warnings, so the interior may not assume a
+watertight mesh.
+
+| Case | Behaviour |
+|---|---|
+| closed connected component | both sides found; normal |
+| component with boundary edges, loop still separates | both sides found; normal (the planar-patch fixture is exactly this) |
+| component with boundary edges, loop does NOT separate | **refused**, `INTERIOR_UNDETERMINED_OPEN_SURFACE` |
+| loop non-separating on a closed surface (a torus handle) | **refused**, `INTERIOR_NOT_SEPARATED` |
+| boundary spans components | **refused**, `CROSS_COMPONENT` |
+| boundary not on this mesh | **refused**, `BOUNDARY_OFF_SURFACE` |
+| boundary crosses itself | **refused**, `SELF_INTERSECTION_DETECTED` |
+
+The region is confined to its own component: a second component in the file is in neither side.
+
+### 11aj.6 An ADDITIONAL triangle-local self-intersection check
+
+§11ag.6 records that the boundary's shared-point test is sound but incomplete: it cannot see a
+crossing that happens strictly *between* two sampled boundary points. Inside a single triangle the
+boundary is straight between samples, so there that crossing is an ordinary segment-segment
+intersection — and `interior.crossing_chords` detects it.
+
+**This is an additional, triangle-local capability, and it is nothing more than that.** BSMT does not
+claim complete or general on-surface self-intersection detection, and §11ag.6's limitation stands
+unchanged. What can now be said is narrower and true: a self-crossing that happens *within one
+triangle* is caught when the interior is computed.
+
+This was found in practice, not in theory: four arbitrary landmarks on a sphere produce a
+self-crossing loop often enough that the first fixture used for the Blender suite had one.
+
+### 11aj.7 Fill: the analysis, drawn
+
+`BSMT_Region_<id>_Fill` carries **one face per classified piece** — whole triangles as triangles,
+clipped pieces as the polygons they actually are. That mesh *is* the representation a later area
+milestone sums. Vertices are duplicated per face deliberately, so two pieces of one triangle stay
+apart.
+
+A fill that looked right while the analysis said something else would be the most convincing wrong
+answer this tool could produce, so there is no separate display geometry to diverge.
+
+Semi-transparent by default (0.30). An interior that is not current is drawn in the warning colour
+and the operator says so.
+
+### 11aj.8 Thickness Preview
+
+Built from the **fill**, which is the classified interior — not from a fresh analysis. That is what
+makes "changing the thickness recomputes nothing" true by construction rather than by promise.
+
+1. weld the fill's per-face vertices by position (tolerance-based: two clipped pieces meet at a point
+   each computed independently, so they agree to float precision and not to the bit);
+2. area-weighted vertex normals;
+3. offset by `thickness × direction`;
+4. border loops = edges used by exactly one face — which on the interior patch are the **clipped**
+   edges, so the side wall is continuous across a cut triangle for the same reason the patch is;
+5. base (reversed winding) + outer + a quad per border edge.
+
+The regression asserts the result is **closed** — every edge used exactly twice — with 128 clipped
+triangles on its border.
+
+**Outward is determined from the signed volume** of the closed component, not assumed from the
+winding: outward is a property of a solid. On an open component there is no solid, nothing defines
+which side is out, and the preview is **refused** — extruding into the body would look entirely
+plausible and be exactly backwards.
+
+**Limitations, stated in `panelpreview.LIMITS` and printed by the operator every run.** The
+perpendicular gap is exactly the thickness; the *shape* is not. On a curved body the outer surface
+stretches over convex areas, compresses over concave ones, and folds through itself where the
+thickness exceeds the local radius of curvature. The material a real panel would need is not uniform.
+`fold_risk` reports faces whose offset copy has flipped — a warning, explicitly not a guarantee that
+an unreported preview is locally right.
+
+Thickness is validated, never clamped: zero, negative, non-finite or outside 0.01–500 mm is refused
+with a reason.
+
+### 11aj.9 Dependency chain and solver behaviour
+
+    geometry → landmarks → boundary → interior → thickness preview
+
+Landmark or order change → boundary stale → interior stale → preview invalid. Geometry change → the
+same, through the existing centralized invalidation. Thickness change → preview geometry only.
+Colour and opacity → drawing only. **Nothing is ever recomputed automatically.**
+
+`bsmt.compute_region_boundary` remains the ONLY route to pygeodesic. Compute Interior is topology and
+geometry analysis on a mesh BSMT already has.
+
+### 11aj.10 What is verified, and what is not
+
+`tests/test_interior.py` — **64 checks**, offline and pure: exact tiling per triangle and in
+aggregate; barycentric and world descriptions agreeing; the planar patch enclosing exactly 9.000000
+of a 36.000000 mesh; a closed sphere's two sides summing to the whole; both sides returned from one
+analysis; the non-separating torus loop, the off-surface boundary and the crossing detector, each
+refused or detected by name; component confinement; that nothing is modified and no area is claimed.
+
+`tests/test_surface_interior_blender.py` — **62 checks** on a real computed geodesic boundary: the
+two sides summing to the mesh's own area; the fill being one face per classified piece with clipped
+pieces drawn as polygons; side switching without a solver; rigid-transform invariance; staleness
+propagating from the boundary; deletion taking only what it should; and the self-intersection refusal
+reaching the researcher as the reason it actually was.
+
+`tests/test_thickness_preview_blender.py` — **69 checks**: 10 mm and 30 mm offsets to float32; outward
+confirmed radially on a sphere; **the shell closed with 128 clipped triangles on its border**;
+thickness, colour and opacity leaving the interior and boundary field-for-field unchanged; invalid
+thicknesses refused rather than clamped; the open-surface orientation refusal checked directly rather
+than inferred; helper tagging and transform following.
+
+**All fixtures are synthetic** — planar grids, a closed sphere, a torus, a two-component patch.
+**Nothing in this milestone has been validated against a real human scan.** The thickness preview in
+particular will behave worst exactly where a body is most curved, which is where a researcher is most
+likely to want it.
+
+
+## 11ak. Milestone 3.33 — Surface Area (shipped in v0.29.0, 2026-09-15)
+
+### 11ak.1 What the number is called, and what it is not
+
+**The mesh surface area of the selected region on the triangular body mesh.**
+
+Not the true anatomical surface area, not the actual human surface area, not an exact smooth-body
+area. A triangulation is a chord approximation of a curved surface, so its area reads systematically
+a little under the smooth surface it was sampled from. That is a property of the mesh, not an error
+in the sum, and it is the same wording §0.3 of `docs/VALIDATION.md` already uses for distances.
+
+    A_region = Σ area(whole interior triangles) + Σ area(exactly-clipped boundary polygons)
+
+### 11ak.2 It consumes the interior, and nothing else
+
+Surface Area does **not** decide which side is the region, choose a seed, flood fill, clip anything,
+reinterpret a side, or re-run self-intersection detection. If the interior is missing, stale or
+invalid, there is no area. That is a refusal, not a reason to derive one.
+
+The representation it consumes is the one the fill is drawn from and the one the thickness preview's
+base is built from. There is no second copy that can drift.
+
+### 11ak.3 The units problem, and the barycentric answer
+
+`interior.compute` is called with `canonical.vertices_local` — the scan's OBJECT-LOCAL space. Every
+area it carries internally is therefore in local units squared, **not mm²**, and not convertible by a
+single scale factor when an object carries a non-uniform scale.
+
+The stored form solves this rather than working around it. Each clipped piece is kept as
+**barycentric coordinates in its parent triangle**, so the polygon is rebuilt against that triangle's
+corners in whatever space is wanted:
+
+| | source of geometry | result |
+|---|---|---|
+| whole triangle | `canonical.vertices_solver[triangles[i]]` | mm², directly |
+| clipped piece | `bary @ vertices_solver[triangles[parent]]` | mm², directly |
+
+`vertices_solver` is BSMT's "physical millimetres, centred" array. No projection, no rescaling of an
+already-computed number, and every piece stays tied to the surface it came from.
+
+Polygon area is the Newell sum — cross products accumulated, norm taken **once**, which keeps the
+measurement in the polygon's own plane. Projecting to a global axis pair would make the answer depend
+on how the scan happens to be oriented.
+
+### 11ak.4 New: the classification is persisted in float64
+
+Before this milestone the only survivor of Compute Interior was the fill helper mesh. That is enough
+to DRAW and not enough to MEASURE, for two reasons:
+
+* Blender mesh vertices are **float32**, so an area summed from them inherits about seven digits —
+  and the per-triangle tiling the analysis guarantees to 3.6e-07 would be checked against numbers
+  coarser than the guarantee;
+* the fill carries no link back to a clipped piece's **parent triangle**, so "is this piece at most
+  as big as the triangle it came from" could not be asked at all — and that is the check that catches
+  a clipping error which happens to look plausible.
+
+`interiorcache` therefore stores the classification itself, in a Mesh datablock with a fake user (the
+`pathcache` mechanism and the same reasoning), with the payload in custom properties because mesh
+vertices are the very thing being avoided:
+
+    full      int64   wholly-interior triangle indices
+    parents   int64   parent triangle of each cut piece
+    counts    int64   corners in each cut piece
+    bary      float64 barycentric corners, in order
+
+### 11ak.5 Two-side consistency — the strongest check available
+
+The selected side plus its complement must equal the surface component's own area. Nothing that is
+wrong near the boundary can satisfy it: whatever one side gains, the other must lose.
+
+| Fixture | Agreement |
+|---|---|
+| planar patch, offline | exact — 9.000000 + 27.000000 = 36.000000 of 36.000000 |
+| closed sphere, offline float64 | < 1e-09 relative |
+| sphere through the real operators | **3.3e-09** relative |
+| read back from stored properties | ~1e-07 — float32 property storage, not the arithmetic |
+
+Per cut triangle, the two sides' pieces tile it to **1e-12** relative offline. Every triangle is on
+exactly one side or is cut, and the three sets together are the whole mesh.
+
+### 11ak.6 Precision, stated by source
+
+| Stage | Precision | Why |
+|---|---|---|
+| clipped geometry, stored | **float64** | `interiorcache`, barycentric |
+| area accumulation | **float64** | numpy, throughout |
+| area as stored on the region | **float32** | a Blender `FloatProperty` is single precision |
+| piece-bounds tolerance | `1e-5` relative | matched to `interior.TILING_TOLERANCE`, which is what the clipping itself is guaranteed to; tighter would fail on correct geometry, looser would catch nothing the guarantee does not already permit |
+
+float32 storage is about seven significant digits — roughly 0.004 mm² on a 400 cm² region. That is
+far finer than the mesh's own fidelity to a body and finer than the displayed resolution, and it is
+why the two-side sum reads ~1e-07 from properties while the same sum in float64 reads 3.3e-09.
+
+### 11ak.7 Refusals
+
+A clipped piece that is negative, or larger than its parent triangle beyond tolerance, means the
+clipping produced a plausible wrong number: `AREA_PIECE_OUT_OF_BOUNDS`, with the triangle named. An
+empty or non-finite selection is `AREA_DEGENERATE` — refused, never reported as 0 mm².
+
+### 11ak.8 Explicit, and stale when anything under it moves
+
+    geometry → landmarks → boundary → interior → AREA
+
+*Compute Area* is its own press. Nothing computes an area during Compute Boundary, Compute Interior,
+a panel draw, Show Fill, Show Preview, a thickness change, a side switch, or a save/load.
+
+**Must not move it, and do not:** thickness, fill colour, fill opacity, preview colour, preview
+rebuilds, and adding, editing, deleting or clearing measurements. Asserted field by field.
+
+**A stale area is never shown as a number.** The panel had been echoing `area_detail` — which holds
+the result sentence, and therefore the figure — under a "stale" heading. It now shows the reason code
+instead. A number on screen is read as a result whatever label sits above it.
+
+### 11ak.9 Export and protocol
+
+**CSV: deferred.** Schema v2 is per-measurement rows with a fixed column tuple; region-area rows
+would either mutate those row semantics or require a new export surface with its own schema, tests
+and packaging. Deferred and documented, exactly as protocol integration for regions already is
+(§11ag.7). **Schema v2 is untouched**, asserted by test.
+
+**Protocol: excluded by design.** A reusable region definition is ordered landmark identities; an
+area is scan-specific derived data. `protocol.py` contains no occurrence of "area", asserted by test.
+
+### 11ak.10 A name collision worth recording
+
+The module was first written as `area.py`. BSMT's own cross-module resolution check in
+`tests/test_import.py` reported `operators.py calls area.tag_redraw()` — because `area` is Blender's
+ubiquitous name for a UI region (`for area in context.screen.areas`). It runs, since a local shadows
+a global, and it is exactly the kind of latent trap that bites a later reader. Renamed to
+`surfacearea.py`. The structural test earned its place.
+
+### 11ak.11 What is verified, and what is not
+
+`tests/test_surfacearea.py` — **45 checks**, offline: a 3-4-5 triangle at exactly 6 mm²; two
+triangles as a 5×5 square at exactly 25; a median split at exactly half; a convex clipped quad
+against an independently computed planar area; full-plus-partial mixtures; a zero-area piece
+contributing nothing; oversized and empty selections refused by name; units; the planar patch
+measuring exactly the square it encloses; sphere and torus two-side behaviour; every triangle
+accounted for exactly once; and that no area reaches a protocol file or the CSV.
+
+`tests/test_surface_area_blender.py` — **55 checks** on a real computed geodesic boundary: that a
+DRAFT region and a VALID-boundary-without-interior are both refused; that Compute Boundary and
+Compute Interior compute no area; that the classification is stored in float64 with parent links;
+two-side consistency through the real operators; units; that thickness, colour, opacity, preview
+rebuilds and measurement changes leave the area untouched; staleness from reorder, re-pick and
+geometry change; save/reload preserving a VALID area; that a panel draw writes nothing; that a stale
+area is not drawn as a number; and that no solver is constructed anywhere in it.
+
+**All fixtures are synthetic.** **No human scan has been measured.** §11ak.12.
+
+### 11ak.12 What real-scan validation would have to establish
+
+Software verification is not human validation, and nothing below has been done:
+
+- **repeatability** — does the same researcher, re-picking the same anatomical landmarks on the same
+  scan, produce the same region area, and within what spread;
+- **sensitivity to landmark placement** — how much area moves per millimetre of landmark
+  displacement, which on a curved region may be strongly non-uniform;
+- **sensitivity to scan density and decimation** — §C characterises this for distances; area is a
+  quadratic quantity and may behave differently;
+- **agreement with independent mesh software** — the same region measured in another tool;
+- **posture sensitivity** — if a region is compared across scans of the same subject;
+- **protocol reproducibility** — whether a landmark-defined region transfers between subjects in a
+  way that makes areas comparable at all.
+
+None of these is marked complete, and none is implied by any number this milestone produces.
+
+
+## 11al. Milestone 3.34 — Compute Interior on a real scan (shipped in v0.29.0, 2026-09-15)
+
+### 11al.1 The symptom, and the rule followed
+
+Compute Interior passed every synthetic test and was effectively hung on a ~350,000-triangle human
+scan. The rule for the whole milestone: **profile the actual implementation before changing
+anything, and change nothing about the result.**
+
+### 11al.2 The bottleneck, measured before any edit
+
+`locate_point` compared each boundary point against EVERY edge in the mesh, in a Python loop.
+
+| triangles | edges | boundary points | point location |
+|---|---|---|---|
+| 800 | 1,240 | 32 | 0.15 s |
+| 3,200 | 4,880 | 64 | 1.14 s |
+| 12,800 | 19,360 | 128 | 9.13 s |
+| 28,800 | 43,440 | 192 | **30.6 s** |
+
+O(points x edges), and both grow with mesh linear size, so the stage is quadratic. Extrapolated to
+350,000 triangles (≈525,000 edges) with a realistic 2,000-10,000 point boundary: **1.1 to 5.4
+hours**.
+
+Two secondary costs: `build_graph` ran `_edge_intervals` on **every edge in the mesh** when only
+edges touching a cut triangle carry information, and side classification **flooded the component
+twice**. Both are linear, but with Python constants that reach ~20 s at 350,000 triangles - and the
+dict-of-sets adjacency allocates one small Python set per triangle.
+
+### 11al.3 Equivalence, established first
+
+A fingerprint of the COMPLETE output was recorded before any edit and re-checked after every one:
+every full-triangle index, every clipped polygon and barycentric corner to 12 decimals, every piece
+area, both sides' totals, and the Surface Area on each side, across five fixtures (planar 6x6 and
+10x10, sphere 24x16 and 32x20, two-component).
+
+    ed3e41855feff39bfabfd2a153fccd85ad0c0cfc4ba031a4fcdaa83d3ba52389
+
+**Unchanged through every step.** A faster implementation that silently moves geometry is not an
+optimisation, and the fingerprint is what makes that statement checkable rather than hopeful.
+
+### 11al.4 What was changed
+
+| # | Change | Effect |
+|---|---|---|
+| 1 | `EdgeGrid` - uniform grid over edge bounding boxes | point location O(points x edges) -> O(points) |
+| 2 | `_closest_edge` vectorised over the candidate list | one numpy pass, no per-edge Python arithmetic |
+| 3 | `edge_map` and `vertex_triangles` vectorised, built once | `_triangles_at_vertex` no longer scans the mesh per query |
+| 4 | `SurfaceGraph` - CSR arrays over integer node ids | no dict of 350,000 tuple-keyed sets |
+| 5 | whole-to-whole links emitted in one numpy operation | interval overlap runs only on cut edges |
+| 6 | one flood; complement = the rest of the component | the mesh is walked once, not twice |
+
+**The grid cannot change the answer.** It SHORTLISTS candidate edges; the winning edge is still
+chosen by the same exact distance test, widening rings are tried before falling back to a full scan,
+and `test_interior.py` §F12 asserts the shortlist gives the same answer as scanning every edge on a
+real fixture.
+
+**The single flood still checks separation.** If the first side's flood reaches the other piece of
+the seed triangle, the boundary did not cut the component in two, and that is refused exactly as
+before. One subtlety was found in review and is worth recording: a cut triangle's WHOLE-triangle node
+id becomes a phantom once the triangle is split, and deriving the complement as "everything else"
+handed each cut triangle its full area a second time. Struck out explicitly, and caught by the
+existing two-side tests rather than by inspection.
+
+### 11al.5 Result
+
+| triangles | boundary points | seconds | triangles/second |
+|---|---|---|---|
+| 14,160 | 360 | 0.21 | 67,000 |
+| 57,120 | 720 | 0.69 | 83,000 |
+| 192,720 | 1,320 | 2.14 | 90,000 |
+| **358,800** | **1,800** | **4.17** | **86,000** |
+
+Linear. The two sides sum to the mesh's own area to **2.8e-13** relative at full scale.
+
+The benchmark boundary is built from TRUE EDGE CROSSINGS - every point on a mesh edge, consecutive
+points sharing a triangle - because that is what a computed geodesic is. An arbitrary polyline
+sampled at arbitrary spacing exercises a code path real data never takes, and timing against one
+would have measured the wrong thing.
+
+### 11al.6 A robustness fix found on the way
+
+The face-location fallback for a boundary CORNER searched only the previous point's triangles and
+raised if the corner was not in one of them. It now widens - neighbours, then a grid shortlist, then
+the whole mesh below `_FULL_SCAN_LIMIT` - so a point it used to place is placed identically and one
+it used to refuse gets a fair chance. Above that limit the last-resort scan is skipped: it is
+O(triangles) per point, and a point the grid cannot find within two cells of itself is not on this
+mesh, which is a refusal worth reaching quickly.
+
+### 11al.7 Reporting, and why not a modal operator
+
+Compute Interior prints its triangle and boundary-point counts BEFORE starting - silence in a
+non-redrawing Blender reads as a hang - and one line of stage timings when it finishes. No
+per-element logging: on a 350,000-triangle scan that would cost more than the stage it measured.
+
+**A modal operator with ESC cancellation was considered and NOT implemented.** The analysis is a
+single deterministic pass whose stages are not independently resumable, and slicing it across modal
+timer events would either hold partial state between ticks - the thing §9 of the brief warns
+against - or require restructuring the algorithm for an interruption that now costs four seconds.
+Publication is already transactional: nothing is written to the region, the classification cache or
+the fill until the whole analysis has succeeded, so a failure or a forced quit leaves no half-written
+interior. If a future scan makes this long again, the honest fix is a modal operator, not a progress
+bar over an atomic step.
+
+### 11al.8 Structural performance tests
+
+Wall-clock is deliberately NOT a pass/fail criterion: it varies by machine, it fails for reasons
+nobody can act on, and it does not say why anything is slow. `test_interior.py` §F asserts the
+properties that made the difference instead, by counting calls on a 14,160-triangle fixture:
+
+* clipping runs **once per cut triangle** (240 calls, 240 cut, 14,160 in the mesh), not once per
+  triangle;
+* the edge map is built **once**;
+* edge-interval work scales with the cut (1,680 calls for 480 touching edges) and not with the mesh's
+  21,240 edges;
+* **one** flood, not one per side, and the derived complement is still exact;
+* the grid shortlists ~49 edges of 5,220 per point and **gives the same answer as a full scan**.
+
+Benchmark timings are reported separately (§11al.5) and are not asserted.
+
+### 11al.9 What this does not change
+
+No boundary cache schema change. No change to the interior classification cache, the fill, the
+thickness preview or Surface Area. No solver call anywhere in Compute Interior. Nothing about what
+the numbers mean, and nothing about what remains unvalidated on real human scans (§11ak.12).
+
+
+## 11am. Milestone 3.35 — the real-scan tiling failure (shipped in v0.29.0, 2026-09-15)
+
+### 11am.1 The failure, and what was not done about it
+
+On a real ~350,000-triangle human scan, Compute Interior finished and refused:
+
+    the pieces of triangle 14527 do not tile it (3.82042 vs 3.81668)
+
+**+9.8e-04 relative, an EXCESS** — 0.00374 mm² more than the parent triangle. An excess means the
+pieces OVERLAP; a deficit would mean a gap. The refusal was correct and the invariant stayed:
+`TILING_TOLERANCE` was not raised, the failing triangle was not skipped, no area was renormalised
+afterwards, and the discrepancy was not assigned to a side. The partition was wrong and the partition
+was fixed.
+
+### 11am.2 The cause, reproduced before it was fixed
+
+A chord end stored a few microns off the triangle border.
+
+`split_polygon` LOCATES a chord's ends by projecting them onto the polygon border — and then inserted
+the **raw** stored point into both pieces. The pieces therefore shared a corner that was not on the
+border; their union bulged past the triangle; the two sides overlapped along the chord.
+
+Why an end is off the border at all: the region boundary cache is **float32**, because it is display
+geometry (`pathcache`, §11ag). A point that mathematically lies exactly where the geodesic crosses a
+shared mesh edge lands a few microns to one side of that edge once stored.
+
+Reproduced on a 3.9 mm² triangle — the size of the real one — with a scan-scale tolerance:
+
+| drift of the chord end | tiling residual |
+|---|---|
+| 0 | 0 |
+| 1e-5 mm | +3.8e-06 |
+| 1e-4 mm | +3.8e-05 |
+| 1e-3 mm | +3.8e-04 |
+| **3e-3 mm** | **+1.2e-03** |
+
+which brackets the +9.8e-04 the scan reported. Thirteen triangle-local configurations were tried
+first — near-vertex, on-vertex, edge-coincident, same-edge entry/exit, two and three chords, nested
+and reversed order, shared endpoints, interior bends, duplicate points — and **only the drifted end
+produced an excess**. The others tiled exactly, so multiple visits, corner bends and near-vertex
+events were each ruled out rather than assumed innocent.
+
+### 11am.3 The fix
+
+`split_polygon` inserts the **projected** point — the one on the border — into both pieces. The union
+is then exactly the polygon, and the two pieces meet along the chord sharing its two ends exactly.
+
+The correction is the drift itself: microns. It cannot visibly move the boundary, and it is applied
+identically by both triangles sharing an edge, because both project onto the same segment. This is
+**numerical handling of a storage precision, not a simplification of the boundary** — the distinction
+§5 of the brief asks for.
+
+A second hole closed with it: `split_triangle` used to pass `max(tolerance, best_border_distance * 2)`
+as the per-chord tolerance, which accepted a chord end arbitrarily far off the border and then built
+a polygon around it. It now passes the fixed, mesh-scale tolerance, so **a drift too large to be
+float32 is still refused**: half a millimetre off a 3 mm triangle is a real fault, and inventing a
+projection for it would hide one.
+
+**No data-model change.** The boundary cache schema is untouched. Retaining barycentric provenance in
+the boundary cache (§7 of the brief) was considered and is not needed: the projection recovers the
+border relationship exactly, deterministically, and from data already present.
+
+### 11am.4 Equivalence
+
+Every existing fixture is **numerically identical** — same full-triangle sets, same partial parent
+ids, same clipped polygon coordinates, same piece areas, same Smaller/Complement selection, same
+Surface Area. Exhaustive float comparison across five fixtures (planar 6x6 and 10x10, sphere 24x16
+and 32x20, two-component): **0 numeric differences, worst absolute 0.000e+00**.
+
+The recorded fingerprint text did change, and the reason is worth stating so it is not mistaken for a
+result change later: two barycentric components now print as `0.0` where they printed `-0.0`, because
+the projected point reaches zero from the other side. `-0.0 == 0.0` is true; nothing moved.
+
+### 11am.5 Diagnostics
+
+**On failure**, one inspectable record for the offending triangle: its corners in millimetres and its
+area, how many times the boundary visited it, each chord end in millimetres AND in barycentric
+coordinates, whether an end sits at a vertex or on an edge, **how far off the border it is** and
+whether that exceeds tolerance, each piece's corner count, area and duplicated corners, the piece sum
+against the parent, and a line saying that an excess means overlap and a deficit means a gap. Under
+thirty lines; the mesh is never dumped.
+
+**On success**, the invariant is reported rather than left silent:
+
+    [BSMT] tiling: 140 boundary triangles | max abs residual 3.34e-13 mm^2
+           | max relative 7.82e-15 | worst triangle 550
+
+This is the line to read when the scan is re-tried: it says whether triangle 14527 now tiles, how
+many boundary triangles were checked, and what the worst residual was and where.
+
+### 11am.6 Regression
+
+`tests/test_interior.py` §G, built from the real case at the real scale: drifts from 0 to 1e-2 mm
+all tile float-exactly; the 3e-3 mm case that reproduces the scan's magnitude shows **no excess**;
+the two pieces share exactly the chord's two ends; a 0.5 mm drift is still **refused**; the failure
+report contains each required field and stays short.
+
+**Verified to catch the defect**: reintroducing the raw-point insertion makes **seven** of these
+checks fail, including one at 1.15e-03 — the scan's own magnitude.
+
+### 11am.7 Known remaining refusal
+
+A chord lying **along** a triangle edge still yields no split and is refused. Geometrically such a
+triangle is not cut at all and belongs wholly to one side; handling it properly requires the
+adjacency construction and the two-side seeding to agree that a "visited" triangle may be uncut,
+which is a change to the partition logic rather than to the clipper. It is recorded here rather than
+quietly special-cased.
+
+It was observed on a real scan on the very next re-test, and §11an resolves it.
+
+### 11am.8 Performance
+
+Unchanged by the fix: 358,800 triangles in **4.19 s**, with the two sides summing to the mesh's own
+area to 2.8e-13.
+
+
+## 11an. Milestone 3.36 — a boundary that runs along a mesh edge (shipped in v0.29.0, 2026-09-15)
+
+### 11an.1 The failure
+
+Re-testing §11am on the same ~350,000-triangle human scan got past triangle 14527 and refused a
+different triangle:
+
+    the boundary's crossing of triangle 6825 could not be split exactly
+
+This is exactly the limitation recorded in §11am.7, now met on real data.
+
+It was **not assumed** to be that case. The split-failure path carried **no diagnostic record** —
+only the tiling path did — so triangle 6825 could not be classified from what the operator printed.
+That was fixed first: the refusal now attaches the same per-triangle record (`tiling_report` with
+`pieces=None`), which names each visit as along-edge or interior. That record is what identified it:
+
+    visit 1 lies ALONG mesh edge (16, 17) - such a traversal does not cut the triangle, and is
+    handled as an edge-aligned boundary event
+
+### 11an.2 The geometry
+
+The breakpoints of an exact (MMP) geodesic lie **on mesh edges** — the property the whole interior
+algorithm rests on (§11ai). Ordinarily the path enters a triangle through one edge and leaves
+through another, and the chord between the two cuts the triangle in two.
+
+When the shortest path between two landmarks *is* a chain of mesh edges — common where a scan has a
+crease, a seam, or a run of near-coplanar strips — the run lies flat along one edge of the triangle.
+Such a triangle **is not cut**. Requesting a split asks for a piece with no interior; the clipper
+correctly produced nothing, and the computation was correctly refused. Neither the boundary nor the
+mesh was at fault.
+
+### 11an.3 The partition gains a second kind of barrier
+
+Until now a boundary partitioned the surface in exactly one way: by clipping the triangles it
+crossed. It now has two, and they are disjoint:
+
+| the boundary run … | effect on the partition |
+| --- | --- |
+| crosses a triangle's interior | that triangle is clipped into pieces, exactly as before (§11aj) |
+| lies along a mesh edge | nothing is clipped; the two triangles sharing that edge cease to be neighbours |
+
+An uncut triangle keeps its **whole** area and belongs entirely to one side. The tiling invariant is
+therefore satisfied trivially for it — whole area to one side, nothing to the other — which is why
+the fully-aligned fixture reports a worst relative residual of exactly 0.0.
+
+`SurfaceGraph` takes a `blocked` set of edge keys, removes those edges from the manifold adjacency
+before linking, and reports how many it `severed`. When a boundary cuts **no** triangle at all,
+seeding falls back to the two triangles either side of a severed edge, so the flood still has a
+defined starting point on each side.
+
+### 11an.4 Detection is topological, not a tolerance
+
+Every boundary point is already classified by `locate_point` as on a vertex (`LOC_VERTEX`), on an
+edge (`LOC_EDGE`) or inside a face (`LOC_FACE`). `traversals` now records that classification per
+point, and `aligned_edge(run)` returns the single mesh edge a run lies along, or `None`.
+
+A run is edge-aligned when **every** one of its points lies on one common mesh edge, or at one of
+that edge's two ends — the intersection of the candidate edge sets. Consequently:
+
+* a run with even one `LOC_FACE` point is an ordinary chord and is still clipped, so a boundary that
+  enters and leaves through the same edge but **bulges into** the triangle between is not
+  edge-aligned;
+* a run whose points lie on two *different* edges is an ordinary chord;
+* a boundary merely passing **close** to an edge is classified by `locate_point` as on a face and is
+  not edge-aligned.
+
+**No new tolerance was introduced and no existing one was changed.** `TILING_TOLERANCE` and
+`ON_EDGE_FRACTION` are untouched. This path recognises a configuration that was always exact; it
+does not widen what counts as close enough. Drift beyond tolerance is still refused (§11am.3).
+
+### 11an.5 Locality
+
+Alignment is read off the per-point classification the traversal has already produced for its own
+purposes. Nothing iterates triangles against boundary segments, so the **global triangle × boundary
+search removed in §11al is not reintroduced**, and the cost is proportional to the number of
+boundary points rather than to the mesh.
+
+### 11an.6 Equivalence
+
+The result-equivalence harness (§11al.3) compares full-triangle sets, partial parent ids, clipped
+polygon coordinates to 12 decimal places, barycentric coordinates, per-piece areas,
+Smaller/Complement selection and the resulting Surface Area across five fixtures.
+
+Against the §11am build: **0 numeric differences, worst absolute 0.000e+00 — identical.** None of
+those boundaries runs along a mesh edge, so none of them reaches the new path.
+
+### 11an.7 Reporting
+
+A successful run states how the boundary met the mesh, because the two ways are not interchangeable
+and the counts are diagnostic in themselves:
+
+    [BSMT]   interior boundary: 142 partial triangles / 3 edge-aligned mesh edges
+             (3 adjacencies severed) / tiling max relative residual 7.82e-15
+
+A boundary following a crease shows few partials and many aligned edges. The result carries
+`partial_triangles`, `aligned_edges` and `severed_edges` alongside the existing `tiling` record.
+
+### 11an.8 Regression
+
+`tests/test_interior.py` §H, 34 checks. The seven configurations required are each asserted: a
+boundary exactly along one triangle edge; a shared edge used as boundary blocking adjacency; an
+edge-aligned run ending at a triangle vertex; an interior chord that is *not* edge-aligned despite
+both ends on one edge; a boundary extremely near but not on an edge, which must still be clipped;
+large numerical drift, which must still be refused; and both sides tiling every triangle exactly.
+
+The decisive check is H28–H31: **with alignment detection disabled the module is the previous
+implementation**, and it refuses the along-edge loop with the scan's own message, "could not be
+split exactly". With it enabled the same loop resolves to exactly 4.000000 mm² on a 6×6 grid, with
+zero partial triangles and the two sides summing to the mesh area to 1e-12.
+
+### 11an.9 Performance
+
+Unchanged: 358,800 triangles in **4.17 s** (§11am: 4.19 s), with the two sides summing to the mesh's
+own area to 2.8e-13.
+
+### 11an.10 What this does not change
+
+`TILING_TOLERANCE`; Surface Area semantics; Smaller/Complement semantics; the geodesic solver; the
+region definition; the source or measurement mesh geometry; and Panel Preview geometry logic, which
+consumes the corrected Interior result and is otherwise untouched.

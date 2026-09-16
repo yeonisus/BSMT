@@ -418,17 +418,23 @@ def edge_incidence(faces):
     return incidence
 
 
-def non_manifold_regions(vertices, faces, max_regions=64):
-    """Group non-manifold edges into connected local regions.
+def group_nonmanifold_edges(edges):
+    """Group non-manifold edges into DEFECTS. Two sharing a vertex are one.
 
-    Two non-manifold edges belong to the same region when they share a vertex.
-    Reporting them individually would be misleading: the real scan's seven
-    edges are one artefact around one vertex, not seven separate problems.
+    Reporting them individually would be misleading: the real Design X scan's
+    seven non-manifold edges are one artefact around one vertex, not seven
+    separate problems.
+
+    Returns a list of lists of row indices into `edges`, largest defect first,
+    ties broken by lowest member index. The ordering is part of the contract:
+    it is what gives a defect its region id, and two callers that want
+    different levels of detail about the same defect - the full region
+    description here, and the cheap component lookup in ``artifact.py`` -
+    have to number them identically or the panel and the deletion would be
+    talking about different things.
     """
-    vertices = np.asarray(vertices, dtype=np.float64)
-    faces = np.asarray(faces, dtype=np.int64)
-    edges = classify_edges(faces, vertices.shape[0])["non_manifold"]
-    if edges.shape[0] == 0:
+    edges = np.asarray(edges, dtype=np.int64)
+    if edges.size == 0:
         return []
 
     # Union-find over non-manifold edges, joined through shared vertices.
@@ -457,9 +463,28 @@ def non_manifold_regions(vertices, faces, max_regions=64):
     for index in range(edges.shape[0]):
         groups.setdefault(find(index), []).append(index)
 
+    members = list(groups.values())
+    members.sort(key=lambda group: (-len(group), group[0]))
+    return members
+
+
+def non_manifold_regions(vertices, faces, max_regions=64):
+    """Group non-manifold edges into connected local regions.
+
+    Two non-manifold edges belong to the same region when they share a vertex -
+    see ``group_nonmanifold_edges``, which is the one place that rule lives.
+    This adds the incident faces, area and extent, which cost a pass over the
+    whole triangle array.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    edges = classify_edges(faces, vertices.shape[0])["non_manifold"]
+    if edges.shape[0] == 0:
+        return []
+
     incidence = edge_incidence(faces)
     regions = []
-    for members in groups.values():
+    for members in group_nonmanifold_edges(edges):
         member_edges = edges[np.asarray(members, dtype=np.int64)]
         face_set = set()
         for a, b in member_edges:

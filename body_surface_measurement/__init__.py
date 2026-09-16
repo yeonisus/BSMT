@@ -16,7 +16,7 @@ automatic landmark detection, mesh repair, cropping, measurement templates.
 #: modern way. This constant is defined by the module itself, survives both
 #: packaging modes, and is what tools/build_release.py reads to stamp the
 #: extension manifest, so the two can never disagree.
-VERSION = (0, 26, 2)
+VERSION = (0, 29, 0)
 
 bl_info = {
     "name": "Body Surface Measurement Tool (BSMT)",
@@ -53,7 +53,15 @@ bl_info = {
         "Milestone 3.22: alignment validates its own result against the "
         "anatomical axis contract. "
         "Milestone 3.25: CSV schema v2 - stable ids and protocol names on "
-        "every exported row - and the validation record in docs/VALIDATION.md"
+        "every exported row - and the validation record in docs/VALIDATION.md. "
+        "Milestone 3.28: researcher-supervised removal of the connected "
+        "component holding an inspected non-manifold defect. Never automatic, "
+        "and never the primary body component. "
+        "Milestone 3.29: Surface Regions - a closed boundary assembled from "
+        "cached surface paths. Boundary only; no area is calculated. "
+        "Milestone 3.30: local face repair of a defect INSIDE a component, "
+        "including the primary body - offered only when the local topology "
+        "yields one unambiguous removable branch, and refused otherwise"
     ),
     "category": "3D View",
 }
@@ -63,10 +71,10 @@ if "bpy" in locals():
     import importlib
 
     from . import (
-        alignment, attach, export, geodesic, landmarks, measurement,
-        measurements, meshrepair, overlay, panels, pathcache, picking,
-        preprocess, protocol, readiness, repair, scancopy, state, timing,
-        visualization, viz, operators,
+        alignment, artifact, attach, export, geodesic, landmarks,
+        localrepair, measurement, measurements, meshrepair, overlay, panels,
+        pathcache, picking, preprocess, protocol, readiness, regions, repair,
+        scancopy, state, timing, visualization, viz, operators,
     )
 
     importlib.reload(geodesic)
@@ -78,11 +86,18 @@ if "bpy" in locals():
     importlib.reload(export)
     importlib.reload(preprocess)
     importlib.reload(repair)
+    importlib.reload(artifact)
+    importlib.reload(localrepair)
+    importlib.reload(regions)
+    importlib.reload(interior)
+    importlib.reload(panelpreview)
+    importlib.reload(surfacearea)
     importlib.reload(protocol)
     importlib.reload(measurement)
     importlib.reload(timing)
     importlib.reload(visualization)
     importlib.reload(pathcache)
+    importlib.reload(interiorcache)
     importlib.reload(overlay)
     importlib.reload(state)
     importlib.reload(scancopy)
@@ -94,10 +109,12 @@ if "bpy" in locals():
     importlib.reload(attach)
 else:
     from . import (
-        alignment, attach, export, geodesic, landmarks, measurement,
-        measurements, meshrepair, operators, overlay, panels, pathcache,
-        picking, preprocess, protocol, readiness, repair, scancopy, state,
-        timing, visualization, viz,
+        alignment, artifact, attach, export, geodesic, interior,
+        interiorcache, landmarks, localrepair, measurement, measurements,
+        meshrepair, operators, overlay, panelpreview, panels, pathcache,
+        picking, preprocess, protocol, surfacearea,
+        readiness, regions, repair, scancopy, state, timing, visualization,
+        viz,
     )
 
 import bpy  # noqa: E402  (kept after the reload guard on purpose)

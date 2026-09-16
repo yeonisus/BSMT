@@ -305,6 +305,132 @@ def draw_cached_path(context, props, item, canonical=None, force=False):
     return True
 
 
+# ---------------------------------------------------------------------------
+# Surface Region boundaries (Milestone 3.29)
+# ---------------------------------------------------------------------------
+
+
+def region_boundary_points(item):
+    """The region's whole closed loop, as one local-space polyline.
+
+    Built by concatenating each segment's CACHED polyline in loop order and
+    dropping the duplicated point at each join, so a corner is one point
+    rather than two stacked on each other. There is no orientation to resolve:
+    segment i was solved FROM boundary landmark i TO landmark i+1, so the
+    pieces already run the same way round (Milestone 3.31).
+
+    Returns (points, closed, missing) - `missing` lists the 1-based positions
+    of segments with no cached polyline, which is what lets the caller say
+    WHICH part of the boundary still needs computing instead of just drawing
+    a gap.
+
+    Reads `pathcache` and nothing else. No canonical mesh, no BVH, no solver.
+    """
+    pieces = []
+    missing = []
+    # One loader, in state.region_polylines, so the drawn boundary and the
+    # self-intersection test can never disagree about where the boundary runs.
+    for position, points in enumerate(state.region_polylines(item), start=1):
+        if points is None or points.shape[0] < 2:
+            missing.append(position)
+            continue
+        pieces.append(points)
+
+    if not pieces:
+        return np.zeros((0, 3), dtype=np.float64), False, missing
+
+    joined = [pieces[0]]
+    for piece in pieces[1:]:
+        # Drop the leading point when it repeats the previous piece's last
+        # one: at a corner the two paths end and start at the same landmark,
+        # and two coincident points would give the bevel a zero-length span.
+        if np.allclose(piece[0], joined[-1][-1], atol=0.0, rtol=0.0):
+            piece = piece[1:]
+        if piece.shape[0]:
+            joined.append(piece)
+    points = np.vstack(joined)
+
+    closed = False
+    if points.shape[0] > 2 and np.allclose(points[0], points[-1],
+                                           atol=0.0, rtol=0.0):
+        # The curve is drawn cyclic, so the repeated closing point is dropped
+        # rather than drawn on top of the first one.
+        points = points[:-1]
+        closed = True
+    return points, closed, missing
+
+
+def draw_region_boundary(context, props, item, trusted=True):
+    """Draw one region's boundary from cached paths. Never solves anything.
+
+    `trusted` false forces the warning colour: a boundary BSMT cannot vouch
+    for must not look identical to one it can. The geometry is still drawn,
+    because seeing where a stale boundary runs is how a researcher works out
+    what to fix - but it is drawn in the warning colour and the operator says
+    so, so it can never pass for an authoritative one.
+
+    Returns (object_or_None, missing_positions).
+    """
+    points, closed, missing = region_boundary_points(item)
+    object_name = item.boundary_object
+    if not object_name:
+        object_name = _region_object_name(context, item)
+    obj = bpy.data.objects.get(object_name) if object_name else None
+    if obj is None or points.shape[0] < 2:
+        visualization.remove_region_boundary(item.stable_id)
+        return None, missing
+
+    color = (tuple(item.color) if trusted
+             else visualization.REGION_UNTRUSTED_COLOR)
+    helper = visualization.update_region_boundary(
+        context, props, item.stable_id, points, obj.matrix_world, color,
+        props.region_boundary_thickness_mm, closed=closed,
+    )
+    return helper, missing
+
+
+def _region_object_name(context, item):
+    """The scan a region belongs to. Resolved WITHOUT touching measurements."""
+    return state.region_object_name(context, item)
+
+
+def sync_region_transforms(context, props=None):
+    """Keep every drawn region boundary aligned with its scan."""
+    if props is None:
+        props = state.get_props(context)
+    if props is None:
+        return 0
+    collection = None
+    scene = _scene_for(context, props)
+    if scene is not None:
+        collection = getattr(scene, "bsmt_regions", None)
+    if not collection:
+        return 0
+    matrices = {}
+    synced = 0
+    for item in collection:
+        object_name = item.boundary_object or _region_object_name(context,
+                                                                  item)
+        if not object_name:
+            continue
+        if object_name not in matrices:
+            obj = bpy.data.objects.get(object_name)
+            matrices[object_name] = obj.matrix_world if obj else None
+        matrix = matrices[object_name]
+        if matrix is None:
+            continue
+        if visualization.sync_region_transform(item.stable_id, matrix):
+            synced += 1
+        # The FILL lies on the same surface and is drawn from the same
+        # local-space points, so it follows by the same matrix write. Missing
+        # it would leave the analysis layer behind when the scan moved.
+        if visualization.sync_region_fill_transform(item.stable_id, matrix):
+            synced += 1
+        if visualization.sync_region_panel_transform(item.stable_id, matrix):
+            synced += 1
+    return synced
+
+
 def _scene_for(context, props):
     """The Scene, from a context or from the props that live on it.
 
@@ -484,9 +610,13 @@ def sync_transforms(context, props=None):
         props = state.get_props(context)
     if props is None:
         return 0
-    collection = measurements_of(context, props)
-    if not collection:
-        return 0
+    # NOT an early return when there are no measurements. A Surface Region is
+    # defined by landmarks and owns its own boundary cache, so a file can
+    # hold regions and no measurements at all - and under the old model,
+    # where a region was built FROM measurements, returning here was
+    # harmless. It is not any more: it would strand every region boundary at
+    # the scan's old transform.
+    collection = measurements_of(context, props) or ()
     landmarks_collection = None
     scene = _scene_for(context, props)
     if scene is not None:
@@ -513,6 +643,9 @@ def sync_transforms(context, props=None):
                 ):
                     synced += 1
         measured.note("%d helper(s) moved" % synced)
+    # Region boundaries follow the same scan in the same pass. Drawn from
+    # cached local-space points, so a transform is one matrix write each.
+    synced += sync_region_transforms(context, props)
     return synced
 
 

@@ -10,10 +10,11 @@ from mathutils import Matrix, Vector
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        IntProperty, StringProperty)
 
-from . import (alignment, attach, export, geodesic, landmarks, measurement,
-               measurements, meshrepair, overlay, pathcache, picking,
-               preprocess, protocol, readiness, repair, scancopy, state,
-               timing, visualization, viz)
+from . import (alignment, artifact, attach, export, geodesic, interior,
+               interiorcache, landmarks, localrepair, measurement,
+               measurements, meshrepair, overlay, panelpreview, pathcache,
+               picking, preprocess, protocol, readiness, regions, repair,
+               scancopy, state, surfacearea, timing, visualization, viz)
 
 def _addon_version():
     # VERSION, not bl_info: Blender strips bl_info from an extension module.
@@ -279,6 +280,16 @@ class BSMT_OT_pick_point(bpy.types.Operator):
         if affected:
             print("[BSMT] re-picking '%s' invalidated %d measurement result(s)"
                   % (item.label, affected))
+        # Regions depend on the landmark DIRECTLY, so they are restated on
+        # the same event rather than through whatever measurements happen to
+        # share it. A boundary whose corner moved is STALE; it is never
+        # re-solved without being asked.
+        restated = state.invalidate_regions_for_landmark(
+            context, item.stable_id, "landmark '%s' was re-picked" % item.label
+        )
+        if restated:
+            print("[BSMT] re-picking '%s' restated %d surface region(s)"
+                  % (item.label, restated))
 
         self._restore(context)
         advanced = ""
@@ -1734,6 +1745,7 @@ class BSMT_OT_clear_landmarks(bpy.types.Operator):
             state.invalidate_measurements_for_landmark(
                 context, stable_id, "all landmarks were cleared"
             )
+        state.refresh_all_region_statuses(context)
         for item in state.get_measurements(context) or ():
             source, target = state.resolve_measurement_landmarks(context, item)
             if source is None or target is None:
@@ -3794,6 +3806,84 @@ def _canonical_arrays(context, props, obj, rebuild=True):
     return canonical
 
 
+def _component_facts(canonical, label, defect_vertices=(), cache=None):
+    """Facts about one connected component, memoised per analysis pass.
+
+    Memoised because most defects share a component and the measurement -
+    which classifies every edge of the component - is the expensive part on a
+    350,000-triangle body.
+    """
+    if cache is not None and label in cache:
+        facts = dict(cache[label])
+        facts["holds_focused_defect"] = bool(
+            set(int(v) for v in defect_vertices)
+            & set(int(v) for v in facts["vertex_indices"])
+        )
+        return facts
+    facts = artifact.component_facts(
+        canonical.vertices_solver, canonical.triangles,
+        canonical.vertex_components, canonical.triangle_components,
+        label, defect_vertex_indices=defect_vertices,
+    )
+    if cache is not None:
+        cache[label] = facts
+    return facts
+
+
+def _fill_nonmanifold_defects(props, canonical):
+    """Refill the focused-defect list from a freshly analysed canonical mesh.
+
+    The list is rebuilt wholesale on every analysis rather than patched,
+    because a geometry edit renumbers vertices, edges and triangles: a stored
+    region id or component number from before an edit describes a mesh that
+    no longer exists (sect. 7.7). `repair_geometry_hash`, set beside it, is
+    what later lets an operator PROVE the numbers still apply.
+    """
+    props.repair_nonmanifold_defects.clear()
+    props.repair_nonmanifold_index = 0
+    props.repair_artifact_preview = ""
+    try:
+        regions = artifact.defect_regions(
+            canonical.vertices_solver, canonical.triangles,
+            canonical.vertex_components,
+        )
+    except Exception:                                 # noqa: BLE001
+        traceback.print_exc()
+        return 0
+
+    cache = {}
+    for region in regions:
+        entry = props.repair_nonmanifold_defects.add()
+        entry.region_id = region["region_id"]
+        entry.edge_count = region["edge_count"]
+        entry.vertex_count = region["vertex_count"]
+        entry.bbox_diagonal_mm = region["bbox_diagonal_mm"]
+        entry.label = artifact.describe_defect(region)
+        local = viz.solver_to_local(canonical, [region["center_mm"]])[0]
+        entry.center_local = tuple(float(value) for value in local)
+
+        label = region["component"]
+        if label < 0:
+            entry.component_index = 0
+            entry.deletion_block = (
+                "this defect's endpoints do not agree on one connected "
+                "component - re-analyze the mesh"
+            )
+            continue
+        facts = _component_facts(canonical, label, region["vertex_indices"],
+                                 cache)
+        entry.component_index = facts["component_index"]
+        entry.component_triangle_count = facts["triangle_count"]
+        entry.component_vertex_count = facts["vertex_count"]
+        entry.component_percent = facts["percent"]
+        entry.component_is_largest = facts["is_largest"]
+        entry.component_is_small = facts["is_small"]
+        entry.component_bbox = tuple(facts["bbox_mm"])
+        _allowed, _code, reason = artifact.deletion_block(facts)
+        entry.deletion_block = reason
+    return len(props.repair_nonmanifold_defects)
+
+
 def _analyse_repair(context, props, obj):
     """Rebuild the diagnostics and refill the repair lists. Returns lines."""
     canonical = _canonical_arrays(context, props, obj)
@@ -3843,6 +3933,15 @@ def _analyse_repair(context, props, obj):
         entry.merge_count = sum(len(drops) for _root, drops in defect["merges"])
     props.repair_degenerate_index = 0
     props.repair_degenerate_preview = ""
+
+    # Milestone 3.28: the non-manifold defects, each already carrying the
+    # connected component it sits in and whether that component may be
+    # offered for deletion. Computed HERE, in the same pass as everything
+    # else, so the panel cannot show a defect from one analysis beside a
+    # component list from another.
+    _fill_nonmanifold_defects(props, canonical)
+    props.repair_geometry_hash = str(
+        getattr(canonical, "geometry_hash", "") or "")
 
     verdict = repair.readiness(report)
     props.repair_readiness = "\n".join(repair.readiness_lines(verdict))
@@ -3918,6 +4017,10 @@ def _mark_points_stale(context, props, obj, canonical):
             if item.status != landmarks.STATUS_VALID:
                 affected += 1
                 state.invalidate_measurements_for_landmark(
+                    context, item.stable_id,
+                    "the mesh was repaired since this landmark was picked",
+                )
+                state.invalidate_regions_for_landmark(
                     context, item.stable_id,
                     "the mesh was repaired since this landmark was picked",
                 )
@@ -4087,6 +4190,314 @@ class BSMT_OT_focus_non_manifold(bpy.types.Operator):
             return {'CANCELLED'}
         self.report({'INFO'}, "BSMT: framed %d non-manifold edge(s)"
                     % edges.shape[0])
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# The focused defect, and the component it sits in (Milestone 3.28)
+# ---------------------------------------------------------------------------
+#
+# A real scan carries small detached fragments, and one of them is often what
+# holds the non-manifold edge that blocks exact measurement. Deleting that
+# fragment is the right repair; deciding that it is a fragment and not anatomy
+# is NOT something BSMT does. Everything below is the machinery for letting a
+# researcher inspect one defect, see the whole component it belongs to, and
+# then say so - and for refusing when that component is the body.
+
+
+def _lists_match_mesh(props, obj, canonical):
+    """Do the stored repair lists describe THIS mesh? (ok, reason).
+
+    A geometry edit renumbers vertices, edges and triangles, so a stored
+    region id or component number from before an edit names something else
+    afterwards. The geometry hash is what turns "probably still valid" into a
+    checkable fact, and nothing on the destructive path runs without it
+    (sect. 7.7).
+
+    The OBJECT is checked as well as the hash. Two measurement meshes copied
+    from the same scan have the same geometry hash by construction, so the
+    hash alone would let an analysis of one be applied to the other.
+    """
+    stored = str(getattr(props, "repair_geometry_hash", "") or "")
+    live = str(getattr(canonical, "geometry_hash", "") or "")
+    if not stored or not props.repair_valid:
+        return False, ("this mesh has not been analyzed - press Analyze Mesh "
+                       "first")
+    if props.repair_object != obj.name:
+        return False, ("the analysis on screen is of '%s', not '%s' - press "
+                       "Analyze Mesh on this one first"
+                       % (props.repair_object or "another mesh", obj.name))
+    if stored != live:
+        return False, ("the mesh changed since it was analyzed - press "
+                       "Analyze Mesh again before deleting anything")
+    return True, ""
+
+
+def _focused_defect_region(props, canonical):
+    """The FOCUSED defect, re-derived from `canonical`. (region, reason).
+
+    Re-derived on every call, never read back from the stored entry: the
+    stored numbers are a DISPLAY of one analysis, and the only thing carried
+    across from it is the defect's identity - its region id, cross-checked
+    against the position that analysis recorded. If the defect at that id has
+    moved, the answer is "re-analyze", not an edit aimed at whatever is
+    there now.
+
+    One definition, used by everything that acts on the focused defect:
+    component deletion (``_focused_component``) and local face repair both
+    ask this, so they can never disagree about which defect is focused or
+    whether it is still the one that was inspected.
+    """
+    entry = state.active_nonmanifold_defect(props)
+    if entry is None:
+        return None, ("no focused defect - press Analyze Mesh, then "
+                      "select the defect you have inspected")
+    regions = artifact.defect_regions(canonical.vertices_solver,
+                                      canonical.triangles,
+                                      canonical.vertex_components)
+    region = next((candidate for candidate in regions
+                   if candidate["region_id"] == int(entry.region_id)), None)
+    if region is None:
+        return None, ("defect %d is no longer present on this mesh - "
+                      "re-analyze" % int(entry.region_id))
+
+    local = viz.solver_to_local(canonical, [region["center_mm"]])[0]
+    stored = np.asarray(tuple(entry.center_local), dtype=np.float64)
+    tolerance = _local_length(
+        canonical, max(float(entry.bbox_diagonal_mm), 1.0))
+    if float(np.linalg.norm(local - stored)) > tolerance:
+        return None, ("defect %d is not where it was analyzed - re-analyze "
+                      "before changing anything" % int(entry.region_id))
+    return region, ""
+
+
+def _focused_component(props, canonical):
+    """The component holding the focused defect. (facts, region, reason)."""
+    region, why = _focused_defect_region(props, canonical)
+    if region is None:
+        return None, None, why
+
+    if region["component"] < 0:
+        return None, region, (
+            "defect %d does not sit in a single connected component, so "
+            "there is no component to delete - re-analyze"
+            % int(region["region_id"])
+        )
+    facts = artifact.component_facts(
+        canonical.vertices_solver, canonical.triangles,
+        canonical.vertex_components, canonical.triangle_components,
+        region["component"], defect_vertex_indices=region["vertex_indices"],
+    )
+    return facts, region, ""
+
+
+def _component_local_geometry(canonical, facts):
+    """The component's own triangles, compacted into local coordinates.
+
+    Compacted on purpose: handing the helper builder the whole vertex array
+    would put 350,000 unused vertices in a preview of a 400-triangle fragment.
+    """
+    used = np.asarray(facts["vertex_indices"], dtype=np.int64)
+    triangles = np.asarray(facts["triangle_indices"], dtype=np.int64)
+    if used.size == 0 or triangles.size == 0:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3),
+                                                            dtype=np.int64)
+    remap = np.full(int(canonical.vertex_count), -1, dtype=np.int64)
+    remap[used] = np.arange(used.size, dtype=np.int64)
+    faces = remap[canonical.triangles[triangles]]
+    return canonical.vertices_local[used], faces
+
+
+def _measurements_on_object(context, object_name):
+    return sum(1 for item in (state.get_measurements(context) or ())
+               if item.result_object == object_name
+               or item.path_object == object_name)
+
+
+class BSMT_OT_step_nonmanifold_defect(bpy.types.Operator):
+    """Step to the previous or next non-manifold defect.
+
+    Selection only: the mesh is not modified and the view is not moved
+    """
+
+    bl_idname = "bsmt.step_nonmanifold_defect"
+    bl_label = "Step Defect"
+    bl_description = ("Select the previous or next non-manifold defect for"
+                      " inspection")
+    bl_options = {'REGISTER'}
+
+    direction: EnumProperty(
+        name="Direction",
+        items=(('PREV', "Previous", "Select the previous defect"),
+               ('NEXT', "Next", "Select the next defect")),
+        default='NEXT',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return props is not None and len(props.repair_nonmanifold_defects) > 1
+
+    def execute(self, context):
+        props = state.get_props(context)
+        total = len(props.repair_nonmanifold_defects)
+        if not total:
+            return {'CANCELLED'}
+        step = 1 if self.direction == 'NEXT' else -1
+        props.repair_nonmanifold_index = (
+            (props.repair_nonmanifold_index + step) % total
+        )
+        # The previous defect's component preview and local-topology
+        # inspection both describe a DIFFERENT defect now, so neither
+        # survives the step - nor do the highlights they drew.
+        props.repair_artifact_preview = ""
+        state.clear_local_repair(props)
+        for name in (visualization.REPAIR_COMPONENT,
+                     visualization.REPAIR_LOCAL_CANDIDATE):
+            visualization.remove_object(bpy.data.objects.get(name))
+        entry = state.active_nonmanifold_defect(props)
+        self.report({'INFO'}, "BSMT: defect %d / %d - %s"
+                    % (props.repair_nonmanifold_index + 1, total,
+                       entry.label if entry else "?"))
+        return {'FINISHED'}
+
+
+class BSMT_OT_focus_nonmanifold_defect(bpy.types.Operator):
+    """Frame the viewport on the focused non-manifold defect.
+
+    Moves the VIEW only. The scan is never moved, rotated or scaled
+    """
+
+    bl_idname = "bsmt.focus_nonmanifold_defect"
+    bl_label = "Focus Selected Defect"
+    bl_description = ("Point the 3D view at the focused non-manifold defect."
+                      " The scan itself is never moved")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return (props is not None
+                and state.active_nonmanifold_defect(props) is not None
+                and _repair_target(context)[0] is not None)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        entry = state.active_nonmanifold_defect(props)
+        if obj is None or entry is None:
+            self.report({'ERROR'}, "BSMT: " + (reason or "no defect focused"))
+            return {'CANCELLED'}
+        try:
+            canonical = _canonical_arrays(context, props, obj, rebuild=False)
+        except Exception as exc:                      # noqa: BLE001
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        local = tuple(float(value) for value in entry.center_local)
+        world = obj.matrix_world @ Vector(local)
+        # view_distance is a WORLD length. The defect's extent is recorded in
+        # physical millimetres, so it comes back through the unit multiplier;
+        # the highlight radius is LOCAL, so it comes back through the scale.
+        scale = float(obj.matrix_world.to_scale().length / 3.0 ** 0.5)
+        multiplier = float(getattr(canonical, "unit_multiplier", 1.0) or 1.0)
+        distance = max(
+            float(entry.bbox_diagonal_mm) / multiplier * 4.0,
+            _defect_highlight_radius(canonical) * scale * 20.0,
+            1.0,
+        )
+        moved = 0
+        for area in getattr(context.screen, "areas", ()) or ():
+            if area.type != 'VIEW_3D':
+                continue
+            for space in area.spaces:
+                if space.type != 'VIEW_3D' or space.region_3d is None:
+                    continue
+                space.region_3d.view_location = world
+                space.region_3d.view_distance = distance
+                moved += 1
+            area.tag_redraw()
+        if not moved:
+            self.report({'WARNING'},
+                        "BSMT: no 3D viewport to focus; defect %d is around "
+                        "(%.1f, %.1f, %.1f)"
+                        % (int(entry.region_id), world.x, world.y, world.z))
+            return {'CANCELLED'}
+        self.report({'INFO'}, "BSMT: framed defect %d / %d"
+                    % (props.repair_nonmanifold_index + 1,
+                       len(props.repair_nonmanifold_defects)))
+        return {'FINISHED'}
+
+
+class BSMT_OT_preview_artifact_component(bpy.types.Operator):
+    """Show the WHOLE connected component the focused defect belongs to.
+
+    Read-only. Nothing is deleted, nothing is selected, and the mesh is not
+    modified - this is what the deletion would remove, drawn before deciding
+    """
+
+    bl_idname = "bsmt.preview_artifact_component"
+    bl_label = "Preview Artifact"
+    bl_description = ("Highlight the entire connected component holding the"
+                      " focused defect, and state what deleting it would"
+                      " remove. Nothing is modified")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return (props is not None
+                and state.active_nonmanifold_defect(props) is not None
+                and _repair_target(context)[0] is not None)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        try:
+            canonical = _canonical_arrays(context, props, obj, rebuild=False)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        current, why = _lists_match_mesh(props, obj, canonical)
+        if not current:
+            props.repair_artifact_preview = why
+            self.report({'WARNING'}, "BSMT: " + why)
+            return {'CANCELLED'}
+
+        facts, _region, why = _focused_component(props, canonical)
+        if facts is None:
+            props.repair_artifact_preview = why
+            self.report({'WARNING'}, "BSMT: " + why)
+            return {'CANCELLED'}
+
+        points, faces = _component_local_geometry(canonical, facts)
+        _helper, drawing = visualization.show_repair_surface(
+            context, visualization.REPAIR_COMPONENT, points, faces,
+            obj.matrix_world, visualization.REPAIR_COMPONENT_COLOR,
+        )
+
+        allowed, _code, block = artifact.deletion_block(facts)
+        lines = artifact.confirmation_lines(
+            facts, obj.name,
+            _landmarks_on_object(context, obj.name),
+            _measurements_on_object(context, obj.name),
+        )
+        if not allowed:
+            lines = ["DELETION BLOCKED", block, ""] + lines[5:]
+        if drawing:
+            lines.append("")
+            lines.append("Not highlighted: %s." % drawing)
+        props.repair_artifact_preview = "\n".join(lines)
+        print("[BSMT] artifact preview on '%s': %s"
+              % (obj.name, artifact.describe_component(facts)))
+        self.report({'INFO'} if allowed else {'WARNING'},
+                    "BSMT: %s%s" % (artifact.describe_component(facts),
+                                    "" if allowed else " - deletion blocked"))
         return {'FINISHED'}
 
 
@@ -4602,7 +5013,15 @@ class _RepairBase(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def _guarded(self, context, action, work, detail="",
-                 require_nonmanifold_decrease=False):
+                 require_nonmanifold_decrease=False, verify=None):
+        """Run `work` inside the backup / re-diagnose / accept-or-revert loop.
+
+        `verify` is an optional second acceptance test, called with
+        (before_report, after_report, outcome) and returning a list of
+        reasons to REVERT. It can only ever add reasons: the existing
+        `repair.accept_repair` rule is asked first and in full, so a caller
+        cannot use this to make acceptance more permissive.
+        """
         props = state.get_props(context)
         obj, reason = _repair_target(context)
         if obj is None:
@@ -4646,10 +5065,29 @@ class _RepairBase(bpy.types.Operator):
 
         texture_ok, _problems, _facts = meshrepair.verify_texture(
             obj, before_texture)
-        after_probe = dict(_canonical_arrays(context, props, obj).topology or {})
+        # Guarded: a mesh that cannot be re-analysed is a mesh whose state
+        # nothing can vouch for, and leaving that edit in place - which an
+        # unhandled exception here did - is worse than any repair it might
+        # have been.
+        try:
+            after_probe = dict(
+                _canonical_arrays(context, props, obj).topology or {})
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            meshrepair.restore_backup(obj, backup)
+            self.report({'ERROR'},
+                        "BSMT: the edited mesh could not be re-analyzed "
+                        "(%s: %s); it has been restored"
+                        % (type(exc).__name__, exc))
+            return {'CANCELLED'}
         accepted, why = repair.accept_repair(
             before_report, after_probe, texture_ok,
             require_nonmanifold_decrease=require_nonmanifold_decrease)
+        if verify is not None:
+            extra = list(verify(before_report, after_probe, outcome) or ())
+            if extra:
+                accepted = False
+                why = list(why) + extra
         if not accepted:
             meshrepair.restore_backup(obj, backup)
             _analyse_repair(context, props, obj)
@@ -4770,6 +5208,666 @@ class BSMT_OT_remove_small_component(_RepairBase):
                                                           removed)
 
         return self._guarded(context, "Remove component", work)
+
+
+class BSMT_OT_delete_defect_component(_RepairBase):
+    """Delete the whole connected component holding the focused defect.
+
+    The researcher's decision, never BSMT's: nothing here judges whether
+    geometry is anatomically relevant. Refused outright when that component
+    is the primary body
+    """
+
+    bl_idname = "bsmt.delete_defect_component"
+    bl_label = "Delete Artifact"
+    bl_description = ("Permanently delete the connected component containing"
+                      " the focused defect, from the MEASUREMENT MESH only."
+                      " Refused when that component is the primary body")
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or props.repair_running:
+            return False
+        if state.active_nonmanifold_defect(props) is None:
+            return False
+        return _repair_target(context)[0] is not None
+
+    # -- confirmation --------------------------------------------------
+
+    def invoke(self, context, event):
+        """Say exactly what goes, before it goes.
+
+        Not `invoke_confirm`: a one-line "OK?" cannot state the component's
+        size, that the source scan is safe, or that measurements stop being
+        trustworthy - and those are precisely the three things a researcher
+        can only regret not having been told beforehand.
+        """
+        props = state.get_props(context)
+        obj, _reason = _repair_target(context)
+        if props is not None and obj is not None:
+            try:
+                canonical = _canonical_arrays(context, props, obj,
+                                              rebuild=False)
+                current, why = _lists_match_mesh(props, obj, canonical)
+                facts = None
+                if current:
+                    facts, _region, why = _focused_component(props, canonical)
+                if facts is not None:
+                    props.repair_artifact_preview = "\n".join(
+                        artifact.confirmation_lines(
+                            facts, obj.name,
+                            _landmarks_on_object(context, obj.name),
+                            _measurements_on_object(context, obj.name),
+                        )
+                    )
+                else:
+                    props.repair_artifact_preview = why
+            except Exception:                         # noqa: BLE001
+                traceback.print_exc()
+        window_manager = context.window_manager
+        try:
+            return window_manager.invoke_props_dialog(
+                self, width=420, confirm_text="Delete Artifact")
+        except TypeError:
+            # Blender before 4.1 has no confirm_text.
+            return window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        props = state.get_props(context)
+        layout = self.layout
+        column = layout.column(align=True)
+        column.scale_y = 0.8
+        text = (props.repair_artifact_preview if props is not None else "")
+        if not text:
+            column.label(text="Delete the component holding the focused "
+                              "defect?", icon='ERROR')
+            return
+        for line in text.split("\n"):
+            if not line.strip():
+                column.separator()
+            elif line.startswith("DELETION BLOCKED") or line.startswith("NOTE"):
+                row = column.row()
+                row.alert = True
+                row.label(text=line)
+            else:
+                column.label(text=line)
+
+    # -- the operation -------------------------------------------------
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        if geodesic.ensure_loaded():
+            self.report({'ERROR'}, "BSMT: " + geodesic.ensure_loaded())
+            return {'CANCELLED'}
+
+        # --- pre-flight, before a single byte of geometry is touched -----
+        try:
+            canonical = _canonical_arrays(context, props, obj, rebuild=False)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+        current, why = _lists_match_mesh(props, obj, canonical)
+        if not current:
+            self.report({'ERROR'}, "BSMT: " + why)
+            return {'CANCELLED'}
+        facts, _region, why = _focused_component(props, canonical)
+        if facts is None:
+            self.report({'ERROR'}, "BSMT: " + why)
+            return {'CANCELLED'}
+        allowed, _code, block = artifact.deletion_block(facts)
+        if not allowed:
+            props.repair_artifact_preview = "DELETION BLOCKED\n" + block
+            print("[BSMT] artifact deletion refused on '%s': %s"
+                  % (obj.name, block))
+            self.report({'ERROR'}, "BSMT: " + block)
+            return {'CANCELLED'}
+
+        captured = {}
+
+        def work(work_obj, fresh, _before):
+            # Re-derived against the canonical mesh the wrapper just REBUILT,
+            # so the vertex indices handed to bmesh come from the same mesh
+            # state the acceptance test will be measured against. The
+            # pre-flight above is what refuses; this is what acts.
+            ok, why_fresh = _lists_match_mesh(props, work_obj, fresh)
+            if not ok:
+                raise meshrepair.RepairAborted(why_fresh)
+            fresh_facts, _fresh_region, why_fresh = _focused_component(
+                props, fresh)
+            if fresh_facts is None:
+                raise meshrepair.RepairAborted(why_fresh)
+            fresh_allowed, _fresh_code, fresh_block = artifact.deletion_block(
+                fresh_facts)
+            if not fresh_allowed:
+                raise meshrepair.RepairAborted(fresh_block)
+            captured["facts"] = fresh_facts
+            removed = meshrepair.remove_component(
+                work_obj, fresh_facts["vertex_indices"])
+            return ("component %d - %s triangle(s), %d vertex/vertices "
+                    "removed, %.1f mm across"
+                    % (fresh_facts["component_index"],
+                       "{:,}".format(fresh_facts["triangle_count"]), removed,
+                       fresh_facts["bbox_diagonal_mm"]))
+
+        def verify(before_report, after_report, _outcome):
+            removed_facts = captured.get("facts")
+            if removed_facts is None:
+                return ["the deletion did not record what it removed"]
+            return artifact.extra_deletion_reasons(
+                before_report, after_report,
+                {"triangle_count": removed_facts["triangle_count"],
+                 "primary_triangle_count":
+                     removed_facts["largest_triangle_count"]},
+            )
+
+        result = self._guarded(context, "Delete defect component", work,
+                               require_nonmanifold_decrease=True,
+                               verify=verify)
+        if result != {'FINISHED'}:
+            return result
+
+        # --- sect. 12: nothing may keep a pre-deletion verdict -----------
+        #
+        # The highlights go FIRST. They were built from vertex indices of a
+        # mesh that no longer exists, and a rod drawn where a deleted
+        # fragment used to be is a dangling reference a researcher can see.
+        visualization.clear_repair_highlights()
+        summary = state.invalidate_for_geometry_change(context, obj.name,
+                                                       props)
+        removed_facts = captured.get("facts") or {}
+        props.repair_artifact_preview = (
+            "Deleted component %d: %s triangles, %s vertices. %d landmark(s) "
+            "restated, %d measurement(s) invalidated."
+            % (removed_facts.get("component_index", 0),
+               "{:,}".format(removed_facts.get("triangle_count", 0)),
+               "{:,}".format(removed_facts.get("vertex_count", 0)),
+               summary["landmarks_restated"],
+               summary["measurements_invalidated"])
+        )
+        print("[BSMT] " + props.repair_artifact_preview)
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Local face repair inside a component that may not be deleted (M 3.30)
+# ---------------------------------------------------------------------------
+#
+# The three repair options BSMT now offers are deliberately different tools
+# for different topology, and none of them is a general "make it manifold":
+#
+#   * Weld Non-Manifold Region  - coincident / near-coincident VERTICES that
+#     should have been one vertex. Merges, removes nothing.
+#   * Delete Artifact           - a whole detached COMPONENT that is not the
+#     body. Removes everything in it, and is refused outright on the primary
+#     body component.
+#   * Remove Local Faces (here) - a handful of FACES hanging off a defect
+#     INSIDE a component, including the primary body. Removes only the faces
+#     an unambiguous branch separation identified, or refuses.
+
+
+def _stable_mm(canonical):
+    """Physical millimetre positions that do NOT move when vertices are deleted.
+
+    ``vertices_solver`` is centred on the mesh's own bounding box, so deleting
+    a flap that happens to sit at an extreme of that box shifts every
+    coordinate in the array by a fraction of a millimetre. A before/after
+    signature built on it would then report the entire mesh as changed. The
+    un-centred figure is the same physical position either way.
+    """
+    return (np.asarray(canonical.vertices_solver, dtype=np.float64)
+            + np.asarray(canonical.center_mm, dtype=np.float64))
+
+
+def _mean_edge_mm(canonical):
+    report = canonical.topology or {}
+    return float(report.get("edge_length_mean", 0.0) or 0.0)
+
+
+def _inspect_local_defect(props, canonical):
+    """Classify the focused defect's local topology. (report, region, reason).
+
+    Read-only and re-derived: nothing stored on `props` is trusted for
+    anything but WHICH defect is focused.
+    """
+    region, why = _focused_defect_region(props, canonical)
+    if region is None:
+        return None, None, why
+    report = localrepair.classify_local_defect(
+        canonical.vertices_solver, canonical.triangles, region["edges"],
+        mean_edge_mm=_mean_edge_mm(canonical),
+    )
+    return report, region, ""
+
+
+def _store_local_inspection(props, canonical, report, region):
+    """Cache one inspection for the panel. Display only - it never acts."""
+    props.repair_local_report = "\n".join(
+        localrepair.report_lines(report, region["region_id"]))
+    props.repair_local_classification = report["classification"]
+    props.repair_local_removable = bool(report["removable"])
+    props.repair_local_hash = str(getattr(canonical, "geometry_hash", "") or "")
+    props.repair_local_region_id = int(region["region_id"])
+    candidate = report["candidate"] or {}
+    props.repair_local_face_count = int(candidate.get("face_count", 0))
+    props.repair_local_vertex_count = int(candidate.get("vertex_count", 0))
+    props.repair_local_area_mm2 = float(candidate.get("area_mm2", 0.0))
+
+
+def _local_inspection_is_current(props, canonical):
+    """Does the stored inspection still describe THIS mesh and THIS defect?"""
+    if not props.repair_local_hash:
+        return False, "no local inspection - press Inspect Local Topology"
+    live = str(getattr(canonical, "geometry_hash", "") or "")
+    if props.repair_local_hash != live:
+        return False, ("the mesh changed since the local topology was "
+                       "inspected - press Analyze Mesh and inspect again")
+    entry = state.active_nonmanifold_defect(props)
+    if entry is None or int(entry.region_id) != int(props.repair_local_region_id):
+        return False, ("the focused defect changed since it was inspected - "
+                       "press Inspect Local Topology again")
+    return True, ""
+
+
+def _candidate_local_geometry(canonical, candidate):
+    """The candidate's own triangles, compacted into local coordinates."""
+    used = np.asarray(candidate["vertex_indices"], dtype=np.int64)
+    triangles = np.asarray(candidate["face_indices"], dtype=np.int64)
+    if used.size == 0 or triangles.size == 0:
+        return (np.zeros((0, 3), dtype=np.float64),
+                np.zeros((0, 3), dtype=np.int64))
+    remap = np.full(int(canonical.vertex_count), -1, dtype=np.int64)
+    remap[used] = np.arange(used.size, dtype=np.int64)
+    return canonical.vertices_local[used], remap[canonical.triangles[triangles]]
+
+
+class BSMT_OT_inspect_local_defect(bpy.types.Operator):
+    """Classify the local topology around the focused non-manifold defect.
+
+    Read-only: nothing is modified, nothing is selected, and no solver runs.
+    It either names an unambiguous removable candidate or says why it will
+    not
+    """
+
+    bl_idname = "bsmt.inspect_local_defect"
+    bl_label = "Inspect Local Topology"
+    bl_description = ("Classify the surface around the focused non-manifold"
+                      " defect and say whether a small removable candidate"
+                      " can be identified. Nothing is modified")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return (props is not None
+                and state.active_nonmanifold_defect(props) is not None
+                and _repair_target(context)[0] is not None)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        try:
+            canonical = _canonical_arrays(context, props, obj, rebuild=False)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        current, why = _lists_match_mesh(props, obj, canonical)
+        if not current:
+            state.clear_local_repair(props)
+            props.repair_local_report = why
+            self.report({'WARNING'}, "BSMT: " + why)
+            return {'CANCELLED'}
+
+        try:
+            report, region, why = _inspect_local_defect(props, canonical)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: local inspection failed (%s)" % exc)
+            return {'CANCELLED'}
+        if report is None:
+            state.clear_local_repair(props)
+            props.repair_local_report = why
+            self.report({'WARNING'}, "BSMT: " + why)
+            return {'CANCELLED'}
+
+        _store_local_inspection(props, canonical, report, region)
+        # The previous candidate highlight described a different inspection.
+        visualization.remove_object(
+            bpy.data.objects.get(visualization.REPAIR_LOCAL_CANDIDATE))
+        summary = localrepair.describe(report)
+        print("[BSMT] local topology at defect %d on '%s': %s"
+              % (region["region_id"], obj.name, summary))
+        self.report({'INFO'} if report["removable"] else {'WARNING'},
+                    "BSMT: " + summary)
+        return {'FINISHED'}
+
+
+class BSMT_OT_preview_local_candidate(bpy.types.Operator):
+    """Highlight ONLY the faces a local repair would remove.
+
+    Read-only. Not the component, not the defect's neighbourhood - the
+    candidate faces themselves, drawn where they are, at their real size
+    """
+
+    bl_idname = "bsmt.preview_local_candidate"
+    bl_label = "Preview Candidate Faces"
+    bl_description = ("Highlight exactly the faces a local repair would"
+                      " remove. Nothing is modified and no solver runs")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        return (props is not None and props.repair_local_removable
+                and _repair_target(context)[0] is not None)
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        try:
+            canonical = _canonical_arrays(context, props, obj, rebuild=False)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+
+        for check in (_lists_match_mesh(props, obj, canonical),
+                      _local_inspection_is_current(props, canonical)):
+            ok, why = check
+            if not ok:
+                props.repair_local_report = why
+                props.repair_local_removable = False
+                self.report({'WARNING'}, "BSMT: " + why)
+                return {'CANCELLED'}
+
+        report, region, why = _inspect_local_defect(props, canonical)
+        if report is None or not report["removable"]:
+            message = why or report["reason"]
+            if report is not None:
+                _store_local_inspection(props, canonical, report, region)
+            self.report({'WARNING'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        points, faces = _candidate_local_geometry(canonical,
+                                                  report["candidate"])
+        _helper, drawing = visualization.show_repair_surface(
+            context, visualization.REPAIR_LOCAL_CANDIDATE, points, faces,
+            obj.matrix_world, visualization.REPAIR_LOCAL_CANDIDATE_COLOR,
+        )
+        _store_local_inspection(props, canonical, report, region)
+        if drawing:
+            props.repair_local_report = (props.repair_local_report
+                                         + "\n\nNot highlighted: %s." % drawing)
+            self.report({'WARNING'}, "BSMT: " + drawing)
+            return {'CANCELLED'}
+        summary = localrepair.describe(report)
+        print("[BSMT] local candidate preview on '%s': %s" % (obj.name, summary))
+        self.report({'INFO'}, "BSMT: highlighted %d candidate face(s) - %s"
+                    % (report["candidate"]["face_count"], summary))
+        return {'FINISHED'}
+
+
+class BSMT_OT_remove_local_faces(_RepairBase):
+    """Remove the identified local candidate faces from the focused defect.
+
+    Only the faces an unambiguous branch separation identified, inside the
+    measurement mesh, inside one transaction that rolls back unless every
+    postcondition holds. Never offered when the classification is ambiguous
+    """
+
+    bl_idname = "bsmt.remove_local_faces"
+    bl_label = "Remove Local Artifact Faces"
+    bl_description = ("Remove exactly the candidate faces identified at the"
+                      " focused non-manifold defect, from the MEASUREMENT"
+                      " MESH only. Rolled back unless the topology improves")
+
+    @classmethod
+    def poll(cls, context):
+        props = state.get_props(context)
+        if props is None or props.repair_running:
+            return False
+        if not props.repair_local_removable:
+            return False
+        return _repair_target(context)[0] is not None
+
+    # -- confirmation --------------------------------------------------
+
+    def invoke(self, context, event):
+        """State exactly what goes, before it goes (sect. 6)."""
+        props = state.get_props(context)
+        obj, _reason = _repair_target(context)
+        if props is not None and obj is not None:
+            try:
+                canonical = _canonical_arrays(context, props, obj,
+                                              rebuild=False)
+                ok, why = _lists_match_mesh(props, obj, canonical)
+                report = region = None
+                if ok:
+                    report, region, why = _inspect_local_defect(props,
+                                                                canonical)
+                if report is not None and report["removable"]:
+                    props.repair_local_report = "\n".join(
+                        localrepair.confirmation_lines(
+                            report, region["region_id"], obj.name,
+                            _landmarks_on_object(context, obj.name),
+                            _measurements_on_object(context, obj.name),
+                        )
+                    )
+                else:
+                    props.repair_local_report = (
+                        why or (report["reason"] if report else "")
+                        or localrepair.MANUAL_EDIT_MESSAGE)
+            except Exception:                         # noqa: BLE001
+                traceback.print_exc()
+        window_manager = context.window_manager
+        try:
+            return window_manager.invoke_props_dialog(
+                self, width=420, confirm_text="Remove Local Faces")
+        except TypeError:
+            # Blender before 4.1 has no confirm_text.
+            return window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        props = state.get_props(context)
+        layout = self.layout
+        column = layout.column(align=True)
+        column.scale_y = 0.8
+        text = (props.repair_local_report if props is not None else "")
+        if not text:
+            column.label(text="Remove the local candidate faces?",
+                         icon='ERROR')
+            return
+        for line in text.split("\n"):
+            if not line.strip():
+                column.separator()
+            elif line.startswith("NOTE") or line.startswith("Automatic"):
+                row = column.row()
+                row.alert = True
+                row.label(text=line)
+            else:
+                column.label(text=line)
+
+    # -- the operation -------------------------------------------------
+
+    def execute(self, context):
+        props = state.get_props(context)
+        obj, reason = _repair_target(context)
+        if obj is None:
+            self.report({'ERROR'}, "BSMT: " + reason)
+            return {'CANCELLED'}
+        if geodesic.ensure_loaded():
+            self.report({'ERROR'}, "BSMT: " + geodesic.ensure_loaded())
+            return {'CANCELLED'}
+
+        # --- pre-flight, before a single byte of geometry is touched -----
+        try:
+            canonical = _canonical_arrays(context, props, obj, rebuild=False)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+        for check in (_lists_match_mesh(props, obj, canonical),
+                      _local_inspection_is_current(props, canonical)):
+            ok, why = check
+            if not ok:
+                props.repair_local_report = why
+                props.repair_local_removable = False
+                self.report({'ERROR'}, "BSMT: " + why)
+                return {'CANCELLED'}
+        report, _region, why = _inspect_local_defect(props, canonical)
+        if report is None or not report["removable"]:
+            message = why or (report["reason"] if report else
+                              localrepair.MANUAL_EDIT_MESSAGE)
+            props.repair_local_report = message
+            props.repair_local_removable = False
+            print("[BSMT] local repair refused on '%s': %s" % (obj.name,
+                                                               message))
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        captured = {}
+
+        def work(work_obj, fresh, _before):
+            # Re-derived against the canonical mesh the wrapper just REBUILT,
+            # so the vertex sets handed to bmesh come from the same mesh state
+            # the acceptance test will be measured against. The pre-flight
+            # above is what refuses; this is what acts (sect. 7, sect. 11).
+            ok, why_fresh = _lists_match_mesh(props, work_obj, fresh)
+            if not ok:
+                raise meshrepair.RepairAborted(why_fresh)
+            ok, why_fresh = _local_inspection_is_current(props, fresh)
+            if not ok:
+                raise meshrepair.RepairAborted(why_fresh)
+            fresh_report, fresh_region, why_inner = _inspect_local_defect(
+                props, fresh)
+            if fresh_report is None:
+                raise meshrepair.RepairAborted(why_inner)
+            if not fresh_report["removable"]:
+                raise meshrepair.RepairAborted(fresh_report["reason"])
+
+            candidate = fresh_report["candidate"]
+            captured["report"] = fresh_report
+            captured["candidate"] = candidate
+            captured["region_id"] = fresh_region["region_id"]
+            captured["vertices_local"] = np.array(fresh.vertices_local,
+                                                  copy=True)
+            captured["triangles"] = np.array(fresh.triangles, copy=True)
+            stable = _stable_mm(fresh)
+            # Two different questions, two different signatures:
+            #   * did THIS defect's own non-manifold edges go? and
+            #   * did any non-manifold edge appear anywhere that was not
+            #     there before?
+            # Both keyed by midpoint POSITION, because removing faces
+            # renumbers every vertex index in the mesh.
+            captured["defect_signature"] = repair.region_signature(
+                stable, fresh_region)
+            captured["before_signature"] = repair.nonmanifold_signature(
+                stable, fresh.triangles)
+
+            counts = {}
+            for key in candidate["face_keys"]:
+                counts[key] = counts.get(key, 0) + 1
+            # Addressed by VERTEX SET, never by index: a canonical triangle is
+            # a loop triangle, and on a mesh that still carries quads it is
+            # not polygon i (sect. 7.7). A candidate face that is half a quad
+            # simply has no polygon with that vertex set, so the count below
+            # refuses instead of removing something else.
+            removed = meshrepair.remove_faces_by_vertex_sets(work_obj, counts)
+            if removed != candidate["face_count"]:
+                raise meshrepair.RepairAborted(
+                    "%d face(s) were removed, not the %d the approved "
+                    "candidate held - the candidate does not exist as whole "
+                    "faces in this mesh, so triangulate it first"
+                    % (removed, candidate["face_count"])
+                )
+            return ("defect %d - %s, %d face(s), %d vertex/vertices, "
+                    "%.4f mm2, %.2f mm across"
+                    % (fresh_region["region_id"],
+                       localrepair.CLASSIFICATION_LABELS.get(
+                           fresh_report["classification"],
+                           fresh_report["classification"]),
+                       removed, candidate["dropped_vertex_count"],
+                       candidate["area_mm2"], candidate["bbox_diagonal_mm"]))
+
+        def verify(before_report, after_report, _outcome):
+            candidate = captured.get("candidate")
+            if candidate is None:
+                return ["the removal did not record what it removed"]
+            reasons = localrepair.extra_removal_reasons(
+                before_report, after_report,
+                {"face_count": candidate["face_count"],
+                 "dropped_vertex_count": candidate["dropped_vertex_count"]},
+            )
+            try:
+                after = _canonical_arrays(context, props, obj, rebuild=False)
+            except Exception as exc:                  # noqa: BLE001
+                traceback.print_exc()
+                return reasons + ["the edited mesh could not be re-read (%s)"
+                                  % exc]
+            # sect. 9: the locality claim, checked rather than asserted.
+            reasons.extend(localrepair.locality_reasons(
+                captured["vertices_local"], captured["triangles"],
+                candidate["face_indices"],
+                after.vertices_local, after.triangles,
+            ))
+            after_signature = repair.nonmanifold_signature(
+                _stable_mm(after), after.triangles)
+            reasons.extend(localrepair.defect_resolved_reasons(
+                captured["defect_signature"], after_signature))
+            reasons.extend(localrepair.introduced_reasons(
+                captured["before_signature"], after_signature))
+            return reasons
+
+        result = self._guarded(context, "Remove local artifact faces", work,
+                               require_nonmanifold_decrease=True,
+                               verify=verify)
+        if result != {'FINISHED'}:
+            return result
+
+        # --- sect. 10/11: nothing may keep a pre-repair verdict -----------
+        #
+        # The highlights go FIRST. They were built from vertex indices of a
+        # mesh that no longer exists, and a violet patch drawn where deleted
+        # faces used to be is a dangling reference a researcher can see.
+        visualization.clear_repair_highlights()
+        summary = state.invalidate_for_geometry_change(context, obj.name,
+                                                       props)
+        candidate = captured.get("candidate") or {}
+        report = captured.get("report") or {}
+        message = (
+            "Removed %d local face(s) (%s) at defect %d: %d vertex/vertices "
+            "freed, %.4f mm2. %d landmark(s) restated, %d measurement(s) "
+            "invalidated."
+            % (candidate.get("face_count", 0),
+               localrepair.CLASSIFICATION_LABELS.get(
+                   report.get("classification", ""),
+                   report.get("classification", "")),
+               captured.get("region_id", 0),
+               candidate.get("dropped_vertex_count", 0),
+               candidate.get("area_mm2", 0.0),
+               summary["landmarks_restated"],
+               summary["measurements_invalidated"])
+        )
+        # The inspection described a mesh that no longer exists. It is
+        # cleared, not updated: the defect ids have been renumbered by the
+        # re-analysis the wrapper already ran (sect. 11).
+        state.clear_local_repair(props)
+        props.repair_local_report = message
+        print("[BSMT] " + message)
+        return {'FINISHED'}
 
 
 class BSMT_OT_remove_duplicate_faces(_RepairBase):
@@ -6097,6 +7195,1298 @@ class BSMT_OT_load_study_protocol(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Surface Regions (Milestone 3.29)
+# ---------------------------------------------------------------------------
+#
+# NOT ONE OPERATOR IN THIS SECTION CALLS THE SOLVER, and that is a design
+# constraint rather than an accident. A region is assembled from paths that
+# have ALREADY been computed; validating, showing, reordering, reversing,
+# renaming or deleting one reads properties and `pathcache` and stops there.
+# On a real scan a surface solve is tens of seconds to minutes, and a
+# researcher who has to think twice before renaming a region will not use
+# regions.
+
+
+def _region_context(context):
+    """(props, region) or (props, None). No geometry is read."""
+    props = state.get_props(context)
+    if props is None:
+        return None, None
+    return props, state.active_region(context, props)
+
+
+def _region_canonical(context, props, item):
+    """The canonical mesh a region's paths were solved on, or None.
+
+    `rebuild=False` on purpose: this is asked from validation, and a region
+    must never be the thing that forces a mesh rebuild. When the mesh is not
+    already cached the answer is None, and validation then simply does not
+    apply the geometry-hash and metric checks - which is honest, because it
+    genuinely has not checked them.
+    """
+    object_name = item.boundary_object if item is not None else ""
+    if not object_name:
+        object_name = state.region_object_name(context, item) if item else ""
+    obj = bpy.data.objects.get(object_name) if object_name else None
+    if obj is None or obj.type != 'MESH':
+        return None, None
+    try:
+        canonical = geodesic.meshcache.peek_current(obj)
+    except Exception:                                 # noqa: BLE001
+        canonical = None
+    return canonical, obj
+
+
+class BSMT_OT_add_region(bpy.types.Operator):
+    """Create a new, empty Surface Region.
+
+    A region is a closed boundary made of surface paths you have already
+    computed. Creating one computes nothing
+    """
+
+    bl_idname = "bsmt.add_region"
+    bl_label = "New Surface Region"
+    bl_description = ("Create an empty Surface Region. Nothing is computed -"
+                      " a region is assembled from paths that already exist")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return state.get_regions(context) is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        try:
+            item = state.add_region(context, props)
+        except regions.RegionError as exc:
+            self.report({'ERROR'}, "BSMT: %s" % exc)
+            return {'CANCELLED'}
+        self.report({'INFO'}, "BSMT: added %s" % item.label)
+        return {'FINISHED'}
+
+
+class BSMT_OT_remove_region(bpy.types.Operator):
+    """Delete the selected Surface Region.
+
+    Deletes the BOUNDARY DEFINITION only. Every landmark, surface path and
+    measurement it referenced is kept exactly as it was
+    """
+
+    bl_idname = "bsmt.remove_region"
+    bl_label = "Delete Region"
+    bl_description = ("Delete this region's boundary definition. The"
+                      " landmarks, surface paths and measurements it refers"
+                      " to are NOT deleted")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _region_context(context)[1] is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        props, item = _region_context(context)
+        if item is None:
+            self.report({'WARNING'}, "BSMT: select a region first")
+            return {'CANCELLED'}
+        label = item.label
+        state.remove_region(context, props, int(props.region_index))
+        self.report({'INFO'},
+                    "BSMT: deleted %s. Its paths and landmarks are unchanged."
+                    % label)
+        return {'FINISHED'}
+
+
+class BSMT_OT_add_region_landmark(bpy.types.Operator):
+    """Append the selected landmark to this region's boundary.
+
+    Nothing is computed. The boundary is solved only when you press Compute
+    Boundary
+    """
+
+    bl_idname = "bsmt.add_region_landmark"
+    bl_label = "Add Landmark"
+    bl_description = ("Append the landmark selected in Landmark Manager to"
+                      " this region's boundary. Nothing is computed")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        props, item = _region_context(context)
+        return item is not None and bool(state.get_landmarks(context))
+
+    def execute(self, context):
+        props, item = _region_context(context)
+        if item is None:
+            self.report({'WARNING'}, "BSMT: select a region first")
+            return {'CANCELLED'}
+        landmark = state.active_landmark(context, props)
+        if landmark is None:
+            self.report({'ERROR'},
+                        "BSMT: select a landmark in Landmark Manager first")
+            return {'CANCELLED'}
+        state.append_region_landmark(item, landmark)
+        state.refresh_region_status(context, item)
+        self.report({'INFO'}, "BSMT: added %s to %s's boundary"
+                    % (landmark.label, item.label))
+        return {'FINISHED'}
+
+
+class BSMT_OT_remove_region_landmark(bpy.types.Operator):
+    """Remove this landmark from the region's boundary.
+
+    The landmark itself is NOT deleted - only its place in this boundary
+    """
+
+    bl_idname = "bsmt.remove_region_landmark"
+    bl_label = "Remove Landmark"
+    bl_description = ("Remove this landmark from the boundary. The landmark"
+                      " itself is kept")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        _props, item = _region_context(context)
+        return item is not None and len(item.landmarks) > 0
+
+    def execute(self, context):
+        _props, item = _region_context(context)
+        if item is None or not len(item.landmarks):
+            return {'CANCELLED'}
+        index = int(item.landmark_index)
+        if not state.remove_region_landmark(item, index):
+            self.report({'WARNING'}, "BSMT: select a boundary landmark first")
+            return {'CANCELLED'}
+        state.refresh_region_status(context, item)
+        self.report({'INFO'}, "BSMT: removed boundary landmark %d" % (index + 1))
+        return {'FINISHED'}
+
+
+class BSMT_OT_move_region_landmark(bpy.types.Operator):
+    """Reorder this boundary landmark.
+
+    The order IS the boundary: A-B-C-D and A-C-B-D are different loops, so
+    the computed boundary stops matching and must be computed again
+    """
+
+    bl_idname = "bsmt.move_region_landmark"
+    bl_label = "Move Landmark"
+    bl_description = ("Move this landmark up or down the boundary order. The"
+                      " order defines the boundary")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: EnumProperty(
+        name="Direction",
+        items=(('UP', "Up", "Earlier in the boundary"),
+               ('DOWN', "Down", "Later in the boundary")),
+        default='UP',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        _props, item = _region_context(context)
+        return item is not None and len(item.landmarks) > 1
+
+    def execute(self, context):
+        _props, item = _region_context(context)
+        if item is None:
+            return {'CANCELLED'}
+        offset = -1 if self.direction == 'UP' else 1
+        moved = state.move_region_landmark(item, int(item.landmark_index),
+                                           offset)
+        if moved is None:
+            return {'CANCELLED'}
+        state.refresh_region_status(context, item)
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_region_landmarks(bpy.types.Operator):
+    """Remove every landmark from this region's boundary.
+
+    The landmarks themselves are kept; so is nothing else - the computed
+    boundary is discarded, because it described a definition that is gone
+    """
+
+    bl_idname = "bsmt.clear_region_landmarks"
+    bl_label = "Clear Boundary Landmarks"
+    bl_description = ("Empty this region's boundary definition. The landmarks"
+                      " themselves are kept")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        _props, item = _region_context(context)
+        return item is not None and len(item.landmarks) > 0
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        _props, item = _region_context(context)
+        if item is None:
+            return {'CANCELLED'}
+        count = len(item.landmarks)
+        item.landmarks.clear()
+        item.landmark_index = 0
+        state.clear_region_boundary(item)
+        try:
+            visualization.remove_region_boundary(item.stable_id)
+        except Exception:                             # pragma: no cover
+            pass
+        item.show_boundary = False
+        state.refresh_region_status(context, item)
+        self.report({'INFO'}, "BSMT: removed %d boundary landmark(s). The "
+                              "landmarks themselves are unchanged." % count)
+        return {'FINISHED'}
+
+
+class BSMT_OT_compute_region_boundary(bpy.types.Operator):
+    """Solve this region's closed boundary from its ordered landmarks.
+
+    THE ONLY REGION OPERATION THAT RUNS THE SOLVER. One exact geodesic per
+    consecutive landmark pair, including the closing pair, which on a real
+    scan is tens of seconds to minutes EACH and will block Blender
+    """
+
+    bl_idname = "bsmt.compute_region_boundary"
+    bl_label = "Compute Boundary"
+    bl_description = ("Solve one exact surface path per consecutive landmark"
+                      " pair, closing back to the first. This runs the"
+                      " geodesic solver and may block Blender for minutes")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props, item = _region_context(context)
+        if props is None or item is None or props.viz_running:
+            return False
+        return len(item.landmarks) >= regions.MIN_LANDMARKS
+
+    def execute(self, context):
+        props, item = _region_context(context)
+        if props is None or item is None:
+            return {'CANCELLED'}
+        if props.viz_running:
+            self.report({'WARNING'},
+                        "BSMT: a path computation is already running")
+            return {'CANCELLED'}
+
+        # --- refuse on the DEFINITION before anything expensive ----------
+        #
+        # The pure rules already know every way a definition can fail to
+        # describe a boundary - too few landmarks, a repeat, a landmark that
+        # has gone, one that was never picked, two on different components.
+        # Asking them first means the solver is never constructed for a
+        # boundary that could not have been drawn anyway.
+        verdict = state.refresh_region_status(context, item)
+        if verdict["code"] in regions.DEFINITION_FAULTS:
+            self.report({'ERROR'}, "BSMT: %s" % verdict["detail"])
+            return {'CANCELLED'}
+
+        unavailable = geodesic.ensure_loaded() or geodesic.measure_error()
+        if unavailable:
+            props.viz_status = unavailable
+            self.report({'ERROR'}, "BSMT: " + unavailable)
+            return {'CANCELLED'}
+
+        landmark_collection = state.get_landmarks(context)
+        ordered = [state.landmark_by_stable_id(landmark_collection,
+                                               int(entry.landmark_stable_id))
+                   for entry in item.landmarks]
+        object_name = ordered[0].surface_point.source_object
+        obj = bpy.data.objects.get(object_name)
+        if obj is None or obj.type != 'MESH':
+            message = "the scan '%s' is missing" % object_name
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+        spread = {landmark.surface_point.source_object for landmark in ordered}
+        if len(spread) > 1:
+            self.report({'ERROR'},
+                        "BSMT: the boundary landmarks are on %d different "
+                        "meshes (%s). A region lies on one scan."
+                        % (len(spread), ", ".join(sorted(spread))))
+            return {'CANCELLED'}
+
+        props.viz_running = True
+        pairs = regions.segment_pairs(item.landmark_ids)
+        props.viz_status = ("Computing %d boundary segments..." % len(pairs))
+        print("[BSMT] Computing %d boundary segment(s) for region '%s' - "
+              "Blender will not redraw until the solver returns"
+              % (len(pairs), item.label))
+        self._nudge(context)
+        started = time.perf_counter()
+        try:
+            return self._solve(context, props, item, obj, ordered, started)
+        finally:
+            props.viz_running = False
+
+    def _solve(self, context, props, item, obj, ordered, started):
+        solve = geodesic.solve
+        try:
+            canonical = geodesic.meshcache.get(context, obj, props.unit)
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            message = "canonical mesh unavailable (%s)" % exc
+            props.viz_status = message
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+
+        log_solver_target("region boundary", obj, canonical)
+        # The same gate every other route to the native solver passes. A
+        # dense scan with non-manifold edges has crashed Blender with
+        # SIGSEGV; a boundary is n solves rather than one, so a region is the
+        # LAST place to skip it.
+        gate = solver_preflight(props, canonical)
+        if not gate["allowed"]:
+            message = _report_preflight(self, gate, " (region boundary)",
+                                        obj.name)
+            props.viz_status = message
+            state.refresh_region_status(context, item, canonical)
+            self.report({'ERROR'}, "BSMT: " + message)
+            return {'CANCELLED'}
+        for line in gate["warnings"]:
+            print("[BSMT] warning (region boundary): %s" % line)
+
+        def spec(landmark):
+            point = landmark.surface_point
+            return solve.PointSpec(
+                point.triangle_index,
+                np.array(point.barycentric, dtype=np.float64),
+                component_id=point.component_id,
+                source_object=point.source_object,
+                geometry_hash=point.geometry_hash,
+                status=point.status,
+                valid=point.valid,
+            )
+
+        # ------------------------------------------------------------------
+        # TRANSACTIONAL. Every segment is solved into memory first and NOTHING
+        # is written until all of them have succeeded. A boundary that is part
+        # fresh and part stale is not a boundary - it is a drawing that looks
+        # authoritative while describing two different definitions - so the
+        # only two outcomes here are "the whole loop, computed now" and "the
+        # previous state, untouched, plus a named failure".
+        # ------------------------------------------------------------------
+        solved = []
+        count = len(ordered)
+        for position in range(count):
+            source = ordered[position]
+            target = ordered[(position + 1) % count]
+            label = "%s → %s" % (source.label, target.label)
+            props.viz_status = ("Computing boundary segment %d of %d (%s)..."
+                                % (position + 1, count, label))
+            self._nudge(context)
+            try:
+                result = solve.surface_path(
+                    canonical.vertices_solver, canonical.triangles,
+                    spec(source), spec(target),
+                    geometry_hash=canonical.geometry_hash,
+                )
+            except solve.MeasurementError as exc:
+                return self._failed(context, props, item, canonical,
+                                    position, label, exc.message)
+            except Exception as exc:                  # noqa: BLE001
+                traceback.print_exc()
+                return self._failed(
+                    context, props, item, canonical, position, label,
+                    "%s: %s" % (type(exc).__name__, exc))
+            solved.append((source, target, result))
+            print("[BSMT]   segment %d/%d %s: %.4f mm, %d points"
+                  % (position + 1, count, label, result.distance_mm,
+                     result.point_count))
+
+        # --- geometry must not have moved under us ------------------------
+        live = geodesic.meshcache.peek_current(obj)
+        if live is not None and live.geometry_hash != canonical.geometry_hash:
+            return self._failed(
+                context, props, item, canonical, -1, "",
+                "the mesh geometry changed while the boundary was being "
+                "computed")
+
+        return self._commit(context, props, item, obj, canonical, solved,
+                            started)
+
+    def _failed(self, context, props, item, canonical, position, label,
+                message):
+        """Nothing is written. Say which segment, and leave the rest alone.
+
+        POLICY, stated once: a failed compute NEVER replaces the previous
+        cache and never keeps a partial one. Whatever boundary the region had
+        before is still there and still described by its own definition key,
+        so if the definition has since changed it reads STALE and if it has
+        not it reads exactly as it did. The region cannot come out of here
+        VALID on a boundary that was not fully solved.
+        """
+        where = ("boundary segment %d (%s)" % (position + 1, label)
+                 if position >= 0 else "the boundary")
+        detail = "%s could not be computed: %s" % (where, message)
+        props.viz_status = detail
+        print("[BSMT] REFUSED: %s" % detail)
+        result = state.refresh_region_status(context, item, canonical)
+        # The stored verdict comes from the rules, which is what keeps this
+        # honest; the failure is reported separately rather than by writing a
+        # status the rules did not derive.
+        item.report = "\n".join(
+            regions.summary_lines(result)
+            + ["  compute refused: %s" % detail])
+        self.report({'ERROR'}, "BSMT: " + detail)
+        return {'CANCELLED'}
+
+    def _commit(self, context, props, item, obj, canonical, solved, started):
+        """Everything solved. Write the cache and the records in one go."""
+        elapsed = time.perf_counter() - started
+        item.segments.clear()
+        try:
+            pathcache.drop_region(item.stable_id)
+        except Exception:                             # pragma: no cover
+            pass
+
+        total_mm = 0.0
+        total_points = 0
+        for position, (source, target, result) in enumerate(solved):
+            points_local = np.array(
+                viz.solver_to_local(canonical, result.polyline_solver),
+                dtype=np.float64)
+            normals_local = viz.surface_normals(canonical, points_local)
+            stored = pathcache.store_region_segment(
+                item.stable_id, position, points_local, normals_local)
+            if not stored:
+                # Storage failed after a successful solve. Refuse the whole
+                # commit rather than keep a boundary with a hole in it.
+                state.clear_region_boundary(item)
+                return self._failed(context, props, item, canonical, position,
+                                    "%s → %s" % (source.label, target.label),
+                                    "the computed path could not be cached")
+            segment = item.segments.add()
+            segment.from_landmark = int(source.stable_id)
+            segment.to_landmark = int(target.stable_id)
+            segment.computed = True
+            segment.point_count = int(stored)
+            segment.length_mm = float(result.polyline_length_mm)
+            segment.distance_mm = float(result.distance_mm)
+            segment.mode = result.mode
+            segment.object_name = canonical.source_object
+            segment.geometry_hash = canonical.geometry_hash
+            segment.metric_tensor = state.metric_tensor(
+                obj.matrix_world, canonical.unit_multiplier)
+            segment.metric_key = canonical.metric_key
+            segment.unit = props.unit
+            segment.from_triangle = int(source.surface_point.triangle_index)
+            segment.from_bary = tuple(
+                float(value) for value in source.surface_point.barycentric)
+            segment.to_triangle = int(target.surface_point.triangle_index)
+            segment.to_bary = tuple(
+                float(value) for value in target.surface_point.barycentric)
+            segment.component_id = int(source.surface_point.component_id)
+            total_mm += float(result.polyline_length_mm)
+            total_points += int(stored)
+
+        # The definition this cache belongs to, stamped last. Until this line
+        # runs there is no boundary as far as validation is concerned.
+        item.cached_definition = regions.definition_key(item.landmark_ids)
+        item.computed_elapsed_s = float(elapsed)
+        # Orphans from a longer previous definition would otherwise sit in the
+        # file waiting to be picked up by a future definition of the same size.
+        try:
+            pathcache.keep_only_regions(
+                [(int(region.stable_id), len(region.segments))
+                 for region in (state.get_regions(context) or ())])
+        except Exception:                             # pragma: no cover
+            pass
+
+        result = state.refresh_region_status(context, item, canonical)
+        item.show_boundary = True
+        viz.draw_region_boundary(context, props, item,
+                                 trusted=result["status"] in regions.TRUSTED)
+        visualization.set_region_boundary_visible(item.stable_id, True)
+
+        summary = ("boundary computed: %d segments, %.1f mm around, "
+                   "%d points, %.2f s"
+                   % (len(solved), total_mm, total_points, elapsed))
+        props.viz_status = summary
+        print("[BSMT] %s '%s': %s" % (item.protocol_id, item.label, summary))
+        self.report({'INFO'}, "BSMT: " + summary)
+        return {'FINISHED'}
+
+    @staticmethod
+    def _nudge(context):
+        try:
+            if context.area is not None:
+                context.area.tag_redraw()
+        except Exception:                             # pragma: no cover
+            pass
+
+
+class BSMT_OT_validate_region(bpy.types.Operator):
+    """Check that this region's computed boundary is still the answer.
+
+    Reads the cached boundary and its provenance. It never runs the geodesic
+    solver, so it costs the same on a 20k-triangle mesh and a 1M one
+    """
+
+    bl_idname = "bsmt.validate_region"
+    bl_label = "Validate Region"
+    bl_description = ("Check that this region's computed boundary still"
+                      " matches its landmarks. Reads the cache only - no"
+                      " solver")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return _region_context(context)[1] is not None
+
+    def execute(self, context):
+        props, item = _region_context(context)
+        if item is None:
+            self.report({'WARNING'}, "BSMT: select a region first")
+            return {'CANCELLED'}
+        canonical, _obj = _region_canonical(context, props, item)
+        result = state.refresh_region_status(context, item, canonical,
+                                             check_touching=True)
+        lines = regions.summary_lines(result)
+        if canonical is None:
+            lines.append("  note: the mesh is not cached, so the geometry "
+                         "and metric checks were NOT applied")
+        item.report = "\n".join(lines)
+        item.validated = True
+        item.validated_fingerprint = state.region_fingerprint(item, result)
+        print("\n[BSMT] region '%s'" % item.label)
+        for line in lines:
+            print("[BSMT]   %s" % line)
+        level = ({'INFO'} if result["status"] == regions.STATUS_VALID
+                 else {'WARNING'})
+        self.report(level, "BSMT: %s - %s"
+                    % (regions.STATUS_SHORT.get(result["status"],
+                                                result["status"]),
+                       result["detail"]))
+        return {'FINISHED'}
+
+
+class BSMT_OT_show_region_boundary(bpy.types.Operator):
+    """Draw this region's closed boundary from its CACHED paths.
+
+    No solver call: the polylines were computed once and kept
+    """
+
+    bl_idname = "bsmt.show_region_boundary"
+    bl_label = "Show Boundary"
+    bl_description = ("Draw the closed boundary from the cached surface"
+                      " paths. Nothing is computed")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        _props, item = _region_context(context)
+        return item is not None and len(item.segments) > 0
+
+    def execute(self, context):
+        props, item = _region_context(context)
+        if item is None:
+            return {'CANCELLED'}
+        canonical, _obj = _region_canonical(context, props, item)
+        result = state.refresh_region_status(context, item, canonical)
+        trusted = result["status"] in regions.TRUSTED
+        helper, missing = viz.draw_region_boundary(context, props, item,
+                                                   trusted=trusted)
+        if helper is None:
+            self.report({'WARNING'},
+                        "BSMT: nothing to draw - %s" % result["detail"])
+            return {'CANCELLED'}
+        item.show_boundary = True
+        visualization.set_region_boundary_visible(item.stable_id, True)
+        if missing:
+            self.report({'WARNING'},
+                        "BSMT: drew a PARTIAL boundary - segment(s) %s have "
+                        "no computed path"
+                        % ", ".join(str(value) for value in missing))
+        elif not trusted:
+            # Drawn, but in the warning colour and said out loud. A boundary
+            # BSMT cannot vouch for must not pass as one it can.
+            self.report({'WARNING'},
+                        "BSMT: boundary shown in the warning colour - %s"
+                        % result["detail"])
+        else:
+            self.report({'INFO'}, "BSMT: boundary shown (%.1f mm around)"
+                        % result["length_mm"])
+        return {'FINISHED'}
+
+
+class BSMT_OT_hide_region_boundary(bpy.types.Operator):
+    """Hide this region's boundary. The definition and the paths are kept"""
+
+    bl_idname = "bsmt.hide_region_boundary"
+    bl_label = "Hide Boundary"
+    bl_description = ("Hide the boundary. Showing it again computes nothing")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return _region_context(context)[1] is not None
+
+    def execute(self, context):
+        _props, item = _region_context(context)
+        if item is None:
+            return {'CANCELLED'}
+        item.show_boundary = False
+        visualization.set_region_boundary_visible(item.stable_id, False)
+        return {'FINISHED'}
+
+
+class BSMT_OT_refresh_region_boundaries(bpy.types.Operator):
+    """Restate every region and redraw the boundaries that are shown.
+
+    Reads cached paths only. No solver call, whatever the state of the scene
+    """
+
+    bl_idname = "bsmt.refresh_regions"
+    bl_label = "Refresh Regions"
+    bl_description = ("Re-check every region against its paths and redraw the"
+                      " visible boundaries. Nothing is computed")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return state.get_regions(context) is not None
+
+    def execute(self, context):
+        props = state.get_props(context)
+        collection = state.get_regions(context) or ()
+        shown = 0
+        for item in collection:
+            canonical, _obj = _region_canonical(context, props, item)
+            result = state.refresh_region_status(context, item, canonical)
+            if item.show_boundary:
+                viz.draw_region_boundary(
+                    context, props, item,
+                    trusted=result["status"] in regions.TRUSTED)
+                visualization.set_region_boundary_visible(item.stable_id, True)
+                shown += 1
+            else:
+                visualization.set_region_boundary_visible(item.stable_id,
+                                                          False)
+        visualization.remove_orphan_region_boundaries(
+            [int(item.stable_id) for item in collection])
+        self.report({'INFO'}, "BSMT: %d region(s) restated, %d boundary/ies "
+                              "drawn" % (len(collection), shown))
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_region_boundaries(bpy.types.Operator):
+    """Remove every region boundary from the viewport. Definitions are kept"""
+
+    bl_idname = "bsmt.clear_region_boundaries"
+    bl_label = "Clear Boundaries"
+    bl_description = ("Remove every drawn region boundary. The definitions"
+                      " and the cached paths are kept")
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        removed = visualization.clear_region_boundaries()
+        for item in (state.get_regions(context) or ()):
+            item.show_boundary = False
+        self.report({'INFO'}, "BSMT: removed %d boundary/ies" % removed)
+        return {'FINISHED'}
+
+
+class BSMT_OT_compute_region_interior(bpy.types.Operator):
+    """Work out which side of this region's boundary is the region.
+
+    Topology and geometry analysis on the mesh BSMT already has. It does NOT
+    run the geodesic solver, so it costs seconds rather than minutes
+    """
+
+    bl_idname = "bsmt.compute_region_interior"
+    bl_label = "Compute Interior"
+    bl_description = ("Classify every triangle as inside, outside or cut by"
+                      " the boundary, and clip the cut ones exactly. No"
+                      " geodesic solver is used")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props, item = _region_context(context)
+        if props is None or item is None or props.viz_running:
+            return False
+        return len(item.segments) > 0
+
+    def execute(self, context):
+        props, item = _region_context(context)
+        if item is None:
+            self.report({'WARNING'}, "BSMT: select a region first")
+            return {'CANCELLED'}
+
+        # The boundary must be CURRENT. An interior computed from a stale
+        # boundary would be a precise answer to a question nobody asked.
+        canonical, obj = _region_canonical(context, props, item)
+        verdict = state.refresh_region_status(context, item, canonical)
+        if verdict["status"] not in regions.TRUSTED:
+            state.refresh_interior_status(item, verdict, canonical)
+            self.report({'ERROR'},
+                        "BSMT: the boundary is %s - compute it before asking "
+                        "for its interior. %s"
+                        % (regions.STATUS_SHORT.get(verdict["status"],
+                                                    verdict["status"]),
+                           verdict["detail"]))
+            return {'CANCELLED'}
+        if canonical is None or obj is None:
+            self.report({'ERROR'},
+                        "BSMT: the scan's analysed mesh is not available - "
+                        "run Analyze Topology on it first")
+            return {'CANCELLED'}
+
+        loop, closed, missing = viz.region_boundary_points(item)
+        if missing or loop.shape[0] < 3:
+            self.report({'ERROR'},
+                        "BSMT: the cached boundary is incomplete - press "
+                        "Compute Boundary")
+            return {'CANCELLED'}
+
+        # Say what is about to happen BEFORE it happens. Compute Interior is
+        # seconds on a real scan rather than the minutes a solve costs, but
+        # Blender does not redraw while it runs, so silence reads as a hang.
+        props.viz_status = ("Classifying %s triangles against the boundary..."
+                            % "{:,}".format(len(canonical.triangles)))
+        print("[BSMT] Computing interior for region '%s': %s triangles, %d "
+              "boundary points - Blender will not redraw until it returns"
+              % (item.label, "{:,}".format(len(canonical.triangles)),
+                 loop.shape[0]))
+        self._nudge(context)
+        started = time.perf_counter()
+        stages = {}
+        try:
+            analysis = interior.compute(
+                canonical.vertices_local, canonical.triangles, loop,
+                component_labels=canonical.triangle_components,
+                timings=stages)
+        except interior.InteriorError as exc:
+            # The headline goes to the operator report; the diagnostic record
+            # - which can run to a dozen lines - goes to the console, where
+            # it can actually be read.
+            headline = exc.message.split("\n", 1)[0]
+            item.interior_status = interior.STATUS_INVALID
+            item.interior_code = exc.code
+            item.interior_detail = headline
+            item.interior_definition = ""
+            print("[BSMT] REFUSED (interior): %s" % headline)
+            for line in exc.message.split("\n")[1:]:
+                print("[BSMT]   %s" % line)
+            self.report({'ERROR'}, "BSMT: " + headline)
+            return {'CANCELLED'}
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            message = "interior analysis failed (%s: %s)" % (
+                type(exc).__name__, exc)
+            item.interior_status = interior.STATUS_INVALID
+            item.interior_code = interior.CODE_NOT_COMPUTED
+            item.interior_detail = message
+            self.report({'ERROR'}, "BSMT: " + message + " - see the console")
+            return {'CANCELLED'}
+
+        elapsed = time.perf_counter() - started
+        side = analysis["sides"][item.interior_side]
+        item.interior_full_count = int(side["full_count"])
+        item.interior_partial_count = int(side["partial_count"])
+        item.interior_component_id = int(analysis["component_id"] or 0)
+        item.interior_geometry_hash = canonical.geometry_hash
+        item.interior_elapsed_s = float(elapsed)
+        # Stamped LAST, for the same reason the boundary's key is: until this
+        # line runs there is no interior as far as validation is concerned.
+        # The classification itself, in float64, next to the drawing made
+        # from it. The fill is float32 display geometry and carries no link
+        # back to a clipped piece's parent triangle, so it can be drawn from
+        # but not measured from - see `interiorcache`.
+        interiorcache.store(
+            item.stable_id, side["full_triangles"],
+            [(entry["triangle"], entry["bary"]) for entry in side["partial"]],
+            item.interior_side, canonical.geometry_hash)
+        interiorcache.keep_only(
+            [int(region.stable_id)
+             for region in (state.get_regions(context) or ())])
+        item.interior_definition = state.interior_fingerprint(item)
+        item.interior_status = interior.STATUS_VALID
+        item.interior_code = interior.CODE_NONE
+        item.interior_detail = (
+            "%s: %d whole triangles and %d clipped by the boundary."
+            % (interior.SIDE_LABELS.get(item.interior_side,
+                                        item.interior_side),
+               side["full_count"], side["partial_count"]))
+
+        self._draw_fill(context, props, item, canonical, obj, analysis)
+        summary = ("interior computed: %s, %d full + %d partial faces, %.2f s"
+                   % (interior.SIDE_LABELS.get(item.interior_side,
+                                               item.interior_side),
+                      side["full_count"], side["partial_count"], elapsed))
+        print("[BSMT] %s '%s': %s" % (item.protocol_id, item.label, summary))
+        tiling = analysis.get("tiling") or {}
+        # How the boundary actually met the mesh, in one line. The two ways
+        # it can are not interchangeable: a chord CUTS a triangle and has to
+        # be clipped exactly, while a run ALONG a mesh edge cuts nothing and
+        # severs an adjacency instead. Seeing both counts is what tells you
+        # which kind of boundary you are looking at - a scan whose boundary
+        # follows mesh edges will show few partials and many aligned edges.
+        print("[BSMT]   interior boundary: %d partial triangles / %d "
+              "edge-aligned mesh edges (%d adjacencies severed) / tiling max "
+              "relative residual %.2e"
+              % (analysis.get("partial_triangles", 0),
+                 analysis.get("aligned_edges", 0),
+                 analysis.get("severed_edges", 0),
+                 (tiling or {}).get("worst_relative", 0.0)))
+        if tiling.get("checked"):
+            # The invariant that refuses a wrong partition, reported even
+            # when it passes: "it tiled" is less useful than "it tiled, and
+            # here is how close the worst one came".
+            print("[BSMT]   tiling: %d boundary triangles | max abs residual "
+                  "%.2e mm^2 | max relative %.2e | worst triangle %d"
+                  % (tiling["checked"], tiling["worst_absolute"],
+                     tiling["worst_relative"], tiling["worst_triangle"]))
+        if analysis.get("timings"):
+            print("[BSMT]   stages: %s" % analysis["timings"])
+            print("[BSMT]   %s triangles, %d boundary points, %d cut "
+                  "triangles, %d edges touching a cut"
+                  % ("{:,}".format(len(canonical.triangles)), loop.shape[0],
+                     len(analysis["crossed_triangles"]),
+                     analysis.get("cut_edge_count", 0)))
+        for line in (analysis["limits"],):
+            print("[BSMT]   scope: %s" % line)
+        self.report({'INFO'}, "BSMT: " + summary)
+        return {'FINISHED'}
+
+    @staticmethod
+    def _nudge(context):
+        try:
+            if context.area is not None:
+                context.area.tag_redraw()
+        except Exception:                             # pragma: no cover
+            pass
+
+    @staticmethod
+    def _draw_fill(context, props, item, canonical, obj, analysis):
+        """Build the fill helper from the classification just computed."""
+        side = analysis["sides"][item.interior_side]
+        points, faces = state.interior_fill_geometry(
+            canonical.vertices_local, canonical.triangles, side)
+        visualization.update_region_fill(
+            context, props, item.stable_id, points, faces, obj.matrix_world,
+            tuple(item.fill_color), float(item.fill_opacity))
+        item.show_fill = True
+        visualization.set_region_fill_visible(item.stable_id, True)
+
+
+class BSMT_OT_show_region_fill(bpy.types.Operator):
+    """Draw this region's computed interior on the body surface.
+
+    Reuses the classified faces. No solver, and no re-analysis
+    """
+
+    bl_idname = "bsmt.show_region_fill"
+    bl_label = "Show Fill"
+    bl_description = ("Draw the computed interior. Nothing is computed - the"
+                      " classified faces are reused")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        _props, item = _region_context(context)
+        return item is not None and bool(item.interior_definition)
+
+    def execute(self, context):
+        props, item = _region_context(context)
+        if item is None:
+            return {'CANCELLED'}
+        canonical, obj = _region_canonical(context, props, item)
+        verdict = state.refresh_region_status(context, item, canonical)
+        result = state.refresh_interior_status(item, verdict, canonical)
+        helper = visualization.region_fill(item.stable_id)
+        if helper is None:
+            self.report({'WARNING'},
+                        "BSMT: nothing to draw - press Compute Interior")
+            return {'CANCELLED'}
+        trusted = result["status"] in interior.TRUSTED
+        colour = (tuple(item.fill_color) if trusted
+                  else visualization.REGION_FILL_UNTRUSTED_COLOR)
+        visualization.update_region_fill(
+            context, props, item.stable_id,
+            [vertex.co.copy() for vertex in helper.data.vertices],
+            [tuple(polygon.vertices) for polygon in helper.data.polygons],
+            obj.matrix_world if obj is not None else helper.matrix_world,
+            colour, float(item.fill_opacity))
+        item.show_fill = True
+        visualization.set_region_fill_visible(item.stable_id, True)
+        if not trusted:
+            # Drawn, but in the warning colour and said out loud. An interior
+            # BSMT cannot vouch for must not pass for one it can.
+            self.report({'WARNING'},
+                        "BSMT: fill shown in the warning colour - %s"
+                        % result["detail"])
+        else:
+            self.report({'INFO'}, "BSMT: fill shown (%d full + %d partial)"
+                        % (item.interior_full_count,
+                           item.interior_partial_count))
+        return {'FINISHED'}
+
+
+class BSMT_OT_hide_region_fill(bpy.types.Operator):
+    """Hide this region's fill. The computed interior is kept"""
+
+    bl_idname = "bsmt.hide_region_fill"
+    bl_label = "Hide Fill"
+    bl_description = ("Hide the fill. Showing it again computes nothing")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return _region_context(context)[1] is not None
+
+    def execute(self, context):
+        _props, item = _region_context(context)
+        if item is None:
+            return {'CANCELLED'}
+        item.show_fill = False
+        visualization.set_region_fill_visible(item.stable_id, False)
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_region_fills(bpy.types.Operator):
+    """Remove every drawn region fill. The boundaries are kept"""
+
+    bl_idname = "bsmt.clear_region_fills"
+    bl_label = "Clear Fills"
+    bl_description = ("Remove every drawn region fill. The boundaries and"
+                      " the computed interiors are kept")
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        removed = visualization.clear_region_fills()
+        for item in (state.get_regions(context) or ()):
+            item.show_fill = False
+        self.report({'INFO'}, "BSMT: removed %d fill(s)" % removed)
+        return {'FINISHED'}
+
+
+def _region_component_faces(canonical, component_id):
+    """Every triangle of one connected component, as a face list."""
+    labels = canonical.triangle_components
+    wanted = int(component_id)
+    return [tuple(int(value) for value in canonical.triangles[index])
+            for index in range(len(canonical.triangles))
+            if int(labels[index]) == wanted]
+
+
+def _outward_direction(canonical, component_id):
+    """+1 / -1 for which way to offset, or (None, why) when it is unknown.
+
+    Determined from the component's SIGNED VOLUME, not assumed from the
+    winding: outward is a property of a solid, and a component that does not
+    enclose one has no outward at all. BSMT refuses there rather than picking
+    a side - extruding a preview into the body would look entirely plausible
+    and be exactly backwards.
+    """
+    faces = _region_component_faces(canonical, component_id)
+    if not faces:
+        return None, ("the interior's surface component could not be "
+                      "identified")
+    if not panelpreview.is_closed(faces):
+        return None, ("the surface component this region lies on is OPEN - "
+                      "it has boundary edges - so nothing defines which side "
+                      "is outward. BSMT refuses rather than guessing, "
+                      "because extruding into the body would look right and "
+                      "be backwards")
+    sign = panelpreview.outward_sign(canonical.vertices_local, faces)
+    if sign is None:
+        return None, ("the surface component encloses no measurable volume, "
+                      "so outward cannot be determined")
+    return sign, ""
+
+
+class BSMT_OT_show_region_panel(bpy.types.Operator):
+    """Draw a thickness preview of this region's computed interior.
+
+    A VISUALIZATION: the classified interior offset outward along the body
+    surface normals. It is not a physical simulation and not a manufacturing
+    model
+    """
+
+    bl_idname = "bsmt.show_region_panel"
+    bl_label = "Show Thickness Preview"
+    bl_description = ("Offset the computed interior outward by the thickness"
+                      " and draw it as a panel. Nothing is re-analysed and no"
+                      " solver runs - this is a visualization, not a"
+                      " simulation")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        _props, item = _region_context(context)
+        return item is not None and bool(item.interior_definition)
+
+    def execute(self, context):
+        props, item = _region_context(context)
+        if item is None:
+            return {'CANCELLED'}
+
+        # The INTERIOR must be current. A preview of a stale classification
+        # is a solid-looking picture of a region that has moved.
+        canonical, obj = _region_canonical(context, props, item)
+        verdict = state.refresh_region_status(context, item, canonical)
+        result = state.refresh_interior_status(item, verdict, canonical)
+        if result["status"] not in interior.TRUSTED:
+            state.clear_region_panel(item)
+            self.report({'ERROR'},
+                        "BSMT: the interior is %s - compute it before asking "
+                        "for a thickness preview. %s"
+                        % (interior.STATUS_SHORT.get(result["status"],
+                                                     result["status"]),
+                           result["detail"]))
+            return {'CANCELLED'}
+
+        try:
+            thickness = panelpreview.check_thickness(item.panel_thickness_mm)
+        except panelpreview.PreviewError as exc:
+            item.panel_detail = exc.message
+            self.report({'ERROR'}, "BSMT: " + exc.message)
+            return {'CANCELLED'}
+
+        # BUILT FROM THE FILL, which IS the classified interior. Not from a
+        # fresh analysis - that is what makes "changing the thickness
+        # recomputes nothing" true by construction rather than by promise.
+        fill = visualization.region_fill(item.stable_id)
+        if fill is None or not len(fill.data.polygons):
+            self.report({'ERROR'},
+                        "BSMT: there is no computed interior to give a "
+                        "thickness to - press Compute Interior")
+            return {'CANCELLED'}
+
+        direction, why = _outward_direction(canonical,
+                                            item.interior_component_id)
+        if direction is None:
+            state.clear_region_panel(item)
+            item.panel_detail = why
+            print("[BSMT] REFUSED (thickness preview): %s" % why)
+            self.report({'ERROR'}, "BSMT: " + why)
+            return {'CANCELLED'}
+
+        points = [tuple(vertex.co) for vertex in fill.data.vertices]
+        faces = [tuple(polygon.vertices) for polygon in fill.data.polygons]
+        diagonal = float(np.linalg.norm(
+            canonical.vertices_local.max(axis=0)
+            - canonical.vertices_local.min(axis=0)))
+        try:
+            shell = panelpreview.build_shell(points, faces, thickness,
+                                             direction,
+                                             diagonal * 1e-6)
+        except panelpreview.PreviewError as exc:
+            state.clear_region_panel(item)
+            item.panel_detail = exc.message
+            print("[BSMT] REFUSED (thickness preview): %s" % exc.message)
+            self.report({'ERROR'}, "BSMT: " + exc.message)
+            return {'CANCELLED'}
+
+        visualization.update_region_panel(
+            context, props, item.stable_id, shell["points"], shell["faces"],
+            obj.matrix_world if obj is not None else fill.matrix_world,
+            tuple(item.panel_color), float(item.panel_opacity))
+        item.show_panel = True
+        visualization.set_region_panel_visible(item.stable_id, True)
+        item.panel_built = state.panel_fingerprint(item)
+        item.panel_folded_faces = int(shell["folded_faces"])
+        item.panel_detail = (
+            "%.2f mm outward: %d surface faces, %d side-wall faces, %d "
+            "boundary loop(s)."
+            % (thickness, shell["base_face_count"], shell["wall_face_count"],
+               shell["loop_count"]))
+
+        print("[BSMT] %s '%s': thickness preview %s"
+              % (item.protocol_id, item.label, item.panel_detail))
+        print("[BSMT]   scope: %s" % panelpreview.LIMITS)
+        if shell["folded_faces"]:
+            warning = ("%d face(s) of the offset surface have folded through "
+                       "themselves - the thickness exceeds the local radius "
+                       "of curvature there. The preview is drawn, but it is "
+                       "not a usable shape in those places."
+                       % shell["folded_faces"])
+            print("[BSMT]   WARNING: %s" % warning)
+            self.report({'WARNING'}, "BSMT: " + warning)
+        else:
+            self.report({'INFO'}, "BSMT: thickness preview - "
+                        + item.panel_detail)
+        return {'FINISHED'}
+
+
+class BSMT_OT_hide_region_panel(bpy.types.Operator):
+    """Hide this region's thickness preview. The interior is kept"""
+
+    bl_idname = "bsmt.hide_region_panel"
+    bl_label = "Hide Thickness Preview"
+    bl_description = "Hide the thickness preview. Nothing is recomputed"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return _region_context(context)[1] is not None
+
+    def execute(self, context):
+        _props, item = _region_context(context)
+        if item is None:
+            return {'CANCELLED'}
+        item.show_panel = False
+        visualization.set_region_panel_visible(item.stable_id, False)
+        return {'FINISHED'}
+
+
+class BSMT_OT_clear_region_panels(bpy.types.Operator):
+    """Remove every drawn thickness preview. Interiors and fills are kept"""
+
+    bl_idname = "bsmt.clear_region_panels"
+    bl_label = "Clear Thickness Previews"
+    bl_description = ("Remove every drawn thickness preview. The computed"
+                      " interiors and the fills are kept")
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        removed = visualization.clear_region_panels()
+        for item in (state.get_regions(context) or ()):
+            item.panel_built = ""
+            item.show_panel = False
+        self.report({'INFO'}, "BSMT: removed %d thickness preview(s)"
+                    % removed)
+        return {'FINISHED'}
+
+
+class BSMT_OT_compute_region_area(bpy.types.Operator):
+    """Measure the selected region's surface area on the body mesh.
+
+    The mesh surface area of the selected region on the triangular body
+    mesh - whole interior triangles plus the exactly-clipped polygons where
+    the boundary cuts through one. No solver, and no re-analysis
+    """
+
+    bl_idname = "bsmt.compute_region_area"
+    bl_label = "Compute Area"
+    bl_description = ("Sum the whole interior triangles and the clipped"
+                      " boundary polygons. Mesh area on the triangular body"
+                      " mesh - not true anatomical surface area")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        props, item = _region_context(context)
+        return (props is not None and item is not None
+                and not props.viz_running
+                and bool(item.interior_definition))
+
+    def execute(self, context):
+        props, item = _region_context(context)
+        if item is None:
+            self.report({'WARNING'}, "BSMT: select a region first")
+            return {'CANCELLED'}
+
+        # The INTERIOR must be current. Measuring a stale classification
+        # would produce a precise number for a region that has moved, which
+        # is worse than no number at all.
+        canonical, _obj = _region_canonical(context, props, item)
+        verdict = state.refresh_region_status(context, item, canonical)
+        result = state.refresh_interior_status(item, verdict, canonical)
+        if result["status"] not in interior.TRUSTED:
+            state.refresh_area_status(item, result)
+            self.report({'ERROR'},
+                        "BSMT: the interior is %s - compute it before asking "
+                        "for its area. %s"
+                        % (interior.STATUS_SHORT.get(result["status"],
+                                                     result["status"]),
+                           result["detail"]))
+            return {'CANCELLED'}
+        if canonical is None:
+            self.report({'ERROR'},
+                        "BSMT: the scan's analysed mesh is not available - "
+                        "run Analyze Topology on it first")
+            return {'CANCELLED'}
+
+        stored = interiorcache.load(item.stable_id)
+        if stored is None:
+            item.area_status = surfacearea.STATUS_INVALID
+            item.area_code = surfacearea.CODE_NO_INTERIOR
+            item.area_detail = ("The interior classification is not in this "
+                                "file. Press Compute Interior.")
+            self.report({'ERROR'}, "BSMT: " + item.area_detail)
+            return {'CANCELLED'}
+        if stored["geometry_hash"] != canonical.geometry_hash:
+            item.area_status = surfacearea.STATUS_STALE
+            item.area_code = surfacearea.CODE_GEOMETRY_MISMATCH
+            item.area_detail = ("The interior was classified on different "
+                                "geometry. Press Compute Interior.")
+            self.report({'ERROR'}, "BSMT: " + item.area_detail)
+            return {'CANCELLED'}
+
+        started = time.perf_counter()
+        try:
+            # PHYSICAL MILLIMETRES. The interior is classified in the scan's
+            # object-local space, so its own areas are in local units; the
+            # clipped pieces are stored barycentrically precisely so they can
+            # be rebuilt against the millimetre corners of their own parent
+            # triangle instead of being rescaled after the fact.
+            measured = surfacearea.region_area_mm2(
+                canonical.vertices_solver, canonical.triangles,
+                stored["full_triangles"], stored["pieces"])
+        except surfacearea.AreaError as exc:
+            item.area_status = surfacearea.STATUS_INVALID
+            item.area_code = exc.code
+            item.area_detail = exc.message
+            item.area_mm2 = 0.0
+            item.area_interior_key = ""
+            print("[BSMT] REFUSED (area): %s" % exc.message)
+            self.report({'ERROR'}, "BSMT: " + exc.message)
+            return {'CANCELLED'}
+        except Exception as exc:                      # noqa: BLE001
+            traceback.print_exc()
+            message = "area failed (%s: %s)" % (type(exc).__name__, exc)
+            item.area_status = surfacearea.STATUS_INVALID
+            item.area_code = surfacearea.CODE_NOT_COMPUTED
+            item.area_detail = message
+            self.report({'ERROR'}, "BSMT: " + message + " - see the console")
+            return {'CANCELLED'}
+
+        elapsed = time.perf_counter() - started
+        item.area_mm2 = float(measured["area_mm2"])
+        item.area_full_mm2 = float(measured["full_mm2"])
+        item.area_partial_mm2 = float(measured["partial_mm2"])
+        item.area_component_mm2 = surfacearea.component_area_mm2(
+            canonical.vertices_solver, canonical.triangles,
+            canonical.triangle_components, item.interior_component_id)
+        item.area_method = measured["method"]
+        item.area_side = item.interior_side
+        item.area_geometry_hash = canonical.geometry_hash
+        item.area_elapsed_s = float(elapsed)
+        item.area_detail = (
+            "%s and %s of the %s: %d whole triangles and %d clipped pieces."
+            % (surfacearea.format_mm2(item.area_mm2), surfacearea.format_cm2(item.area_mm2),
+               interior.SIDE_LABELS.get(item.interior_side,
+                                        item.interior_side),
+               measured["full_count"], measured["partial_count"]))
+        # Stamped LAST: until this line runs there is no area as far as
+        # validation is concerned.
+        item.area_interior_key = state.area_fingerprint(item)
+        item.area_status = surfacearea.STATUS_VALID
+        item.area_code = surfacearea.CODE_NONE
+
+        share = (100.0 * item.area_mm2 / item.area_component_mm2
+                 if item.area_component_mm2 > 0.0 else 0.0)
+        print("[BSMT] %s '%s': %s" % (item.protocol_id, item.label,
+                                      item.area_detail))
+        print("[BSMT]   method: %s" % surfacearea.METHOD_LABEL)
+        print("[BSMT]   %s of the surface component's %s (%.2f%%)"
+              % (surfacearea.format_mm2(item.area_mm2),
+                 surfacearea.format_mm2(item.area_component_mm2), share))
+        print("[BSMT]   this is the %s. It is NOT true anatomical surface "
+              "area." % surfacearea.DEFINITION)
+        self.report({'INFO'}, "BSMT: %s (%s)"
+                    % (surfacearea.format_mm2(item.area_mm2),
+                       surfacearea.format_cm2(item.area_mm2)))
+        return {'FINISHED'}
+
+
 class BSMT_OT_clear_topology(bpy.types.Operator):
     """Clear the topology diagnostics report"""
 
@@ -6139,6 +8529,26 @@ classes = (
     BSMT_OT_guided_picking,
     BSMT_OT_save_protocol,
     BSMT_OT_load_protocol,
+    BSMT_OT_add_region,
+    BSMT_OT_remove_region,
+    BSMT_OT_add_region_landmark,
+    BSMT_OT_remove_region_landmark,
+    BSMT_OT_move_region_landmark,
+    BSMT_OT_clear_region_landmarks,
+    BSMT_OT_compute_region_boundary,
+    BSMT_OT_validate_region,
+    BSMT_OT_show_region_boundary,
+    BSMT_OT_hide_region_boundary,
+    BSMT_OT_refresh_region_boundaries,
+    BSMT_OT_clear_region_boundaries,
+    BSMT_OT_compute_region_interior,
+    BSMT_OT_show_region_fill,
+    BSMT_OT_hide_region_fill,
+    BSMT_OT_clear_region_fills,
+    BSMT_OT_show_region_panel,
+    BSMT_OT_hide_region_panel,
+    BSMT_OT_clear_region_panels,
+    BSMT_OT_compute_region_area,
     BSMT_OT_export_measurements,
     BSMT_OT_export_landmarks,
     BSMT_OT_save_study_protocol,
@@ -6181,10 +8591,17 @@ classes = (
     BSMT_OT_repair_degenerate_local,
     BSMT_OT_show_non_manifold,
     BSMT_OT_focus_non_manifold,
+    BSMT_OT_step_nonmanifold_defect,
+    BSMT_OT_focus_nonmanifold_defect,
+    BSMT_OT_preview_artifact_component,
     BSMT_OT_show_boundary_loop,
     BSMT_OT_clear_repair_highlight,
     BSMT_OT_fill_boundary_loop,
     BSMT_OT_remove_small_component,
+    BSMT_OT_delete_defect_component,
+    BSMT_OT_inspect_local_defect,
+    BSMT_OT_preview_local_candidate,
+    BSMT_OT_remove_local_faces,
     BSMT_OT_remove_duplicate_faces,
     BSMT_OT_weld_non_manifold,
     BSMT_OT_auto_repair_local,
@@ -6244,6 +8661,28 @@ STAGE_BY_OPERATOR = {
     "bsmt.clear_cached_path": readiness.STAGE_VISUALIZATION,
     "bsmt.path_timing_report": readiness.STAGE_VISUALIZATION,
     "bsmt.clear_all_visualizations": readiness.STAGE_VISUALIZATION,
+
+    # Surface Regions - assembling closed boundaries from computed paths.
+    "bsmt.add_region": readiness.STAGE_REGIONS,
+    "bsmt.remove_region": readiness.STAGE_REGIONS,
+    "bsmt.add_region_landmark": readiness.STAGE_REGIONS,
+    "bsmt.remove_region_landmark": readiness.STAGE_REGIONS,
+    "bsmt.move_region_landmark": readiness.STAGE_REGIONS,
+    "bsmt.clear_region_landmarks": readiness.STAGE_REGIONS,
+    "bsmt.compute_region_boundary": readiness.STAGE_REGIONS,
+    "bsmt.validate_region": readiness.STAGE_REGIONS,
+    "bsmt.show_region_boundary": readiness.STAGE_REGIONS,
+    "bsmt.hide_region_boundary": readiness.STAGE_REGIONS,
+    "bsmt.refresh_regions": readiness.STAGE_REGIONS,
+    "bsmt.clear_region_boundaries": readiness.STAGE_REGIONS,
+    "bsmt.compute_region_interior": readiness.STAGE_REGIONS,
+    "bsmt.show_region_fill": readiness.STAGE_REGIONS,
+    "bsmt.hide_region_fill": readiness.STAGE_REGIONS,
+    "bsmt.clear_region_fills": readiness.STAGE_REGIONS,
+    "bsmt.show_region_panel": readiness.STAGE_REGIONS,
+    "bsmt.hide_region_panel": readiness.STAGE_REGIONS,
+    "bsmt.clear_region_panels": readiness.STAGE_REGIONS,
+    "bsmt.compute_region_area": readiness.STAGE_REGIONS,
 
     # Results and export.
     "bsmt.export_measurements": readiness.STAGE_EXPORT,

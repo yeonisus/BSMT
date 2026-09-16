@@ -17,8 +17,9 @@ from bpy.props import (
     StringProperty,
 )
 
-from . import (alignment, export, geodesic, landmarks, measurement,
-               measurements, overlay, pathcache, preprocess, readiness,
+from . import (alignment, export, geodesic, interior, interiorcache,
+               landmarks, measurement, measurements, overlay, panelpreview,
+               pathcache, preprocess, readiness, regions, surfacearea,
                timing, visualization)
 
 
@@ -624,6 +625,308 @@ class BSMT_Measurement(bpy.types.PropertyGroup):
         return bool(self.straight_valid or self.surface_valid)
 
 
+class BSMT_RegionLandmark(bpy.types.PropertyGroup):
+    """One boundary landmark of a Surface Region. THE authoritative reference.
+
+    A region IS its ordered landmark ids (Milestone 3.31). Everything else a
+    region stores - the segments, the polylines, the verdict - is derived from
+    this list and can be thrown away and recomputed; this cannot.
+
+    The reference is a LANDMARK stable id, never a list index and never a
+    dynamic enum value. Measured in Blender 4.5.13 and recorded in
+    measurements.py: an enum built from the landmark collection remaps by
+    index when that collection changes, so a picker reading "42" after
+    landmark 42 is deleted comes back as "43" - a different landmark, no
+    error. The name and protocol id beside it are cached for diagnostics and
+    for naming a reference that has gone; they are never used to find a
+    substitute.
+    """
+
+    landmark_stable_id: IntProperty(name="Landmark", default=0)
+    landmark_protocol_id: StringProperty(default="")
+    landmark_name: StringProperty(default="")
+
+
+class BSMT_RegionSegment(bpy.types.PropertyGroup):
+    """One computed boundary segment. A CACHED RESULT, not a definition.
+
+    Derived from consecutive boundary landmarks - position i joins landmark i
+    to landmark i+1, and the last joins Ln back to L1 - so there is nothing
+    here for a researcher to order or reverse. The polyline itself lives in
+    ``pathcache`` under the region's own name space; these are the facts
+    needed to decide whether that polyline is still the answer WITHOUT
+    reading geometry or running anything.
+
+    Region-owned, deliberately. A boundary segment is not a measurement: it
+    has no protocol id, appears in no CSV, and exists only as long as the
+    landmark definition that produced it.
+    """
+
+    from_landmark: IntProperty(default=0)
+    to_landmark: IntProperty(default=0)
+    computed: BoolProperty(default=False)
+
+    point_count: IntProperty(default=0)
+    length_mm: FloatProperty(default=0.0)
+    distance_mm: FloatProperty(default=0.0)
+    mode: StringProperty(default="")
+    elapsed_s: FloatProperty(default=0.0)
+
+    #: What it was solved on, and where its ends were at the time.
+    object_name: StringProperty(default="")
+    geometry_hash: StringProperty(default="")
+    metric_tensor: FloatVectorProperty(size=9, default=(0.0,) * 9)
+    metric_key: StringProperty(default="")
+    unit: StringProperty(default="")
+    from_triangle: IntProperty(default=-1)
+    from_bary: FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
+    to_triangle: IntProperty(default=-1)
+    to_bary: FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
+    component_id: IntProperty(default=0)
+
+
+def _on_region_landmark_picker(self, context):
+    """Append the chosen landmark to this region's boundary. WRITE-ONLY.
+
+    The picker exists so a human can choose; the authoritative write is the
+    integer it copies into a new `BSMT_RegionLandmark`. Nothing ever reads it
+    back - see `landmark_enum_items` on why a dynamic enum cannot be trusted
+    as a reference.
+    """
+    try:
+        stable_id = int(self.landmark_picker)
+    except (TypeError, ValueError):
+        return
+    if stable_id <= 0:
+        return
+    collection = get_landmarks(context)
+    landmark = (landmark_by_stable_id(collection, stable_id)
+                if collection else None)
+    if landmark is None:
+        return
+    append_region_landmark(self, landmark)
+    refresh_region_status(context, self)
+
+
+class BSMT_SurfaceRegion(bpy.types.PropertyGroup):
+    """A researcher-defined CLOSED BOUNDARY, specified by ordered landmarks.
+
+    Milestone 3.31. Consecutive boundary landmarks - including the
+    final-to-first pair, which is implicit and mandatory - are joined by
+    cached surface geodesic paths on the triangular mesh.
+
+    This is a boundary and nothing more: there is no area here, no enclosed
+    face set and no coverage figure. Those belong to a later milestone, and
+    building them on a boundary that has not first been proved closed is how
+    a plausible wrong number gets produced.
+
+    Definition vs. cache
+    --------------------
+    `landmarks` is the definition and is authoritative. `segments` plus the
+    polylines in `pathcache` are a CACHED RESULT of it, stamped with
+    `cached_definition` - the definition key they were computed for. Any edit
+    to the definition changes that key, which makes the cache stale rather
+    than wrong, and nothing is ever recomputed without an explicit press.
+
+    The status fields are a RECORD of the last validation, not an authority.
+    The verdict is re-derived from the live landmarks whenever it is needed.
+    Deriving and RECORDING are two different acts with two different callers:
+    `state.validate_region` derives, is pure, and is what the panel uses on
+    every draw; `state.refresh_region_status` derives and then writes, and
+    only an operator or an invalidation path may call it - Blender forbids
+    writing to ID-backed data while the UI is drawing.
+    """
+
+    stable_id: IntProperty(name="Stable ID", default=0)
+    protocol_id: StringProperty(name="ID", default="")
+    name: StringProperty(
+        name="Name",
+        description="Label for this region. Renaming changes nothing about "
+                    "the boundary, so it never invalidates it",
+        default="",
+    )
+    notes: StringProperty(name="Notes", default="")
+
+    # --- the definition ---------------------------------------------------
+    landmarks: CollectionProperty(type=BSMT_RegionLandmark)
+    landmark_index: IntProperty(default=0, min=0)
+    landmark_picker: EnumProperty(
+        name="Add Landmark",
+        description="Append a landmark to this region's boundary. Nothing is "
+                    "computed - press Compute Boundary when the order is right",
+        items=landmark_enum_items,
+        update=_on_region_landmark_picker,
+    )
+
+    # --- the cached result ------------------------------------------------
+    segments: CollectionProperty(type=BSMT_RegionSegment)
+    #: The definition key `segments` were computed for. Empty means never.
+    cached_definition: StringProperty(default="")
+    computed_elapsed_s: FloatProperty(default=0.0)
+
+    status: EnumProperty(
+        name="Status",
+        items=regions.STATUS_ITEMS,
+        default=regions.STATUS_DRAFT,
+    )
+    status_code: StringProperty(default=regions.CODE_EMPTY)
+    status_detail: StringProperty(default="")
+    #: The full multi-line report from the last explicit Validate press.
+    report: StringProperty(default="")
+    #: Has an explicit Validate Region run against the region AS IT NOW
+    #: STANDS? Only that press runs the shared-point self-intersection test.
+    #: The flag would rot the moment anything was edited, so it is not
+    #: trusted: `region_fingerprint` is recomputed on every refresh and any
+    #: difference clears both of these.
+    validated: BoolProperty(default=False)
+    validated_fingerprint: StringProperty(default="")
+
+    # --- what the last validation measured, for display only -------------
+    boundary_closed: BoolProperty(default=False)
+    boundary_length_mm: FloatProperty(default=0.0)
+    boundary_point_count: IntProperty(default=0)
+    boundary_object: StringProperty(default="")
+    boundary_geometry_hash: StringProperty(default="")
+    boundary_component_id: IntProperty(default=0)
+
+    # --- the interior: which SIDE of the boundary is the region ----------
+    #
+    # Derived from the boundary the same way the boundary is derived from the
+    # landmarks: an explicit press computes it, any change upstream makes it
+    # stale, and nothing is ever recomputed unasked. The classification
+    # itself lives in the fill helper mesh - one face per full interior
+    # triangle, one per clipped partial piece - because that geometry IS the
+    # representation, and a later Surface Area milestone sums exactly it.
+    interior_status: EnumProperty(
+        name="Interior", items=interior.STATUS_ITEMS,
+        default=interior.STATUS_NONE,
+    )
+    interior_code: StringProperty(default=interior.CODE_NOT_COMPUTED)
+    interior_detail: StringProperty(default="")
+    #: The boundary definition key and geometry the interior was computed
+    #: against. A mismatch is what makes it stale.
+    interior_definition: StringProperty(default="")
+    interior_geometry_hash: StringProperty(default="")
+    interior_side: EnumProperty(
+        name="Interior Side",
+        description="Which side of the boundary is the region. The smaller "
+                    "side is a DEFAULT, not a claim that it is anatomically "
+                    "inside - switch if the other side is what you meant",
+        items=interior.SIDE_ITEMS,
+        default=interior.SIDE_SMALLER,
+    )
+    interior_full_count: IntProperty(default=0)
+    interior_partial_count: IntProperty(default=0)
+    interior_component_id: IntProperty(default=0)
+    interior_elapsed_s: FloatProperty(default=0.0)
+
+    # --- display ----------------------------------------------------------
+    show_boundary: BoolProperty(
+        name="Show",
+        description="Draw this region's closed boundary. Showing it never "
+                    "computes anything - the cached polylines are reused",
+        default=False,
+    )
+    show_fill: BoolProperty(
+        name="Show Fill",
+        description="Draw the computed interior on the body surface. Nothing "
+                    "is computed - the classified faces are reused",
+        default=False,
+    )
+    fill_color: FloatVectorProperty(
+        name="Fill Colour", subtype='COLOR', size=4,
+        min=0.0, max=1.0, default=(0.15, 0.55, 1.0, 1.0),
+    )
+    fill_opacity: FloatProperty(
+        name="Fill Opacity",
+        description="How solid the fill looks. Semi-transparent by default "
+                    "so landmarks and the scan surface stay visible",
+        default=0.30, min=0.02, max=1.0,
+    )
+
+    # --- thickness preview -----------------------------------------------
+    #
+    # A VISUALIZATION of the computed interior given a thickness, built from
+    # the classified faces and nothing else. Not a physical simulation and
+    # not a manufacturing model - see `panelpreview.LIMITS`, which the
+    # operator prints every time.
+    panel_thickness_mm: FloatProperty(
+        name="Thickness (mm)",
+        description="How far to offset the region outward along the body "
+                    "surface normals. A preview only: a normal offset "
+                    "distorts on a curved body",
+        default=panelpreview.DEFAULT_THICKNESS_MM,
+        min=panelpreview.MIN_THICKNESS_MM,
+        max=panelpreview.MAX_THICKNESS_MM,
+        soft_min=1.0, soft_max=50.0, step=100, precision=2,
+    )
+    show_panel: BoolProperty(
+        name="Show Thickness Preview",
+        description="Draw the interior offset outward by the thickness. "
+                    "Nothing is computed - the classified faces are reused",
+        default=False,
+    )
+    panel_color: FloatVectorProperty(
+        name="Preview Colour", subtype='COLOR', size=4,
+        min=0.0, max=1.0, default=(1.0, 0.75, 0.2, 1.0),
+    )
+    panel_opacity: FloatProperty(
+        name="Preview Opacity", default=0.45, min=0.02, max=1.0)
+    #: What the drawn preview was built from: the interior it belongs to and
+    #: the thickness it was given. A thickness change moves this, which
+    #: rebuilds the preview geometry and NOTHING else.
+    panel_built: StringProperty(default="")
+    panel_detail: StringProperty(default="")
+    panel_folded_faces: IntProperty(default=0)
+
+    # --- surface area ------------------------------------------------------
+    #
+    # THE MESH SURFACE AREA OF THE SELECTED REGION ON THE TRIANGULAR BODY
+    # MESH - not the true anatomical area, and not an exact smooth-body area.
+    # Derived from the stored interior classification and from nothing else:
+    # if there is no current interior there is no area, which is a refusal
+    # rather than a reason to derive one.
+    #
+    # mm^2 is the only authoritative value. cm^2 is derived at display time;
+    # storing both would be two numbers that can disagree.
+    #
+    # PRECISION: the area is COMPUTED in float64 and STORED here at float32,
+    # because that is what a Blender FloatProperty is - about seven
+    # significant digits, so roughly 0.004 mm^2 on a 400 cm^2 region. That is
+    # far finer than the mesh's own fidelity to a body and finer than the
+    # displayed resolution, but it is why the sum of the two sides agrees
+    # with the component area to ~1e-7 when read back from properties, while
+    # the same sum computed in float64 agrees to ~3e-09.
+    area_mm2: FloatProperty(default=0.0)
+    area_full_mm2: FloatProperty(default=0.0)
+    area_partial_mm2: FloatProperty(default=0.0)
+    area_component_mm2: FloatProperty(default=0.0)
+    area_status: EnumProperty(name="Area", items=surfacearea.STATUS_ITEMS,
+                              default=surfacearea.STATUS_NONE)
+    area_code: StringProperty(default=surfacearea.CODE_NOT_COMPUTED)
+    area_detail: StringProperty(default="")
+    area_method: StringProperty(default="")
+    #: What the stored area was computed against: the interior fingerprint
+    #: and the geometry. A mismatch is what makes it stale.
+    area_interior_key: StringProperty(default="")
+    area_geometry_hash: StringProperty(default="")
+    area_side: StringProperty(default="")
+    area_elapsed_s: FloatProperty(default=0.0)
+    color: FloatVectorProperty(
+        name="Boundary Colour", subtype='COLOR', size=4,
+        min=0.0, max=1.0, default=(0.2, 1.0, 0.6, 1.0),
+    )
+
+    @property
+    def label(self):
+        return self.name or self.protocol_id or "(unnamed region)"
+
+    @property
+    def landmark_ids(self):
+        """The ordered definition, as plain integers."""
+        return [int(entry.landmark_stable_id) for entry in self.landmarks]
+
+
 class BSMT_ScanProvenance(bpy.types.PropertyGroup):
     """Provenance stored ON a generated measurement copy (sect. 11).
 
@@ -694,6 +997,43 @@ class BSMT_RepairComponent(bpy.types.PropertyGroup):
     is_small: BoolProperty(default=False)
     is_largest: BoolProperty(default=False)
     label: StringProperty(default="")
+
+
+class BSMT_NonManifoldDefect(bpy.types.PropertyGroup):
+    """One non-manifold DEFECT REGION, for the repair list. Display only.
+
+    A region, not an edge: the real Design X scan's seven non-manifold edges
+    are one artefact around one vertex, and listing them separately would
+    describe seven problems that do not exist. `repair.group_nonmanifold_edges`
+    is the one place that grouping rule lives.
+
+    Holds no authoritative index. `region_id` and `component_index` are the
+    numbering of ONE analysis, valid only while `geometry_hash` still matches
+    the mesh; the centre is carried in OBJECT-LOCAL coordinates so the
+    viewport can be framed on it without re-reading the mesh, and so it
+    survives the scan being moved. Anything that edits geometry re-derives
+    both from the fresh canonical mesh (sect. 7.7).
+    """
+
+    region_id: IntProperty(default=0)
+    edge_count: IntProperty(default=0)
+    vertex_count: IntProperty(default=0)
+    bbox_diagonal_mm: FloatProperty(default=0.0)
+    center_local: FloatVectorProperty(size=3, default=(0.0,) * 3)
+    label: StringProperty(default="")
+
+    #: The connected component this defect sits in, as that analysis numbered
+    #: it. Display and pre-flight only - never the index a deletion acts on.
+    component_index: IntProperty(default=0)
+    component_triangle_count: IntProperty(default=0)
+    component_vertex_count: IntProperty(default=0)
+    component_percent: FloatProperty(default=0.0)
+    component_is_largest: BoolProperty(default=False)
+    component_is_small: BoolProperty(default=False)
+    component_bbox: FloatVectorProperty(size=3, default=(0.0,) * 3)
+    #: Empty when the component may be offered for deletion, otherwise the
+    #: reason it may not - shown in the panel instead of a destructive button.
+    deletion_block: StringProperty(default="")
 
 
 class BSMT_DegenerateDefect(bpy.types.PropertyGroup):
@@ -1220,6 +1560,60 @@ class BSMT_Properties(bpy.types.PropertyGroup):
     repair_components: CollectionProperty(type=BSMT_RepairComponent)
     repair_component_index: IntProperty(default=0, min=0)
 
+    # Milestone 3.28 - the non-manifold defect the researcher is inspecting,
+    # and the connected component it sits in. Filled by Analyze alongside
+    # every other repair list, so the panel can never describe one state of
+    # the mesh while another list describes a different one.
+    # ------------------------------------------------------------------
+    # Milestone 3.29 - Surface Regions. The definitions live on the Scene
+    # (bsmt_regions); these are the selection and the id counter.
+    # ------------------------------------------------------------------
+    region_index: IntProperty(default=0, min=0)
+    region_next_id: IntProperty(default=1, min=1)
+    region_boundary_thickness_mm: FloatProperty(
+        name="Boundary Thickness (mm)",
+        description="Drawn thickness of a region boundary. Display only - it "
+                    "never changes a path or triggers a solve",
+        default=3.0, min=0.1, max=50.0,
+    )
+    show_regions: BoolProperty(name="Surface Regions", default=False)
+
+    repair_nonmanifold_defects: CollectionProperty(type=BSMT_NonManifoldDefect)
+    repair_nonmanifold_index: IntProperty(
+        name="Defect", default=0, min=0,
+        description="Which non-manifold defect is focused for inspection",
+    )
+    #: The canonical geometry hash the lists above were computed from. A
+    #: geometry-changing action compares it to the live mesh and refuses to
+    #: act on numbers that describe a mesh that no longer exists, rather than
+    #: trusting a stored index (sect. 7.7).
+    repair_geometry_hash: StringProperty(default="")
+    repair_artifact_preview: StringProperty(default="")
+
+    # ------------------------------------------------------------------
+    # Milestone 3.30 - local face repair inside a component that may not be
+    # deleted. Every field here is a DISPLAY CACHE of one inspection and
+    # carries no authority: `repair_local_hash` is what says which mesh it
+    # describes, and the removal re-derives the candidate from the live
+    # canonical mesh rather than trusting anything stored (sect. 7.7).
+    # ------------------------------------------------------------------
+    #: The inspection report, as `localrepair.report_lines` produced it.
+    repair_local_report: StringProperty(default="")
+    #: The classification code, e.g. SMALL_DANGLING_FLAP or AMBIGUOUS.
+    repair_local_classification: StringProperty(default="")
+    #: True only when the inspection found an unambiguous removable
+    #: candidate. The destructive button is not drawn at all otherwise.
+    repair_local_removable: BoolProperty(default=False)
+    #: The canonical geometry hash the inspection was computed against, and
+    #: the defect it was computed for. Either one failing to match the live
+    #: mesh makes the report stale, and a stale report never acts.
+    repair_local_hash: StringProperty(default="")
+    repair_local_region_id: IntProperty(default=0)
+    #: Candidate size, for the one-line panel summary only.
+    repair_local_face_count: IntProperty(default=0)
+    repair_local_vertex_count: IntProperty(default=0)
+    repair_local_area_mm2: FloatProperty(default=0.0)
+
     # Milestone 3.19 - degenerate triangles, the one blocking defect Mesh
     # Repair v1 can fix. The list is what Analyze Repair Issues produced; it
     # is never recomputed by a redraw.
@@ -1716,6 +2110,13 @@ def remove_landmark(context, props, index):
     for item in measurements_referencing(get_measurements(context), stable_id):
         item.status = measurements.STATUS_INVALID_REFERENCE
         item.status_detail = "landmark '%s' (id %d) was deleted" % (label, stable_id)
+    # Regions that used it are restated the same way, and for the same
+    # reason: the reference is KEPT and named so the loss is visible, and
+    # nothing is substituted. The region's boundary depends on the landmark
+    # directly - no measurement need ever have existed.
+    invalidate_regions_for_landmark(
+        context, stable_id, "landmark '%s' was deleted" % label
+    )
     return stable_id
 
 
@@ -1734,6 +2135,9 @@ def clear_landmarks(context, props):
     props.landmark_summary = ""
     props.guided_active = False
     props.guided_index = 0
+    # Every region is now missing every landmark it named. Restated in one
+    # pass; no definition is edited and no boundary cache is thrown away.
+    refresh_all_region_statuses(context)
     return stable_ids
 
 
@@ -1748,6 +2152,10 @@ def clear_landmark_position(item, context=None):
     item.status_detail = ""
     if context is not None:
         invalidate_measurements_for_landmark(
+            context, item.stable_id,
+            "landmark '%s' position was cleared" % item.label,
+        )
+        invalidate_regions_for_landmark(
             context, item.stable_id,
             "landmark '%s' position was cleared" % item.label,
         )
@@ -1833,9 +2241,16 @@ def invalidate_for_geometry_change(context, object_name, props=None):
     if props is not None and props.surface_object == object_name:
         clear_surface_result(props)
 
+    # Milestone 3.29. A Surface Region is a boundary made of those paths, so
+    # it cannot survive an edit they did not survive. Restated, never rebuilt:
+    # BSMT does not reproject a boundary onto changed geometry any more than
+    # it reprojects a landmark.
+    regions_restated = refresh_all_region_statuses(context, canonical)
+
     return {
         "landmarks_restated": stale,
         "measurements_invalidated": measurements_hit,
+        "regions_restated": regions_restated,
     }
 
 
@@ -1984,6 +2399,11 @@ def remove_measurement(context, props, index):
         pass
     if props.measurement_index >= len(collection):
         props.measurement_index = max(0, len(collection) - 1)
+    # Surface Regions are NOT restated here, and that is the point of
+    # Milestone 3.31: a region is defined by landmarks and owns its own
+    # boundary cache, so deleting a measurement cannot reach one. Under the
+    # old model this line existed because a region referenced measurement
+    # paths; it would now be a coupling with nothing behind it.
     return stable_id
 
 
@@ -2000,6 +2420,8 @@ def clear_measurements(context, props):
     props.measurement_index = 0
     props.measurement_summary = ""
     props.measurement_progress = ""
+    # Regions are untouched: clearing every measurement removes no part of a
+    # region's definition and no part of its boundary cache.
     return count
 
 
@@ -2263,6 +2685,17 @@ def result_is_displayable(item):
     return bool(item.has_result and item.status == measurements.STATUS_VALID)
 
 
+def measurement_by_stable_id(collection, stable_id):
+    """The measurement with this stable id, or None. Never a substitute."""
+    wanted = int(stable_id or 0)
+    if not wanted:
+        return None
+    for item in (collection or ()):
+        if int(item.stable_id) == wanted:
+            return item
+    return None
+
+
 def measurements_referencing(collection, landmark_stable_id):
     """Definitions that use a landmark. Cheap: one pass, integer compares."""
     if not collection:
@@ -2284,6 +2717,10 @@ def invalidate_measurements_for_landmark(context, landmark_stable_id, reason):
     affected = measurements_referencing(collection, landmark_stable_id)
     for item in affected:
         invalidate_measurement_result(item, reason)
+    # Regions depend on the LANDMARK directly, not on the measurements that
+    # happen to use it, so they are restated by
+    # `invalidate_regions_for_landmark` on the same landmark change - not
+    # here, and not only when some measurement also referenced it.
     return len(affected)
 
 
@@ -2352,6 +2789,618 @@ def refresh_measurement_status(context, item, canonical=None,
     item.status = measurements.STATUS_VALID
     item.status_detail = ""
     return item
+
+
+# ---------------------------------------------------------------------------
+# Surface Regions (Milestone 3.31)
+# ---------------------------------------------------------------------------
+#
+# A region is a CLOSED BOUNDARY defined by ORDERED LANDMARKS. Everything in
+# this section is bounded by one rule, which is the reason the section can be
+# read at all: NOTHING HERE CALLS THE SOLVER. Facts are read from properties
+# and from `pathcache`, the verdict is computed by the pure rules in
+# `regions.py`, and a boundary is drawn from cached polylines. The one route
+# to the solver is the Compute Boundary operator, and it is the only thing a
+# researcher ever waits for.
+#
+# A region does NOT reference measurements. It shares the geodesic backend
+# with them and nothing else: deleting, renaming or editing a measurement
+# cannot reach a region, and a region can be defined and computed in a file
+# that has no measurements at all.
+
+
+def get_regions(context):
+    scene = getattr(context, "scene", None)
+    return getattr(scene, "bsmt_regions", None) if scene is not None else None
+
+
+def region_names(collection):
+    return [item.name for item in (collection or ())]
+
+
+def region_protocol_ids(collection):
+    return [item.protocol_id for item in (collection or ())]
+
+
+def region_by_stable_id(collection, stable_id):
+    wanted = int(stable_id or 0)
+    for item in (collection or ()):
+        if int(item.stable_id) == wanted:
+            return item
+    return None
+
+
+def active_region(context, props=None):
+    collection = get_regions(context)
+    if not collection:
+        return None
+    if props is None:
+        props = get_props(context)
+    index = int(getattr(props, "region_index", 0) or 0) if props else 0
+    if 0 <= index < len(collection):
+        return collection[index]
+    return None
+
+
+def add_region(context, props, name="", protocol_id="", notes=""):
+    """Append an empty Surface Region. Returns it."""
+    collection = get_regions(context)
+    if collection is None:
+        raise regions.RegionError("region collection is not registered")
+    item = collection.add()
+    item.stable_id = props.region_next_id
+    props.region_next_id += 1
+    item.protocol_id = (str(protocol_id).strip()
+                        or regions.next_protocol_id(
+                            region_protocol_ids(collection)))
+    item.name = (" ".join(str(name or "").split())
+                 or regions.default_name(region_names(collection)))
+    item.notes = str(notes or "")
+    item.status = regions.STATUS_DRAFT
+    item.status_code = regions.CODE_EMPTY
+    item.status_detail = ("Add boundary landmarks, in the order they run "
+                          "round the region.")
+    props.region_index = len(collection) - 1
+    return item
+
+
+def remove_region(context, props, index):
+    """Delete one region. Landmarks and measurements are KEPT.
+
+    A region owns its boundary CACHE and its helper, and nothing else. It
+    holds references to landmarks; deleting a boundary must never take one of
+    those with it, nor any measurement, nor any measurement's solved path.
+    """
+    collection = get_regions(context)
+    if collection is None or not 0 <= index < len(collection):
+        return None
+    stable_id = int(collection[index].stable_id)
+    for drop in (visualization.remove_region_boundary,
+                 visualization.remove_region_fill,
+                 visualization.remove_region_panel):
+        try:
+            drop(stable_id)
+        except Exception:                             # pragma: no cover
+            pass
+    for drop in (pathcache.drop_region, interiorcache.drop):
+        try:
+            drop(stable_id)
+        except Exception:                             # pragma: no cover
+            pass
+    collection.remove(index)
+    if props is not None:
+        props.region_index = max(0, min(int(props.region_index),
+                                        len(collection) - 1))
+    return stable_id
+
+
+# ---------------------------------------------------------------------------
+# editing the definition - none of which computes anything
+# ---------------------------------------------------------------------------
+
+def append_region_landmark(item, landmark):
+    """Add one landmark to the end of a region's boundary. Returns the entry."""
+    entry = item.landmarks.add()
+    entry.landmark_stable_id = int(landmark.stable_id)
+    entry.landmark_protocol_id = landmark.protocol_id
+    entry.landmark_name = landmark.name
+    item.landmark_index = len(item.landmarks) - 1
+    return entry
+
+
+def remove_region_landmark(item, index):
+    """Drop one boundary landmark. The cached boundary becomes stale."""
+    if not 0 <= index < len(item.landmarks):
+        return False
+    item.landmarks.remove(index)
+    item.landmark_index = max(0, min(int(item.landmark_index),
+                                     len(item.landmarks) - 1))
+    return True
+
+
+def move_region_landmark(item, index, offset):
+    """Reorder one boundary landmark. Returns the new index, or None.
+
+    Order IS the boundary: A-B-C-D and A-C-B-D are different loops, so this
+    is a real edit and the cached boundary stops matching the definition.
+    Nothing is recomputed - see `regions.definition_key`.
+    """
+    count = len(item.landmarks)
+    target = int(index) + int(offset)
+    if not (0 <= index < count and 0 <= target < count):
+        return None
+    item.landmarks.move(index, target)
+    item.landmark_index = target
+    return target
+
+
+def regions_referencing_landmark(collection, landmark_stable_id):
+    """Regions whose boundary uses this landmark. One pass, integer compares."""
+    wanted = int(landmark_stable_id or 0)
+    if not wanted:
+        return []
+    found = []
+    for item in (collection or ()):
+        if any(int(entry.landmark_stable_id) == wanted
+               for entry in item.landmarks):
+            found.append(item)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# reading a region's live facts - the adapter to the pure rules
+# ---------------------------------------------------------------------------
+
+def region_definition_facts(context, item, canonical=None):
+    """Live facts for one region's definition and cached boundary.
+
+    The adapter between Blender state and the pure rules in `regions.py`.
+    Every value is read from a property; no geometry is evaluated, no
+    canonical mesh is built and the solver is never reached, so this is safe
+    from a panel draw.
+    """
+    landmark_collection = get_landmarks(context)
+    landmark_facts = []
+    for entry in item.landmarks:
+        stable_id = int(entry.landmark_stable_id)
+        landmark = landmark_by_stable_id(landmark_collection, stable_id)
+        fact = {
+            "stable_id": stable_id,
+            "exists": landmark is not None,
+            "label": (entry.landmark_name or entry.landmark_protocol_id
+                      or "landmark %d" % stable_id),
+        }
+        if landmark is not None:
+            point = landmark.surface_point
+            fact.update({
+                "label": landmark.label,
+                "protocol_id": landmark.protocol_id,
+                "picked": bool(point.valid),
+                "status": landmark.status,
+                "component_id": int(point.component_id) if point.valid else 0,
+                "triangle": int(point.triangle_index) if point.valid else -1,
+                "source_object": point.source_object,
+                "geometry_hash": point.geometry_hash,
+            })
+        landmark_facts.append(fact)
+
+    segment_facts = []
+    for position, segment in enumerate(item.segments):
+        segment_facts.append({
+            "position": position,
+            "from_landmark": int(segment.from_landmark),
+            "to_landmark": int(segment.to_landmark),
+            # "computed" means BOTH the record and the polyline are present.
+            # A record whose cache datablock has gone - a purged file, a
+            # hand-edited scene - is not a computed segment, and saying it is
+            # would let a boundary be drawn from nothing.
+            "computed": bool(segment.computed)
+                        and pathcache.region_segment_exists(item.stable_id,
+                                                            position),
+            "point_count": int(segment.point_count),
+            "length_mm": float(segment.length_mm),
+            "object_name": segment.object_name,
+            "geometry_hash": segment.geometry_hash,
+            "from_triangle": int(segment.from_triangle),
+            "to_triangle": int(segment.to_triangle),
+            "component_id": int(segment.component_id),
+        })
+
+    return {
+        "landmarks": landmark_facts,
+        "segments": segment_facts,
+        "cached_definition": item.cached_definition,
+        "live_geometry_hash": (canonical.geometry_hash
+                               if canonical is not None else ""),
+        # A region loaded from a file written by the measurement-path model
+        # has no landmarks and a non-empty segment collection. Detected so it
+        # can be REFUSED BY NAME rather than read as an empty definition.
+        "legacy_segment_count": (len(item.segments)
+                                 if not len(item.landmarks) else 0),
+    }
+
+
+def region_polylines(item):
+    """Cached polylines for a region's boundary, in loop order, or None each.
+
+    THE one place a region's cached geometry is loaded. Read straight out of
+    `pathcache` in the region's own name space - the same local-space arrays
+    the boundary helper is drawn from - so the self-intersection test and the
+    drawn boundary can never disagree about where the boundary runs.
+
+    Nothing is solved, and nothing is projected.
+    """
+    loaded = []
+    for position in range(len(item.segments)):
+        cached = None
+        try:
+            cached = pathcache.load_region_segment(item.stable_id, position)
+        except Exception:                             # pragma: no cover
+            cached = None
+        loaded.append(None if cached is None else cached[0])
+    return loaded
+
+
+#: How close two boundary points must be to count as the SAME place, as a
+#: fraction of the mesh's own bounding-box diagonal. Deliberately tiny: this
+#: is looking for polylines that genuinely share a point, not for ones that
+#: merely pass near each other, and a loose value here would refuse valid
+#: boundaries that run close together round a limb.
+TOUCH_TOLERANCE_FRACTION = 1e-6
+
+
+def region_touch_tolerance(canonical):
+    """The shared-point tolerance in OBJECT-LOCAL units, or 0 when unknown."""
+    if canonical is None:
+        return 0.0
+    report = getattr(canonical, "topology", None) or {}
+    diagonal = float(report.get("bbox_diagonal", 0.0) or 0.0)
+    if diagonal <= 0.0:
+        return 0.0
+    multiplier = float(getattr(canonical, "unit_multiplier", 1.0) or 1.0)
+    return diagonal * TOUCH_TOLERANCE_FRACTION / max(multiplier, 1e-12)
+
+
+def region_object_name(context, item):
+    """The scan a region belongs to: its cache's, else its landmarks'."""
+    for segment in item.segments:
+        if segment.object_name:
+            return segment.object_name
+    landmark_collection = get_landmarks(context)
+    for entry in item.landmarks:
+        landmark = landmark_by_stable_id(landmark_collection,
+                                         int(entry.landmark_stable_id))
+        if landmark is not None and landmark.surface_point.valid:
+            return landmark.surface_point.source_object
+    return ""
+
+
+def validate_region(context, item, canonical=None, check_touching=False):
+    """The live verdict for one region. Pure inspection; no solver, no writes.
+
+    `check_touching` adds the shared-point half of the self-intersection test,
+    which reads every cached polyline. That is cheap next to a solve but not
+    free, so it belongs to an explicit Validate press rather than to a redraw.
+    """
+    facts = region_definition_facts(context, item, canonical)
+    polylines = None
+    tolerance = 0.0
+    if check_touching:
+        tolerance = region_touch_tolerance(canonical)
+        if tolerance > 0.0:
+            polylines = region_polylines(item)
+    return regions.validate(facts, polylines=polylines,
+                            touch_tolerance=tolerance), facts
+
+
+def region_fingerprint(item, result):
+    """What an explicit Validate was run AGAINST, as one comparable string.
+
+    The ordered landmark definition plus the verdict the same pass derived.
+    Any edit to the boundary, and any change in what the landmarks or the
+    cache are worth, moves this value - which is what lets `validated` be
+    cleared automatically instead of being remembered until somebody notices
+    it is wrong.
+    """
+    return "|".join((regions.definition_key(item.landmark_ids),
+                     str(item.cached_definition or ""),
+                     str(result.get("status", "")),
+                     str(result.get("code", "")),
+                     str(result.get("geometry_hash", "")),
+                     "%.6f" % float(result.get("length_mm", 0.0) or 0.0)))
+
+
+def store_region_status(item, result):
+    """WRITE a derived verdict onto the region. Never call this from a draw.
+
+    Split out from `refresh_region_status` deliberately. Blender forbids
+    writing to ID-backed data while the UI is drawing - a panel that assigns
+    to a PropertyGroup field raises
+
+        AttributeError: Writing to ID classes in this context is not allowed
+
+    and the whole panel disappears behind an error. So the DERIVATION
+    (`validate_region`, pure) and the RECORD (this, a write) are two
+    functions, and only operators and invalidation call this one.
+    """
+    item.status = result["status"]
+    item.status_code = result["code"]
+    item.status_detail = result["detail"]
+    item.boundary_closed = bool(result["closed"])
+    item.boundary_length_mm = float(result["length_mm"])
+    item.boundary_point_count = int(result["point_count"])
+    item.boundary_object = result["object_name"]
+    item.boundary_geometry_hash = result["geometry_hash"]
+    item.boundary_component_id = int(result["component_id"])
+    # A recorded "validated" that no longer describes this region is worse
+    # than none: it is the stale authoritative-looking claim this milestone
+    # exists to refuse. Derive it, do not remember it.
+    if item.validated and (region_fingerprint(item, result)
+                           != item.validated_fingerprint):
+        item.validated = False
+        item.report = ""
+    return result
+
+
+def refresh_region_status(context, item, canonical=None, check_touching=False):
+    """Re-derive AND store one region's status. Returns the result dict.
+
+    The mutating entry point: every region operator and every invalidation
+    path calls this, so a stored verdict can never outlive the definition
+    that produced it. **A panel draw must not**, because storing is a write -
+    see `store_region_status`. Draw code wants `validate_region`, which
+    derives exactly the same answer and keeps none of it.
+    """
+    result, _facts = validate_region(context, item, canonical, check_touching)
+    store_region_status(item, result)
+    # The interior hangs off the boundary, so it is restated in the same
+    # pass. Nothing is recomputed and no classified geometry is discarded: a
+    # boundary that moved makes its interior STALE, which is a thing the
+    # researcher can see and fix.
+    refresh_interior_status(item, result, canonical)
+    return result
+
+
+def refresh_all_region_statuses(context, canonical=None):
+    """Restate every region. Returns how many changed status."""
+    collection = get_regions(context)
+    if not collection:
+        return 0
+    changed = 0
+    for item in collection:
+        before = item.status
+        refresh_region_status(context, item, canonical)
+        if item.status != before:
+            changed += 1
+    return changed
+
+
+def clear_region_boundary(item):
+    """Throw away one region's computed boundary. The DEFINITION is kept.
+
+    Used when a compute is abandoned and when a region's cache is known to
+    describe something the region no longer is. The landmarks - the thing the
+    researcher actually typed - are never touched by this.
+    """
+    try:
+        pathcache.drop_region(item.stable_id)
+    except Exception:                                 # pragma: no cover
+        pass
+    item.segments.clear()
+    item.cached_definition = ""
+    item.boundary_closed = False
+    item.boundary_length_mm = 0.0
+    item.boundary_point_count = 0
+    item.boundary_object = ""
+    item.boundary_geometry_hash = ""
+    item.boundary_component_id = 0
+    item.validated = False
+    item.validated_fingerprint = ""
+    item.report = ""
+
+
+# ---------------------------------------------------------------------------
+# Surface Interior: which side of the boundary is the region
+# ---------------------------------------------------------------------------
+#
+# The interior is derived from the boundary exactly as the boundary is derived
+# from the landmarks: an explicit press computes it, anything upstream
+# changing makes it STALE, and nothing is recomputed unasked. Unlike the
+# boundary it costs NO SOLVER - it is topology and geometry analysis on a mesh
+# BSMT already has - which is why switching side is allowed to recompute it
+# outright rather than needing a second cached copy.
+
+
+def interior_fingerprint(item):
+    """What an interior would have to match to still be current."""
+    return "%s|%s" % (item.cached_definition or "", item.interior_side)
+
+
+def interior_is_current(item, canonical=None):
+    """(status, code, detail) for the stored interior, derived not trusted."""
+    if not item.interior_definition:
+        return (interior.STATUS_NONE, interior.CODE_NOT_COMPUTED,
+                "The interior has not been computed yet.")
+    if item.interior_definition != interior_fingerprint(item):
+        return (interior.STATUS_STALE, interior.CODE_BOUNDARY_CHANGED,
+                "The boundary or the chosen side changed after the interior "
+                "was computed. Press Compute Interior again.")
+    if canonical is not None and item.interior_geometry_hash and \
+            canonical.geometry_hash != item.interior_geometry_hash:
+        return (interior.STATUS_STALE, interior.CODE_GEOMETRY_MISMATCH,
+                "The mesh geometry changed after the interior was computed. "
+                "Press Compute Interior again.")
+    return (interior.STATUS_VALID, interior.CODE_NONE, item.interior_detail)
+
+
+def refresh_interior_status(item, boundary_result, canonical=None):
+    """Re-derive and STORE the interior's status. Never call from a draw.
+
+    An interior can never outlive the boundary under it, so a boundary that
+    is not currently VALID drags the interior to stale with it - without
+    touching the classified geometry, which stays exactly as computed until
+    something explicitly replaces it.
+    """
+    if not item.interior_definition:
+        status, code = interior.STATUS_NONE, interior.CODE_NOT_COMPUTED
+        detail = "The interior has not been computed yet."
+    elif boundary_result is not None and \
+            boundary_result["status"] not in regions.TRUSTED:
+        status, code = interior.STATUS_STALE, interior.CODE_BOUNDARY_NOT_VALID
+        detail = ("The region boundary is %s, so its interior is no longer "
+                  "the answer." % regions.STATUS_SHORT.get(
+                      boundary_result["status"], boundary_result["status"]))
+    else:
+        status, code, detail = interior_is_current(item, canonical)
+    item.interior_status = status
+    item.interior_code = code
+    item.interior_detail = detail
+    result = {"status": status, "code": code, "detail": detail}
+    # The area hangs off the interior, so it is restated in the same pass.
+    refresh_area_status(item, result)
+    return result
+
+
+def panel_fingerprint(item):
+    """What a drawn thickness preview was built from.
+
+    The interior it belongs to AND the thickness it was given, so a thickness
+    change rebuilds the preview geometry while leaving the interior - and the
+    boundary under it - completely alone.
+    """
+    return "%s|%.6f" % (item.interior_definition or "",
+                        float(item.panel_thickness_mm))
+
+
+def panel_is_current(item):
+    return bool(item.panel_built) and item.panel_built == panel_fingerprint(item)
+
+
+def clear_region_area(item):
+    """Throw away one region's area result. The interior is kept."""
+    item.area_mm2 = 0.0
+    item.area_full_mm2 = 0.0
+    item.area_partial_mm2 = 0.0
+    item.area_component_mm2 = 0.0
+    item.area_status = surfacearea.STATUS_NONE
+    item.area_code = surfacearea.CODE_NOT_COMPUTED
+    item.area_detail = ""
+    item.area_method = ""
+    item.area_interior_key = ""
+    item.area_geometry_hash = ""
+    item.area_side = ""
+    item.area_elapsed_s = 0.0
+
+
+def area_fingerprint(item):
+    """What a stored area was computed against."""
+    return "%s|%s" % (item.interior_definition or "",
+                      item.interior_geometry_hash or "")
+
+
+def refresh_area_status(item, interior_result=None):
+    """Re-derive and STORE the area's status. Never call from a draw.
+
+    An area can never outlive the interior under it. Nothing is recomputed
+    and the stored number is not cleared - a stale area is shown AS stale,
+    which is more useful than a blank, and is never shown as a result.
+    """
+    if not item.area_interior_key:
+        status, code = surfacearea.STATUS_NONE, surfacearea.CODE_NOT_COMPUTED
+        detail = "The area has not been computed yet."
+    elif interior_result is not None and \
+            interior_result["status"] not in interior.TRUSTED:
+        status, code = surfacearea.STATUS_STALE, surfacearea.CODE_INTERIOR_NOT_VALID
+        detail = ("The interior is %s, so its area is no longer the answer."
+                  % interior.STATUS_SHORT.get(interior_result["status"],
+                                              interior_result["status"]))
+    elif item.area_interior_key != area_fingerprint(item):
+        status, code = surfacearea.STATUS_STALE, surfacearea.CODE_INTERIOR_CHANGED
+        detail = ("The interior changed after the area was computed. Press "
+                  "Compute Area again.")
+    else:
+        status, code, detail = (surfacearea.STATUS_VALID, surfacearea.CODE_NONE,
+                                item.area_detail)
+    item.area_status = status
+    item.area_code = code
+    item.area_detail = detail
+    return {"status": status, "code": code, "detail": detail}
+
+
+def clear_region_panel(item):
+    """Remove one region's thickness preview. The interior is kept."""
+    try:
+        visualization.remove_region_panel(item.stable_id)
+    except Exception:                                 # pragma: no cover
+        pass
+    item.panel_built = ""
+    item.panel_detail = ""
+    item.panel_folded_faces = 0
+    item.show_panel = False
+
+
+def clear_region_interior(item):
+    """Throw away one region's computed interior. The BOUNDARY is kept."""
+    try:
+        visualization.remove_region_fill(item.stable_id)
+    except Exception:                                 # pragma: no cover
+        pass
+    item.interior_definition = ""
+    item.interior_geometry_hash = ""
+    item.interior_status = interior.STATUS_NONE
+    item.interior_code = interior.CODE_NOT_COMPUTED
+    item.interior_detail = "The interior has not been computed yet."
+    item.interior_full_count = 0
+    item.interior_partial_count = 0
+    item.interior_component_id = 0
+    item.show_fill = False
+    # The preview hangs off the interior, so it goes with it. A preview of an
+    # interior that no longer exists is the clearest possible wrong picture.
+    clear_region_panel(item)
+    clear_region_area(item)
+    try:
+        interiorcache.drop(item.stable_id)
+    except Exception:                                 # pragma: no cover
+        pass
+
+
+def interior_fill_geometry(vertices, triangles, side):
+    """(vertices, faces) for the fill helper, from one side of an analysis.
+
+    One face per full interior triangle and one per exactly-clipped partial
+    piece - the classification itself, drawn. Vertices are duplicated per
+    face on purpose: this is analysis geometry read once per rebuild, and
+    welding it would merge pieces that a later area sum must keep apart.
+    """
+    points = []
+    faces = []
+    for triangle in side["full_triangles"]:
+        base = len(points)
+        points.extend(vertices[index] for index in triangles[triangle])
+        faces.append(tuple(range(base, base + 3)))
+    for entry in side["partial"]:
+        polygon = entry["polygon"]
+        if polygon.shape[0] < 3:
+            continue
+        base = len(points)
+        points.extend(polygon)
+        faces.append(tuple(range(base, base + polygon.shape[0])))
+    return points, faces
+
+
+def invalidate_regions_for_landmark(context, landmark_stable_id, reason):
+    """Restate the regions that use this landmark. Targeted, not a sweep.
+
+    Called when a landmark is re-picked or deleted. Nothing is recomputed and
+    no cache is thrown away: a boundary whose landmark moved is STALE, which
+    is a thing the researcher can see and fix, and silently re-solving it
+    would cost minutes without being asked.
+    """
+    collection = get_regions(context)
+    affected = regions_referencing_landmark(collection, landmark_stable_id)
+    for item in affected:
+        refresh_region_status(context, item)
+    return len(affected)
 
 
 def invalidate_all_measurement_results(context, reason):
@@ -2968,6 +4017,56 @@ def active_degenerate_defect(props):
     return None
 
 
+def active_nonmanifold_defect(props):
+    """The FOCUSED non-manifold defect, or None.
+
+    "Focused" is the defect the researcher stepped to and inspected with Show
+    Edges / Focus. It is the only defect any component-scoped deletion is ever
+    allowed to act on, so there is exactly one place that decides which it is.
+    """
+    if props is None:
+        return None
+    index = props.repair_nonmanifold_index
+    if 0 <= index < len(props.repair_nonmanifold_defects):
+        return props.repair_nonmanifold_defects[index]
+    return None
+
+
+def clear_focused_defect(props):
+    """Forget the focused non-manifold defect and its artifact preview.
+
+    Called after a geometry edit: the stored region id, component number and
+    centre all describe a mesh that no longer exists, and a dangling reference
+    to deleted geometry is exactly what must not survive an edit.
+    """
+    if props is None:
+        return
+    props.repair_nonmanifold_defects.clear()
+    props.repair_nonmanifold_index = 0
+    props.repair_artifact_preview = ""
+    clear_local_repair(props)
+
+
+def clear_local_repair(props):
+    """Forget the local-repair inspection. No object or mesh is touched.
+
+    Called whenever the focused defect changes or the geometry does: an
+    inspection names a candidate by the topology of ONE mesh state, and
+    leaving it on screen beside a different defect - or a different mesh - is
+    exactly the dangling reference sect. 11 of the brief forbids.
+    """
+    if props is None:
+        return
+    props.repair_local_report = ""
+    props.repair_local_classification = ""
+    props.repair_local_removable = False
+    props.repair_local_hash = ""
+    props.repair_local_region_id = 0
+    props.repair_local_face_count = 0
+    props.repair_local_vertex_count = 0
+    props.repair_local_area_mm2 = 0.0
+
+
 def clear_repair_lists(props):
     props.boundary_loops.clear()
     props.repair_components.clear()
@@ -2976,6 +4075,7 @@ def clear_repair_lists(props):
     props.repair_degenerate_preview = ""
     props.boundary_loop_index = 0
     props.repair_component_index = 0
+    clear_focused_defect(props)
 
 
 def clear_repair_state(props):
@@ -2985,6 +4085,7 @@ def clear_repair_state(props):
     props.repair_readiness = ""
     props.repair_valid = False
     props.repair_object = ""
+    props.repair_geometry_hash = ""
 
 
 def active_boundary_loop(props):
@@ -3193,9 +4294,14 @@ classes = (
     BSMT_SurfacePoint,
     BSMT_Landmark,
     BSMT_Measurement,
+    # Both must exist before the region whose collections hold them.
+    BSMT_RegionLandmark,
+    BSMT_RegionSegment,
+    BSMT_SurfaceRegion,
     BSMT_ScanProvenance,
     BSMT_BoundaryLoop,
     BSMT_RepairComponent,
+    BSMT_NonManifoldDefect,
     BSMT_DegenerateDefect,
     BSMT_ComponentInfo,
     BSMT_Properties,
@@ -3209,6 +4315,9 @@ def register():
     # Scene-level, as specified in the Milestone 3.0 brief.
     bpy.types.Scene.bsmt_landmarks = CollectionProperty(type=BSMT_Landmark)
     bpy.types.Scene.bsmt_measurements = CollectionProperty(type=BSMT_Measurement)
+    # Milestone 3.29. Additive: a .blend saved before this existed simply has
+    # an empty collection, which is exactly "no regions defined yet".
+    bpy.types.Scene.bsmt_regions = CollectionProperty(type=BSMT_SurfaceRegion)
     # Provenance lives on the generated object itself, so it travels with the
     # .blend and cannot drift from the object it describes.
     bpy.types.Object.bsmt_scan = PointerProperty(type=BSMT_ScanProvenance)
@@ -3217,6 +4326,8 @@ def register():
 def unregister():
     if hasattr(bpy.types.Object, "bsmt_scan"):
         del bpy.types.Object.bsmt_scan
+    if hasattr(bpy.types.Scene, "bsmt_regions"):
+        del bpy.types.Scene.bsmt_regions
     if hasattr(bpy.types.Scene, "bsmt_measurements"):
         del bpy.types.Scene.bsmt_measurements
     if hasattr(bpy.types.Scene, "bsmt_landmarks"):

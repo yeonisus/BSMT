@@ -50,6 +50,7 @@ EXPECTED_STAGES = (
     "Landmark Manager",
     "Measurement Manager",
     "Measurement Visualization",
+    "Surface Regions",
     "Results and Export",
 )
 
