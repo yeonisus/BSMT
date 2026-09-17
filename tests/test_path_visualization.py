@@ -51,6 +51,19 @@ def check(label, condition, detail=""):
 SOLVER_CALLS = {"construct": 0, "query": 0}
 
 
+#: Every pygeodesic method that represents one real solve against the
+#: native mesh - not just geodesicDistance() (the original, always-
+#: unbounded call), but every capability-gated route that answers the same
+#: kind of question, present or future. A route that isn't listed here
+#: silently escapes "exactly one path solve ran" the way geodesicDistance-
+#: Bounded() did until this fix: the query executed correctly, but nothing
+#: counted it. Named here once, rather than reimplemented per method, so
+#: the next added route is a one-line edit to this tuple, not a routine
+#: this test forgets to also wrap.
+PATH_QUERY_METHODS = ("geodesicDistance", "geodesicDistances",
+                      "geodesicDistanceBounded")
+
+
 def instrument_solver(exact_mmp):
     """Count every construction of, and query against, the native solver."""
     module = getattr(exact_mmp, "_geodesic", None)
@@ -65,16 +78,15 @@ def instrument_solver(exact_mmp):
             SOLVER_CALLS["construct"] += 1
             self._inner = original(*args, **kwargs)
 
-        def geodesicDistance(self, *args, **kwargs):
-            SOLVER_CALLS["query"] += 1
-            return self._inner.geodesicDistance(*args, **kwargs)
-
-        def geodesicDistances(self, *args, **kwargs):
-            SOLVER_CALLS["query"] += 1
-            return self._inner.geodesicDistances(*args, **kwargs)
-
         def __getattr__(self, name):
-            return getattr(self._inner, name)
+            attr = getattr(self._inner, name)
+            if name not in PATH_QUERY_METHODS or not callable(attr):
+                return attr
+
+            def counted_call(*args, **kwargs):
+                SOLVER_CALLS["query"] += 1
+                return attr(*args, **kwargs)
+            return counted_call
 
     module.PyGeodesicAlgorithmExact = Counted
     return True
