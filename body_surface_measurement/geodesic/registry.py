@@ -190,6 +190,112 @@ def bounded_distance(vertices, triangles, source_index, target_index,
     return report.distance_mm, report
 
 
+def bounded_path_capability():
+    """True when the installed backend can answer a bounded query WITH a
+    path in one call (see exact_mmp.bounded_path_capability()). The one
+    probe every Phase-1 caller must use before choosing the bounded-path
+    route over the unbounded fallback - never a version-string guess.
+    """
+    return exact_mmp.bounded_path_capability()
+
+
+def bounded_distance_and_path(vertices, triangles, source_index, target_index,
+                              straight_mm, bound_factors=BOUND_FACTORS,
+                              allow_unbounded_fallback=True, solver=None):
+    """Exact geodesic distance AND path via the expanding-bound strategy.
+
+    The path-carrying counterpart of bounded_distance() above - same
+    strategy, same BOUND_FACTORS, same MIN_BOUND_MM floor, same meaning of
+    `straight_mm`, extended to also return the polyline in one call instead
+    of needing a second, unbounded, path-only query.
+
+    Requires bounded_path_capability(). Raises BackendUnavailable if the
+    installed pygeodesic does not expose the bounded-path method - this is
+    a capability precondition, not a query outcome, and callers (solve.py)
+    are expected to check bounded_path_capability() BEFORE choosing this
+    route over the always-available unbounded one. This function still
+    checks it itself and refuses cleanly, rather than trusting every future
+    caller to have checked first.
+
+    Returns (distance_mm, path ndarray(k,3), QueryReport). Raises
+    BackendUnavailable or QueryFailed - the same two exceptions
+    bounded_distance() raises, reused as-is.
+    """
+    started_total = time.perf_counter()
+    if not bounded_path_capability():
+        raise BackendUnavailable(
+            "geodesicDistanceAndPathBounded is not available on this "
+            "pygeodesic build; check registry.bounded_path_capability() "
+            "before calling bounded_distance_and_path()"
+        )
+    if solver is None:
+        if not available():
+            raise BackendUnavailable(unavailable_reason())
+        solver = exact_mmp.ExactSolver(vertices, triangles)
+
+    report = QueryReport()
+    report.straight_mm = float(straight_mm)
+    report.attempt_log = []
+    report.unbounded_fallback = False
+    report.backend_name = backend_name()
+    report.backend_version = backend_version()
+    report.algorithm_version = ALGORITHM_VERSION
+
+    base = max(float(straight_mm), MIN_BOUND_MM)
+
+    distance = None
+    path = None
+    used_factor = None
+    used_bound = None
+    for factor in bound_factors:
+        bound = base * float(factor)
+        started = time.perf_counter()
+        value, candidate_path = solver.distance_and_path_bounded(
+            source_index, target_index, bound
+        )
+        elapsed = time.perf_counter() - started
+        reached = np.isfinite(value)
+        report.attempt_log.append((float(factor), bound, elapsed, bool(reached)))
+        if reached:
+            distance = value
+            path = candidate_path
+            used_factor = float(factor)
+            used_bound = bound
+            break
+
+    if distance is None and allow_unbounded_fallback:
+        # Last resort, exact MMP either way. distance_and_path() already
+        # returns a path, so this fallback needs no separate second call.
+        started = time.perf_counter()
+        value, candidate_path = solver.distance_and_path(
+            source_index, target_index
+        )
+        elapsed = time.perf_counter() - started
+        reached = value is not None and np.isfinite(value)
+        report.attempt_log.append((None, float("inf"), elapsed, bool(reached)))
+        if reached:
+            distance = value
+            path = candidate_path
+            report.unbounded_fallback = True
+            used_bound = float("inf")
+
+    report.attempts = len(report.attempt_log)
+    report.seconds = time.perf_counter() - started_total
+
+    if distance is None:
+        raise QueryFailed(
+            "the exact backend did not reach the target after %d attempt(s) "
+            "(largest bound %.3f mm). The endpoints are most likely on "
+            "surfaces with no path between them."
+            % (report.attempts, base * float(bound_factors[-1]))
+        )
+
+    report.distance_mm = float(distance)
+    report.bound_factor = used_factor
+    report.bound_mm = used_bound
+    return report.distance_mm, path, report
+
+
 def provenance(report, geometry_hash, metric_key, component_id, unit,
                source_object, preprocessing=None):
     """The sect. 5.4 provenance record for one successful measurement."""

@@ -44,6 +44,14 @@ IMPORT_TRACEBACK = ""
 MODULE_PATH = ""
 VERSION = ""
 
+#: True when the installed pygeodesic exposes the BSMT Phase-1 bounded
+#: distance-AND-path method. Most installs will not have it - it exists
+#: only in BSMT's own locally-patched macOS ARM64 build (sect. "Phase 1"
+#: in ~/bsmt-geodesic-prototype/README.md). Checked once at import time
+#: with a plain hasattr() probe, never assumed from a version string: a
+#: version number is a claim, hasattr() is the actual capability.
+BOUNDED_PATH_CAPABLE = False
+
 _geodesic = None
 
 
@@ -79,6 +87,9 @@ try:
     AVAILABLE = True
     VERSION = str(getattr(pygeodesic, "__version__", "unknown"))
     MODULE_PATH = str(getattr(pygeodesic, "__file__", ""))
+    BOUNDED_PATH_CAPABLE = hasattr(
+        _geodesic.PyGeodesicAlgorithmExact, "geodesicDistanceAndPathBounded"
+    )
 except Exception as exc:  # noqa: BLE001 - any import failure must be reported
     _geodesic = None
     AVAILABLE = False
@@ -89,6 +100,20 @@ except Exception as exc:  # noqa: BLE001 - any import failure must be reported
 def availability():
     """True when the exact backend can be used right now."""
     return bool(AVAILABLE and _geodesic is not None)
+
+
+def bounded_path_capability():
+    """True when the installed pygeodesic can answer a bounded query WITH a
+    path in one call (BSMT's own locally-patched build only).
+
+    This is the capability probe every caller must use instead of assuming
+    from a version string or a platform check. It costs nothing beyond the
+    hasattr() already done once at import time (sect. "Phase 1" capability
+    detection) - re-checked here rather than read from the cached module
+    global directly so a test can monkeypatch this one function without
+    touching module state.
+    """
+    return bool(availability() and BOUNDED_PATH_CAPABLE)
 
 
 def backend_version():
@@ -102,6 +127,7 @@ def status():
         "backend_name": BACKEND_NAME,
         "wrapper_version": WRAPPER_VERSION,
         "available": availability(),
+        "bounded_path_capable": bounded_path_capability(),
         "version": VERSION,
         "module_path": MODULE_PATH,
         "import_error": IMPORT_ERROR,
@@ -292,6 +318,119 @@ class ExactSolver(object):
 
     def distance(self, source_index, target_index):
         return self.distance_and_path(source_index, target_index)[0]
+
+    # -- bounded distance AND path query (Phase 1, capability-gated) -------
+    #
+    # Only callable when exact_mmp.bounded_path_capability() is True - the
+    # installed pygeodesic must expose geodesicDistanceAndPathBounded().
+    # Every production caller MUST check that capability first (registry.
+    # bounded_distance_and_path() does); this method itself still refuses
+    # cleanly if called without it, rather than letting an AttributeError
+    # escape from inside a Cython call.
+    #
+    # Bounded distance without a path already exists below
+    # (bounded_distances/bounded_distance) and is the production DISTANCE
+    # route today - read that comment for why an unbounded query sweeps the
+    # whole mesh regardless of separation. This method exists because a
+    # PATH additionally needs geodesicDistance(), which cannot be bounded,
+    # so Region Boundary's per-segment polyline paid the ~26s/segment
+    # unbounded cost with no bounded alternative. Where the patched
+    # geodesicDistanceAndPathBounded() is available, this method answers
+    # both the distance and the path from ONE bounded call.
+    #
+    # Same max_distance semantics as bounded_distances() below: a minimum
+    # sweep radius, not a truncation. Verified against unbounded queries
+    # with zero difference on the 2026-09-17 durable fixture (67/67 checks,
+    # see ~/bsmt-geodesic-prototype/README.md) - not re-derived here.
+    def distance_and_path_bounded(self, source_index, target_index, max_distance):
+        """Exact distance AND path, bounded by max_distance.
+
+        Requires exact_mmp.bounded_path_capability() - raises
+        BackendUnavailable if called without it, same as calling any solver
+        method before require() passes.
+
+        Returns (distance float, path ndarray(k,3)) in source -> target
+        order, exactly like distance_and_path(). `distance` is
+        numpy.inf and `path` is None when the target is genuinely
+        unreachable within this connected component (mirrors
+        bounded_distances()'s inf-for-not-covered contract).
+        """
+        if not bounded_path_capability():
+            raise BackendUnavailable(
+                "geodesicDistanceAndPathBounded is not available on this "
+                "pygeodesic build (bounded_path_capability() is False); "
+                "callers must check the capability before calling this "
+                "method, not rely on it to refuse"
+            )
+
+        source = _check_index("source_index", source_index, self.vertex_count)
+        target = _check_index("target_index", target_index, self.vertex_count)
+
+        if source == target:
+            # Same convention as distance_and_path(): A->A is exact zero,
+            # no solver call.
+            xyz = self.vertices[source]
+            return 0.0, np.asarray([xyz, xyz], dtype=np.float64)
+
+        try:
+            bound = float(max_distance)
+        except Exception as exc:  # noqa: BLE001
+            raise InvalidMeshError(
+                "max_distance is not a number: %s" % _describe(exc)
+            )
+        if not np.isfinite(bound):
+            raise InvalidMeshError(
+                "max_distance must be finite. An infinite bound disables "
+                "pygeodesic's stop-vertex check and forces a full mesh "
+                "sweep; see the comment above bounded_distances()."
+            )
+        if bound <= 0.0:
+            raise InvalidMeshError(
+                "max_distance must be positive, got %r" % bound
+            )
+
+        try:
+            result = self._algorithm.geodesicDistanceAndPathBounded(
+                source, target, bound
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SolverError(
+                "pygeodesic raised during geodesicDistanceAndPathBounded"
+                "(%d, %d, max_distance=%r): %s"
+                % (source, target, bound, _describe(exc))
+            )
+
+        if isinstance(result, tuple) and len(result) == 2:
+            distance, path = result
+        else:
+            raise SolverError(
+                "pygeodesic returned %s, not the (distance, path) tuple "
+                "this method was written against" % type(result).__name__
+            )
+
+        try:
+            distance = float(distance)
+        except Exception as exc:  # noqa: BLE001
+            raise SolverError("distance is not a float: %s" % _describe(exc))
+        if np.isnan(distance):
+            raise SolverError("pygeodesic returned a NaN distance")
+        if distance < 0.0:
+            raise SolverError("pygeodesic returned a negative distance (%r)" % distance)
+        if not np.isfinite(distance):
+            # Genuinely unreachable within this connected component - honest
+            # "not covered", same contract as bounded_distances().
+            return float("inf"), None
+
+        path = np.ascontiguousarray(np.asarray(path, dtype=np.float64))
+        if path.ndim != 2 or path.shape[1] != 3 or path.shape[0] < 2:
+            raise SolverError(
+                "pygeodesic returned a path of shape %r; expected (k>=2, 3)"
+                % (path.shape,)
+            )
+        if not np.all(np.isfinite(path)):
+            raise SolverError("pygeodesic returned a path with non-finite points")
+
+        return distance, orient_path(path, self.vertices[source], self.vertices[target])
 
     # -- bounded distance query (Milestone 2.3 production path) ------------
     #

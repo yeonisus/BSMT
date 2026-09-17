@@ -470,13 +470,25 @@ def surface_path(vertices_solver, triangles, point_a, point_b,
         result.total_seconds = time.perf_counter() - started_total
         return result
 
-    # --- the expensive unbounded query ------------------------------------
+    # --- the path query: Phase-1 bounded where available, else unbounded --
     #
     # Construction and query are timed apart on purpose. "The path is slow"
     # has to be attributable: building the MMP structure over a 1M-triangle
     # scratch mesh and propagating across it are different costs with
     # different fixes, and a single total hides which one is biting.
+    #
+    # registry.bounded_path_capability() is the ONLY thing that decides the
+    # route - never a platform check, never a version string. True only
+    # when the installed pygeodesic actually exposes
+    # geodesicDistanceAndPathBounded() (BSMT's locally-patched macOS ARM64
+    # build today; see exact_mmp.BOUNDED_PATH_CAPABLE). Everywhere else -
+    # stock pygeodesic, Windows, an older wheel, the backend missing
+    # entirely - this is False and the query below is BYTE-IDENTICAL to
+    # what production has always done. A failure that reaches either branch
+    # below is a real solver/geometry failure and is reported as one; it is
+    # never reinterpreted as "try the other route".
     started = time.perf_counter()
+    bounded_path = registry.bounded_path_capability()
     try:
         with timing.stage(
             timing.SOLVER_BUILD,
@@ -486,13 +498,32 @@ def surface_path(vertices_solver, triangles, point_a, point_b,
                 insertion.vertices, insertion.triangles
             )
         with timing.stage(timing.PATH_SOLVE) as measured:
-            distance_mm, polyline = solver.distance_and_path(
-                source_index, target_index
-            )
-            measured.note("%d points" % int(np.asarray(polyline).shape[0]))
-    except registry.exact_mmp.BackendUnavailable as exc:
+            if bounded_path:
+                distance_mm, polyline, _report = registry.bounded_distance_and_path(
+                    insertion.vertices, insertion.triangles,
+                    source_index, target_index, straight_mm,
+                    solver=solver,
+                )
+            else:
+                distance_mm, polyline = solver.distance_and_path(
+                    source_index, target_index
+                )
+            measured.note("%d points (%s)" % (
+                int(np.asarray(polyline).shape[0]),
+                "bounded" if bounded_path else "unbounded"))
+    except (registry.exact_mmp.BackendUnavailable,
+           registry.BackendUnavailable) as exc:
+        # Two distinct classes (exact_mmp's own, and registry's - raised by
+        # bounded_distance_and_path() if capability or the backend itself
+        # is missing) that mean the SAME thing to a caller: the dependency
+        # is not usable. Both map to BACKEND_MISSING, never BACKEND_ERROR -
+        # this is the "capability absence" case sect. 6 requires never be
+        # confused with a genuine solver failure.
         raise MeasurementError('BACKEND_MISSING',
                                failure_message('BACKEND_MISSING', str(exc)))
+    except registry.QueryFailed as exc:
+        raise MeasurementError('BACKEND_ERROR',
+                               failure_message('BACKEND_ERROR', str(exc)))
     except Exception as exc:  # noqa: BLE001
         raise MeasurementError(
             'BACKEND_ERROR',
