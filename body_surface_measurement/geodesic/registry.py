@@ -224,7 +224,7 @@ def bounded_distance_and_path(vertices, triangles, source_index, target_index,
     started_total = time.perf_counter()
     if not bounded_path_capability():
         raise BackendUnavailable(
-            "geodesicDistanceAndPathBounded is not available on this "
+            "geodesicDistanceBounded is not available on this "
             "pygeodesic build; check registry.bounded_path_capability() "
             "before calling bounded_distance_and_path()"
         )

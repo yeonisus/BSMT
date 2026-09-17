@@ -480,7 +480,7 @@ def surface_path(vertices_solver, triangles, point_a, point_b,
     # registry.bounded_path_capability() is the ONLY thing that decides the
     # route - never a platform check, never a version string. True only
     # when the installed pygeodesic actually exposes
-    # geodesicDistanceAndPathBounded() (BSMT's locally-patched macOS ARM64
+    # geodesicDistanceBounded() (BSMT's locally-patched macOS ARM64
     # build today; see exact_mmp.BOUNDED_PATH_CAPABLE). Everywhere else -
     # stock pygeodesic, Windows, an older wheel, the backend missing
     # entirely - this is False and the query below is BYTE-IDENTICAL to

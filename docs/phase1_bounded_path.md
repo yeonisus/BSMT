@@ -30,7 +30,7 @@ Boundary needs a path for every segment, so it has always paid the full
 unbounded cost.
 
 A locally-patched build of pygeodesic adds one additive method,
-`geodesicDistanceAndPathBounded()`, which returns a distance **and** a path
+`geodesicDistanceBounded()`, which returns a distance **and** a path
 from a single bounded query. Where that method is available, BSMT's
 expanding-bound strategy is extended to use it (`registry.
 bounded_distance_and_path`), turning Region Boundary's per-segment cost from

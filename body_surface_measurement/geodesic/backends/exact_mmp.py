@@ -88,7 +88,7 @@ try:
     VERSION = str(getattr(pygeodesic, "__version__", "unknown"))
     MODULE_PATH = str(getattr(pygeodesic, "__file__", ""))
     BOUNDED_PATH_CAPABLE = hasattr(
-        _geodesic.PyGeodesicAlgorithmExact, "geodesicDistanceAndPathBounded"
+        _geodesic.PyGeodesicAlgorithmExact, "geodesicDistanceBounded"
     )
 except Exception as exc:  # noqa: BLE001 - any import failure must be reported
     _geodesic = None
@@ -322,7 +322,7 @@ class ExactSolver(object):
     # -- bounded distance AND path query (Phase 1, capability-gated) -------
     #
     # Only callable when exact_mmp.bounded_path_capability() is True - the
-    # installed pygeodesic must expose geodesicDistanceAndPathBounded().
+    # installed pygeodesic must expose geodesicDistanceBounded().
     # Every production caller MUST check that capability first (registry.
     # bounded_distance_and_path() does); this method itself still refuses
     # cleanly if called without it, rather than letting an AttributeError
@@ -335,7 +335,7 @@ class ExactSolver(object):
     # PATH additionally needs geodesicDistance(), which cannot be bounded,
     # so Region Boundary's per-segment polyline paid the ~26s/segment
     # unbounded cost with no bounded alternative. Where the patched
-    # geodesicDistanceAndPathBounded() is available, this method answers
+    # geodesicDistanceBounded() is available, this method answers
     # both the distance and the path from ONE bounded call.
     #
     # Same max_distance semantics as bounded_distances() below: a minimum
@@ -357,7 +357,7 @@ class ExactSolver(object):
         """
         if not bounded_path_capability():
             raise BackendUnavailable(
-                "geodesicDistanceAndPathBounded is not available on this "
+                "geodesicDistanceBounded is not available on this "
                 "pygeodesic build (bounded_path_capability() is False); "
                 "callers must check the capability before calling this "
                 "method, not rely on it to refuse"
@@ -390,12 +390,12 @@ class ExactSolver(object):
             )
 
         try:
-            result = self._algorithm.geodesicDistanceAndPathBounded(
+            result = self._algorithm.geodesicDistanceBounded(
                 source, target, bound
             )
         except Exception as exc:  # noqa: BLE001
             raise SolverError(
-                "pygeodesic raised during geodesicDistanceAndPathBounded"
+                "pygeodesic raised during geodesicDistanceBounded"
                 "(%d, %d, max_distance=%r): %s"
                 % (source, target, bound, _describe(exc))
             )

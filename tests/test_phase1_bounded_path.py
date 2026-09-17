@@ -131,7 +131,7 @@ class _StubAlgorithm(object):
     def __init__(self, mode):
         self.mode = mode  # "raise" | "unreachable" | "ok"
 
-    def geodesicDistanceAndPathBounded(self, source, target, max_distance):
+    def geodesicDistanceBounded(self, source, target, max_distance):
         if self.mode == "raise":
             raise RuntimeError("stub solver failure")
         if self.mode == "unreachable":
@@ -313,7 +313,7 @@ def test_bounded_and_unbounded_routes_agree(V, F, a, b):
         return
     if not HAVE_BOUNDED_PATH:
         skip("route agreement",
-             "installed pygeodesic has no geodesicDistanceAndPathBounded - "
+             "installed pygeodesic has no geodesicDistanceBounded - "
              "this is the expected state on every platform except BSMT's "
              "patched macOS ARM64 build; see "
              "~/bsmt-geodesic-prototype/README.md")
